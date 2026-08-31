@@ -9,3 +9,5 @@ chromadb==1.5.9
 # groq<0.13 passes a `proxies` kwarg to httpx.Client that httpx>=0.28 no longer accepts.
 groq==1.7.0
 python-dotenv==1.0.1
+# Keyword half of hybrid retrieval (pure Python, no index server).
+rank-bm25==0.2.2

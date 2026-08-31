@@ -1,0 +1,79 @@
+{
+  "_readme": [
+    "Golden question set for eval/run_eval.py.",
+    "",
+    "The entries below target the fictional fixture PDF (scripts/make_test_pdf.py), so the",
+    "harness is runnable out of the box. REPLACE THEM with 20-30 questions about your own",
+    "documents in data/ - that is what actually measures this system.",
+    "",
+    "Fields per question:",
+    "  question        - what to ask",
+    "  expected_source - the filename in data/ the answer should come from",
+    "  expected_pages  - page number(s) that should be retrieved; hit-rate@k checks these",
+    "  reference_answer- optional, only used by the LLM-as-judge correctness score",
+    "",
+    "Retrieval hit-rate needs no API key and no judge: it just asks whether the right page",
+    "made it into the retrieved set. That single number is what tells you whether a change",
+    "to chunking, the embedding model, BM25 or the re-ranker actually helped."
+  ],
+  "questions": [
+    {
+      "question": "How much funding did Project Nightingale receive?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [2],
+      "reference_answer": "A grant of 1.2 million dollars from the Global Wildlife Fund, covering 2021 to 2024."
+    },
+    {
+      "question": "Which two previously undocumented stopover sites were identified?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [3],
+      "reference_answer": "One in the Yellow River Delta and one near Poyang Lake."
+    },
+    {
+      "question": "How many satellite tags were deployed and where?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [1],
+      "reference_answer": "42 tags across three breeding grounds in northern Russia."
+    },
+    {
+      "question": "What percentage of the budget goes to field operations?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [2],
+      "reference_answer": "30 percent, with a recommendation to increase it by 10 percent in the final year."
+    },
+    {
+      "question": "How long do tagged cranes rest at the Yellow River Delta site?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [3],
+      "reference_answer": "An average of 11 days before continuing their migration."
+    },
+    {
+      "question": "What is the battery life of each satellite tag?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [1],
+      "reference_answer": "Approximately 18 months, transmitting location data every six hours."
+    },
+    {
+      "question": "Who leads the project and at which institute?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [1],
+      "reference_answer": "Dr. Amara Chen at the Boreal Ecology Institute."
+    },
+    {
+      "question": "What does the team hypothesize about cranes departing later in the season?",
+      "expected_source": "sample.pdf",
+      "expected_pages": [3],
+      "reference_answer": "They take a more westerly route, hypothesized to be linked to wind patterns rather than food availability."
+    }
+  ],
+  "unanswerable": [
+    {
+      "question": "What is the airspeed velocity of an unladen swallow?",
+      "note": "Not in any ingested document - the system should decline rather than invent an answer. Measured as the 'refusal' metric."
+    },
+    {
+      "question": "How do I configure a Kubernetes ingress controller?",
+      "note": "Also absent - checks the relevance floor is doing its job."
+    }
+  ]
+}

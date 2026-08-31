@@ -17,6 +17,8 @@ the frontend can only ask questions, never add or change what's in the vector st
 | Chunking           | custom structure-aware chunker (`app/pdf_utils.py`) |
 | Embeddings         | `sentence-transformers` (`BAAI/bge-small-en-v1.5`, runs locally, free) |
 | Vector store       | ChromaDB (persistent, local folder, no server to run) |
+| Keyword search     | `rank-bm25` fused with vector search via Reciprocal Rank Fusion |
+| Re-ranking         | `cross-encoder/ms-marco-MiniLM-L-6-v2` (local, free) |
 | LLM                | Groq API (`openai/gpt-oss-20b` by default) |
 | Backend            | FastAPI + Uvicorn |
 | Frontend           | Plain HTML/CSS/JS (no build step) |
@@ -29,34 +31,42 @@ the frontend can only ask questions, never add or change what's in the vector st
 
 ```
 My RAG Project/
-├── backend/
-│   ├── app/                        the application package
-│   │   ├── main.py                 FastAPI app: /ingest, /ingest/status, /chat, /stats, /reset, /health
-│   │   ├── config.py               every setting, loaded once from .env
-│   │   ├── ingest.py               the ONLY path documents enter the system + background job
-│   │   ├── manifest.py             small JSON record of what's ingested (hashes, page/chunk counts)
-│   │   ├── pdf_utils.py            PDF → pages → structure-aware overlapping chunks
-│   │   ├── embeddings.py           wraps sentence-transformers (+ truncation guard)
-│   │   ├── vectorstore.py          ChromaDB: add / query / delete / reset
-│   │   ├── llm.py                  builds the grounded prompt, calls Groq
-│   │   └── logging_setup.py        logging config + per-stage timing helper
-│   ├── scripts/
-│   │   ├── ingest.py               CLI: build the index without starting the API
-│   │   └── make_test_pdf.py        generates the fictional fixture PDF
-│   ├── tests/
-│   │   └── test_pipeline_offline.py   automated end-to-end test (see below)
-│   ├── requirements.txt
-│   ├── requirements-dev.txt
-│   └── .env.example                copy to .env and fill in your Groq key
-├── frontend/
-│   ├── index.html
-│   ├── style.css
-│   └── script.js
-├── data/                           your real PDFs go here — the only way to add documents
-├── README.md
-├── CLAUDE.md                       architecture notes for AI-assisted work on this repo
-├── PLAN.md                         roadmap / changelog
-└── OPTIMIZATIONS.md                code review + remaining optimization backlog
+├── src/                          the application package
+│   ├── main.py                   app assembly: router, CORS, lifespan, static mount
+│   ├── api/                      HTTP layer — thin handlers
+│   │   ├── chat.py               /chat, /chat/stream (SSE)
+│   │   ├── documents.py          /ingest, /ingest/status, /stats, /reset
+│   │   └── system.py             /health, /info
+│   ├── core/
+│   │   ├── config.py             every setting, loaded once from .env
+│   │   └── logging.py            logging config + per-stage timing helper
+│   ├── models/
+│   │   └── schemas.py            pydantic request/response shapes
+│   ├── ml/
+│   │   ├── embeddings.py         sentence-transformers (+ truncation guard)
+│   │   ├── reranker.py           lazy cross-encoder singleton
+│   │   └── llm.py                grounded prompt, Groq call (sync + streaming)
+│   ├── services/
+│   │   ├── ingestion.py          the ONLY path documents enter the system
+│   │   ├── manifest.py           what's ingested, with content hashes
+│   │   ├── pdf.py                extraction + structure-aware chunking
+│   │   ├── vectorstore.py        ChromaDB add / query / neighbours / delete / reset
+│   │   ├── bm25.py               lazy in-memory BM25 keyword index
+│   │   └── retrieval.py          fusion → re-rank → floor → neighbour expansion
+│   └── static/                   the web UI, served at "/" by FastAPI
+│       └── index.html / style.css / script.js
+├── scripts/
+│   ├── ingest.py                 CLI: build the index without starting the API
+│   └── make_test_pdf.py          generates the fictional fixture PDF
+├── eval/
+│   ├── golden_questions.json     golden set for measuring answer quality
+│   └── run_eval.py               hit-rate@k, MRR, refusal rate, optional LLM-as-judge
+├── tests/
+│   └── test_pipeline_offline.py  86 offline checks
+├── data/                         your real PDFs go here — the only way to add documents
+├── storage/chroma_db/            generated index state (gitignored)
+├── requirements.txt / requirements-dev.txt / .env.example
+└── README.md · CLAUDE.md · PLAN.md · OPTIMIZATIONS.md
 ```
 
 ## How a question actually gets answered (the RAG loop)
@@ -73,17 +83,27 @@ My RAG Project/
 5. Chunk text + vector + page range get stored in ChromaDB, in batches.
 
 **At question time (every chat message):**
-1. Your question is embedded with the *same* model, with the model's query prefix applied.
-2. ChromaDB returns the chunks whose vectors are closest to the question's (cosine
-   similarity) — the "retrieval" in Retrieval-Augmented Generation.
-3. Those chunks go into a prompt as CONTEXT (under a character budget), with a system
+1. If the conversation has history, the question is first rewritten into a standalone one
+   ("what about the second one?" retrieves nothing useful as written).
+2. Two searches run over the same corpus: **vector** (semantic, good at paraphrase) and
+   **BM25** (lexical, good at exact terms like "A* search"). Their ranked lists are merged
+   with Reciprocal Rank Fusion.
+3. A **cross-encoder re-ranks** the ~30 fused candidates by reading each (question, chunk)
+   pair together, and the best `top_k` survive.
+4. A **relevance floor** applies: if nothing scores well enough, the app answers "not in
+   these documents" *without calling the LLM at all*.
+5. Each surviving chunk is returned with its **neighbouring chunks**, so the model reads
+   continuous prose rather than a fragment.
+6. Those chunks go into a prompt as CONTEXT (under a character budget), with a system
    prompt instructing the model to answer only from that context.
-4. Groq's LLM generates the answer, returned with the documents and pages it drew from.
+7. Groq generates the answer — streamed token by token — with the documents and pages it
+   drew from.
 
 ## Setup
 
+Run everything from the **project root**:
+
 ```bash
-cd backend
 python -m venv venv
 venv\Scripts\activate           # Windows;  macOS/Linux: source venv/bin/activate
 
@@ -101,11 +121,13 @@ get a "model not found" error, check https://console.groq.com/docs/models and up
 Put PDFs directly in the `data/` folder — that's the only way documents get in. Then:
 
 ```bash
-cd backend
-python scripts/ingest.py          # ingest new / changed PDFs
+python scripts/ingest.py          # ingest new / changed PDFs, prune deleted ones
 python scripts/ingest.py --status # show what's in the store
 python scripts/ingest.py --force  # wipe and rebuild from scratch
 ```
+
+Subfolders work too — `data/textbooks/norvig.pdf` is ingested and identified by that
+relative path.
 
 Files are fingerprinted by content hash, so re-running is always safe: unchanged files are
 skipped, and an edited PDF is re-ingested (its old chunks are deleted first, not
@@ -118,26 +140,27 @@ book is real CPU work and can take several minutes.
 ## Running it
 
 ```bash
-cd backend
-uvicorn app.main:app --reload --port 8000
+uvicorn src.main:app --reload --port 8000
 ```
+
+Then open **http://localhost:8000** — that's it. The web UI is served by the same FastAPI
+process from `src/static/`, so there is no separate file to open and no CORS hop.
+`http://localhost:8000/docs` gives you the interactive API reference.
 
 The API starts immediately and kicks off an ingestion pass in the background — it does not
 block on embedding. `GET /ingest/status` reports progress.
-
-Then open `frontend/index.html` directly in your browser (double-click it, or use VS Code's
-Live Server). It is a local file, **not** served by the backend — `http://localhost:8000`
-is the API only. Change `API_BASE` at the top of `frontend/script.js` if you serve the
-backend elsewhere.
 
 ## API
 
 | Method | Path              | Purpose |
 |--------|-------------------|---------|
+| GET    | `/`               | the web UI (served from `src/static/`) |
 | GET    | `/health`         | liveness check |
+| GET    | `/info`           | which embedding / re-rank / LLM models this instance is running |
 | POST   | `/ingest`         | start a background scan of `data/` (202) |
 | GET    | `/ingest/status`  | progress of the current/last ingestion job |
-| POST   | `/chat`           | `{"question": "...", "top_k": 4}` → answer + sources |
+| POST   | `/chat`           | `{"question": "...", "top_k": 4, "source": null, "history": []}` → answer + sources |
+| POST   | `/chat/stream`    | same body, streamed as SSE (`sources`, then `token`s, then `done`) |
 | GET    | `/stats`          | chunk count, per-document pages/chunks, ingestion state |
 | POST   | `/reset`          | wipe the store and rebuild from `data/` (202) |
 
@@ -146,17 +169,35 @@ Interactive docs at `http://localhost:8000/docs`.
 ## Testing
 
 ```bash
-cd backend
 pip install -r requirements-dev.txt
 python tests/test_pipeline_offline.py
 ```
 
-37 checks covering the chunker (page ranges, oversized paragraphs, overlap edge cases),
+86 checks covering the chunker (page ranges, oversized paragraphs, overlap edge cases),
 startup ingestion, `/ingest` idempotency, change detection (an edited PDF is re-ingested,
-not duplicated), input validation, retrieval, and `/reset`. It generates its own fixture
-PDFs into an isolated temp folder — never `data/` — swaps in a deterministic fake embedding
-model so it runs offline, and doesn't call Groq. It does **not** prove the real model
-downloads or that a live Groq call succeeds; do a manual smoke test with a real key.
+not duplicated), BM25 tokenisation and scoping, RRF fusion, cross-encoder re-ranking, the
+relevance floor, neighbour expansion, per-document scoping, conversation history, SSE
+streaming, input validation, and `/reset`. It generates its own fixture PDFs into an
+isolated temp folder — never `data/` — stubs the embedding and re-ranking models so it runs
+offline, and doesn't call Groq. It does **not** prove the real models download or that a
+live Groq call succeeds; do a manual smoke test with a real key.
+
+## Measuring answer quality
+
+The test suite proves the plumbing works. The eval harness measures whether the answers are
+any *good* — and, more usefully, whether a change made them better:
+
+```bash
+python eval/run_eval.py                  # hit-rate@k, MRR, refusal rate (no API key needed)
+python eval/run_eval.py --judge          # + LLM-as-judge correctness/groundedness/relevance
+python eval/run_eval.py --no-rerank      # A/B: what is the cross-encoder actually worth?
+python eval/run_eval.py --no-hybrid      # A/B: what is BM25 worth?
+```
+
+`eval/golden_questions.json` currently holds questions about the *fixture* PDF so the
+harness runs out of the box. **Replace them with 20–30 questions about your real documents**
+— that is what turns tuning (chunk size, `top_k`, the relevance floor) from guesswork into
+measurement.
 
 ## Manual smoke test (with a real GROQ_API_KEY)
 
@@ -176,14 +217,16 @@ Worth testing deliberately:
 
 ## Known limitations
 
-- **No OCR** — scanned/image PDFs extract no text and are skipped.
-- **No conversation history** — each question is answered independently.
-- **Single collection, no per-document filter** — a question retrieves across every
-  ingested document.
+- **OCR is off by default** — set `OCR_ENABLED=true` and install `pytesseract`, `pillow`
+  and the Tesseract binary; otherwise scanned/image PDFs are skipped.
+- **Conversation history is client-side** — the backend is stateless, so history is lost on
+  a browser reload.
 - **Page ranges are chunk-level**, not sentence-level — good for "roughly where to look".
+- **The golden question set still targets the fixture PDF**, so the eval numbers describe a
+  fictional 3-page document until you replace them.
 - **No auth on `/ingest` or `/reset`** — fine locally, not for public exposure.
 - **Windows ARM64**: numpy has no official MSVC/OpenBLAS build there, so pip installs a
   community MINGW-W64 build that prints an "experimental" warning. Harmless on its own.
 
-See `OPTIMIZATIONS.md` for the reviewed backlog (re-ranking, hybrid BM25 search, an
-evaluation harness) and `PLAN.md` for the roadmap.
+`OPTIMIZATIONS.md` is the rationale record for why the pipeline looks the way it does;
+`PLAN.md` is the changelog and the remaining backlog.

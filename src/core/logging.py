@@ -9,7 +9,7 @@ import logging
 import time
 from contextlib import contextmanager
 
-from app.config import LOG_LEVEL
+from src.core.config import LOG_LEVEL
 
 _configured = False
 

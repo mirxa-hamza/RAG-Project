@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Ask questions about your documents and get answers grounded in their actual pages.">
+<meta name="theme-color" content="#dc3126">
+<title>Document Q&A</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
+</head>
+<body>
+
+<a class="skip-link" href="#questionInput">Skip to the question box</a>
+
+<div class="app">
+
+  <!-- ───────────────────────── Top bar ───────────────────────── -->
+  <header class="topbar">
+    <button class="icon-btn topbar__menu" id="menuBtn" aria-label="Show documents panel" aria-expanded="false" aria-controls="sidebar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+
+    <div class="brand">
+      <span class="brand__mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>
+      </span>
+      <span class="brand__text">
+        <span class="brand__name">Document Q&amp;A</span>
+        <span class="brand__tag">Answers grounded in your PDFs</span>
+      </span>
+    </div>
+
+    <div class="topbar__right">
+      <span class="status-dot" id="serverStatus" data-state="checking" title="Checking the backend…">
+        <span class="status-dot__light" aria-hidden="true"></span>
+        <span class="status-dot__label">Checking</span>
+      </span>
+    </div>
+  </header>
+
+  <!-- ───────────────────────── Sidebar ───────────────────────── -->
+  <div class="scrim" id="scrim" hidden></div>
+
+  <aside class="sidebar" id="sidebar" aria-label="Document library">
+    <div class="sidebar__inner">
+
+      <section class="panel">
+        <div class="panel__head">
+          <h2 class="panel__title">Library</h2>
+          <span class="pill" id="chunkCount" title="Searchable passages in the index">—</span>
+        </div>
+
+        <p class="panel__hint">
+          Documents load from the server's <code>data/</code> folder. There's no upload — put a
+          PDF in that folder, then sync.
+        </p>
+
+        <div class="btn-row">
+          <button id="syncBtn" class="btn btn--primary btn--block">
+            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+            <span>Sync from data folder</span>
+          </button>
+          <button id="resetBtn" class="btn btn--ghost btn--block" title="Wipe the index and rebuild it from the data folder">
+            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+            <span>Rebuild index</span>
+          </button>
+        </div>
+
+        <p id="syncStatus" class="status" role="status" aria-live="polite"></p>
+        <div class="progress" id="syncProgress" hidden><div class="progress__bar" id="syncProgressBar"></div></div>
+      </section>
+
+      <section class="panel panel--grow">
+        <div class="panel__head">
+          <h2 class="panel__title">Documents</h2>
+          <span class="pill pill--muted" id="docCount">0</span>
+        </div>
+        <ul id="sourceList" class="doc-list">
+          <li class="doc-empty">Nothing ingested yet</li>
+        </ul>
+      </section>
+
+      <section class="panel">
+        <label class="field__label" for="scopeSelect">Search scope</label>
+        <div class="select-wrap">
+          <select id="scopeSelect" class="select">
+            <option value="">All documents</option>
+          </select>
+          <svg class="select-wrap__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </div>
+        <p class="field__help">Limit answers to a single document.</p>
+      </section>
+
+    </div>
+  </aside>
+
+  <!-- ───────────────────────── Chat ───────────────────────── -->
+  <main class="chat">
+    <div class="messages" id="messages" role="log" aria-live="polite" aria-label="Conversation">
+
+      <div class="welcome" id="welcome">
+        <span class="welcome__mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+        </span>
+        <h1 class="welcome__title">Ask your documents anything</h1>
+        <p class="welcome__text">
+          Every answer is built only from passages retrieved out of your PDFs, and cites the pages
+          it came from. If something isn't in them, you'll be told so rather than guessed at.
+        </p>
+        <ol class="welcome__steps">
+          <li><span class="step-num">1</span><span>Hybrid search finds candidate passages</span></li>
+          <li><span class="step-num">2</span><span>A re-ranker keeps only the strongest</span></li>
+          <li><span class="step-num">3</span><span>The model answers from those, with citations</span></li>
+        </ol>
+      </div>
+
+    </div>
+
+    <div class="composer-wrap">
+      <form id="chatForm" class="composer">
+        <div class="composer__field">
+          <label class="sr-only" for="questionInput">Your question</label>
+          <textarea id="questionInput" class="composer__input" rows="1"
+                    placeholder="Ask a question…"
+                    autocomplete="off" enterkeyhint="send"></textarea>
+          <button type="button" id="clearBtn" class="icon-btn composer__clear"
+                  title="Clear the conversation" aria-label="Clear the conversation">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+          </button>
+        </div>
+        <button type="submit" id="sendBtn" class="btn btn--primary composer__send">
+          <span class="composer__send-text">Ask</span>
+          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </form>
+      <p class="composer__meta">
+        <span id="apiBase" class="composer__origin"></span>
+        <span class="composer__hint">Enter to send · Shift + Enter for a new line</span>
+      </p>
+    </div>
+  </main>
+
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>

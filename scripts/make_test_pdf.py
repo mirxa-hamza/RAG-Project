@@ -1,7 +1,7 @@
 """
 Generates a small fictional PDF used to test the pipeline end to end.
 
-Writes to backend/test_fixtures/ by default - deliberately OUTSIDE the real data/ folder,
+Writes to tests/fixtures/ by default - deliberately OUTSIDE the real data/ folder,
 which is the live ingestion source for real documents and must never get a synthetic test
 PDF mixed into it.
 """
@@ -43,8 +43,8 @@ more westerly route, which the team hypothesizes is linked to wind patterns rath
 food availability. A follow-up paper on this hypothesis is planned for early 2025.""",
 ]
 
-DEFAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "test_fixtures", "sample.pdf")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_PATH = os.path.join(PROJECT_ROOT, "tests", "fixtures", "sample.pdf")
 
 
 def make_pdf(path: str = DEFAULT_PATH) -> str:

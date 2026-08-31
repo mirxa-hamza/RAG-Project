@@ -12,12 +12,12 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # make `app` importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # make `src` importable
 
-from app import manifest, vectorstore  # noqa: E402
-from app.config import CHROMA_DIR, DATA_DIR, EMBEDDING_MODEL  # noqa: E402
-from app.ingest import ingest_data_folder  # noqa: E402
-from app.logging_setup import get_logger  # noqa: E402
+from src.services import manifest, vectorstore  # noqa: E402
+from src.core.config import CHROMA_DIR, DATA_DIR, EMBEDDING_MODEL  # noqa: E402
+from src.services.ingestion import ingest_data_folder  # noqa: E402
+from src.core.logging import get_logger  # noqa: E402
 
 log = get_logger("ingest-cli")
 

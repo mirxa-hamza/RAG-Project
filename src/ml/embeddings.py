@@ -17,8 +17,8 @@ from typing import List
 
 from sentence_transformers import SentenceTransformer
 
-from app.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL, EMBEDDING_QUERY_PREFIX
-from app.logging_setup import get_logger
+from src.core.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL, EMBEDDING_QUERY_PREFIX
+from src.core.logging import get_logger
 
 log = get_logger(__name__)
 

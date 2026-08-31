@@ -4,20 +4,27 @@ Roadmap and changelog for the Document Q&A RAG project. Status as of 2026-08-31.
 
 ## Status
 
-Working end-to-end, backend-only ingestion, restructured into a proper `app/` package.
-37 automated checks pass offline. Two real textbooks (AI: A Modern Approach; Pattern
-Classification) live in `data/`.
+Full retrieval pipeline in place: hybrid (vector + BM25) search, Reciprocal Rank Fusion,
+cross-encoder re-ranking, a relevance floor, neighbour expansion, per-document scoping,
+streaming answers, conversation history with follow-up rewriting, optional OCR, and an
+evaluation harness. 86 automated checks pass offline. Two real textbooks (AI: A Modern
+Approach; Pattern Classification) live in `data/`.
 
-**Action required after this change:** the embedding model changed, so the existing index
-is stale and must be rebuilt:
+**Action required after this change:** none beyond a restart — the audit pass below is
+backend-only and needs no re-ingest. (The previous pass added `rank-bm25`; if you haven't
+run `pip install -r requirements.txt` since then, do that first.)
 
 ```bash
-cd backend
 pip install -r requirements.txt
-python scripts/ingest.py --force
+python scripts/ingest.py --status      # confirm the index is intact (no re-ingest needed)
+uvicorn src.main:app --reload --port 8000   # then open http://localhost:8000
 ```
 
-## Changelog — this pass (Tier 1 + Tier 2 of OPTIMIZATIONS.md)
+The embedding model and chunking are unchanged this pass, so **the existing index is still
+valid** — no `--force` re-ingest required. The cross-encoder (~80MB) downloads on the first
+question asked.
+
+## Changelog — Tier 1 + Tier 2 (previous pass)
 
 **Retrieval correctness**
 
@@ -71,26 +78,141 @@ python scripts/ingest.py --force
 - [x] Dropped `python-multipart` — it was only needed by the removed upload endpoint.
 - [x] `refrence/` gitignored (kept on disk for study, not part of this codebase).
 
+## Changelog — Tier 3 + Tier 4 (this pass)
+
+**Retrieval quality (Tier 3)**
+
+- [x] **Cross-encoder re-ranking** (`app/reranker.py`). Retrieve `RETRIEVAL_CANDIDATES`
+      (30) cheaply, then score each (question, chunk) pair with
+      `cross-encoder/ms-marco-MiniLM-L-6-v2` and keep the best `top_k`. Loads lazily on
+      first question and degrades to fusion-only ranking if the model can't be loaded.
+- [x] **Hybrid search with RRF** (`app/bm25.py`). BM25 keyword ranking fused with vector
+      ranking by Reciprocal Rank Fusion. The tokenizer deliberately preserves `A*`,
+      `k-means`, `f1` — a plain `\w+` split destroys exactly the terms BM25 exists to
+      catch. The index is built lazily in memory and invalidated on any store change.
+- [x] **Per-document scoping.** `POST /chat` accepts `source`; the frontend has an
+      "Ask about" dropdown fed from `/stats`.
+- [x] **Retrieve-more-then-filter + relevance floor.** Nothing above `MIN_RERANK_SCORE`
+      (or `MIN_SIMILARITY` when re-ranking is off) means the system answers "not in these
+      documents" **without calling the LLM** — faster, cheaper, and it removes a whole
+      class of confident answers built on irrelevant context.
+- [x] **Neighbour expansion.** Each hit is returned with its `chunk_index ± 1` neighbours,
+      in document order, so the model reads continuous prose rather than a fragment.
+
+**Evaluation and polish (Tier 4)**
+
+- [x] **Evaluation harness** (`eval/run_eval.py` + `eval/golden_questions.json`).
+      Retrieval hit-rate@k, MRR, and refusal rate need no API key; `--judge` adds
+      LLM-as-judge correctness/groundedness/relevance via Groq, modelled on the four axes
+      in the reference project's LangSmith notebook. `--no-rerank` / `--no-hybrid` /
+      `--no-expand` / `--top-k` make every stage measurable. First run on the fixture set:
+      hit-rate 100%, MRR 1.000, refusal 100% — and with `--no-rerank`, MRR drops to 0.812
+      and refusal to 0%, which is the harness doing its job.
+- [x] **Streaming answers.** `POST /chat/stream` emits SSE: `sources` first, then `token`
+      events, then `done`. The frontend renders tokens as they arrive with a caret.
+- [x] **Conversation history + follow-up rewriting.** The frontend keeps recent turns and
+      sends them with each question; the backend rewrites follow-ups into standalone
+      questions *before* retrieval (a raw "what about the second one?" embeds to noise),
+      and shows the rewritten query in the sources line.
+- [x] **OCR fallback.** `OCR_ENABLED=true` rasterises text-less pages with PyMuPDF and runs
+      Tesseract. Both the Python packages and the binary are optional — missing pieces log
+      a warning and the document is skipped exactly as before.
+- [x] **Ordering fix found while testing:** "nothing relevant was retrieved" is now
+      returned *before* the missing-API-key check, since that answer needs no LLM call.
+
+## Changelog — project restructure + self-served UI (this pass)
+
+- [x] **Reorganised into a purpose-based `src/` package at the project root**, matching the
+      layout used in the owner's other FastAPI projects: `api/` (thin HTTP handlers, split
+      by endpoint group), `core/` (config + logging), `models/` (pydantic schemas), `ml/`
+      (embeddings, re-ranker, LLM), `services/` (pdf, chunking, stores, retrieval,
+      ingestion, manifest), `static/` (the UI). The `backend/` wrapper folder is gone —
+      there was only ever one backend, so it added a level of nesting for nothing.
+- [x] **`main.py` is now app assembly only** — router wiring, CORS, lifespan, static mount.
+      Endpoints moved to `src/api/{chat,documents,system}.py`, schemas to
+      `src/models/schemas.py`.
+- [x] **Added `GET /info`** reporting the embedding / re-rank / LLM models in use — the
+      first thing to check when answers look different from what you expected.
+- [x] **The frontend folder is gone; FastAPI serves the UI itself.** `src/static/` is
+      mounted at `/` (registered *after* the API router, so API paths always win), and
+      `script.js` now uses a relative `API_BASE`. Open http://localhost:8000 — no separate
+      HTML file, no CORS hop.
+- [x] **Generated state moved to `storage/chroma_db/`**, out of the source tree, and
+      `tests/fixtures/` replaces `backend/test_fixtures/`.
+- [x] All 86 checks still pass, and the UI/API route precedence is covered by a live check
+      (`/` serves HTML, `/health` and `/chat` still resolve as API routes).
+
+## Changelog — edge-case audit (previous pass)
+
+Six defects found by probing the code with runnable repros rather than reading it, plus
+four robustness gaps. Every one has a regression test.
+
+**Critical**
+
+- [x] **One malformed PDF aborted the entire ingest job.** Verified: with three files and a
+      corrupt one in the middle, the third was never indexed and the job reported failure.
+      `ingest_data_folder()` now catches per file and records
+      `{"status": "failed", "error": ...}`, continuing with the rest of the corpus.
+- [x] **`build_context()` could return an empty string.** If the first chunk exceeded
+      `MAX_CONTEXT_CHARS` the loop broke immediately, so the model was told "answer only
+      from CONTEXT" and handed nothing — a direct hallucination path. It now truncates that
+      chunk (keeping its citation label) instead of dropping it.
+- [x] **The embedding query prefix was malformed by `.env`.** python-dotenv strips trailing
+      whitespace from unquoted values, so every query embedded as
+      `...passages:What is A* search?` with no space. `config.py` now normalises the prefix.
+      This silently degraded *every* query — the same class of bug as the truncation issue.
+
+**Major**
+
+- [x] **Deleted PDFs were never pruned.** A file removed from `data/` stayed searchable and
+      citable indefinitely. `prune_deleted()` now reconciles the store against disk on every
+      ingest and reports `{"status": "removed"}`.
+- [x] **Manifest writes were not atomic.** A torn read returned `{}`, which convinced the
+      ingester nothing was stored and triggered a full re-embed of both textbooks. Writes
+      now go through a temp file + `os.replace` under a lock.
+- [x] **Nested PDFs were invisible.** `data/textbooks/norvig.pdf` was silently ignored;
+      the scan is now recursive and documents are keyed by POSIX-style relative path.
+
+**Moderate**
+
+- [x] **N+1 queries for neighbour expansion** — measured 5 separate Chroma `get()` calls for
+      one question. Now one batched query per source (`get_neighbors_bulk`).
+- [x] **`top_k` above `RETRIEVAL_CANDIDATES`** silently returned fewer hits than requested;
+      the candidate pool now widens to match.
+- [x] **Byte-identical duplicates** under different filenames were indexed twice and then
+      competed with themselves for every retrieval slot. Now detected and skipped.
+- [x] **The re-ranker latched off permanently** after a single failed load — one transient
+      network blip disabled the biggest quality stage for the life of the process. It now
+      retries after 5 minutes.
+
 ## Next steps — the remaining backlog
 
 Full detail and rationale in `OPTIMIZATIONS.md`. In priority order:
 
-1. **Evaluation harness (OPTIMIZATIONS 4.1).** 20-30 golden questions against the two
-   textbooks plus a retrieval hit-rate@k metric. Do this *before* the retrieval-quality
-   work below — otherwise there's no way to tell whether a change helped.
-2. **Cross-encoder re-ranker (3.1).** Retrieve ~30, re-rank, keep 4. The single biggest
-   remaining quality jump; local, free, ~100-300ms.
-3. **Hybrid BM25 + vector search with RRF fusion (3.2).** Fixes exact-term questions
-   ("A* search", "Bayes decision rule") that dense retrieval alone handles poorly.
-4. **Per-document scoping (3.3).** A `source` filter on `/chat` plus a dropdown, so a
-   question can target one textbook.
-5. **Retrieve-more-then-filter + distance floor (3.4).** Answer "not in these documents"
-   without calling the LLM when nothing scores well.
-6. **Neighbor chunk expansion (3.5).** Pull `chunk_index ± 1` around each hit.
-7. **Conversation history (4.5)** — and rewrite follow-up questions to standalone form
-   *before* retrieving, or the retrieval step gets a question that embeds to nothing.
-8. **Streaming responses (4.4).** Groq is fast; the UI currently hides that.
-9. **OCR fallback (4.7)** via `page.get_pixmap()` + `pytesseract` for scanned PDFs.
+0. **Re-run `python scripts/ingest.py`** once after updating, so the deleted-document
+   pruning and recursive scan reconcile the store with what's actually on disk.
+1. **Replace the golden question set with real ones.** `eval/golden_questions.json` still
+   targets the fictional fixture PDF. Write 20-30 questions against the two textbooks with
+   the page you'd expect cited. Until then the eval numbers describe a 3-page fake
+   document, not the corpus you actually query. This is now the highest-value task in the
+   project — everything below should be measured against it.
+2. **Tune with the harness, now that it exists.** Sweep `CHUNK_SIZE_WORDS`,
+   `RETRIEVAL_CANDIDATES`, `TOP_K` and `MIN_RERANK_SCORE` against real questions; the
+   defaults were chosen by reasoning, not measurement.
+3. **Calibrate `MIN_RERANK_SCORE` on real data.** -6.0 is a sensible starting point for
+   ms-marco logits, but the right floor depends on the corpus. Too high and good answers
+   get refused; too low and the "not in these documents" path never fires.
+4. **Persist conversations** if you want history to survive a browser reload — currently
+   the backend is stateless by design and history lives in the page.
+5. **Auth in front of `/ingest` and `/reset`** before this is ever exposed beyond
+   localhost.
+6. **Agentic routing (OPTIMIZATIONS 4.6)** — gate retrieval behind a cheap decision for
+   greetings and general-knowledge questions. Mostly redundant now that the relevance
+   floor short-circuits irrelevant questions without an LLM call; keep it as a learning
+   exercise rather than a priority.
+7. **If you ever deploy this beyond your own machine:** hosted vector DB instead of local
+   Chroma persistence, tighten `allow_origins=["*"]`, and note that the in-memory BM25
+   index is per-process (each worker builds its own).
 
 ## Explicitly out of scope
 

@@ -8,11 +8,16 @@ search).
 Ranked by impact. Tier 1 items are affecting answer quality *right now* on the two
 textbooks in `data/`. Tier 4 items are polish.
 
-> **Status (2026-08-31): Tier 1 and Tier 2 are implemented**, along with the two
-> ten-minute hardening items from Tier 4 (4.2 `top_k` bounds + context budget, 4.3 Groq
-> error handling). See PLAN.md for exactly what changed. **Tier 3 and the rest of Tier 4
-> remain open** — that is the live backlog. Do 4.1 (the evaluation harness) before the
-> Tier 3 retrieval work, so the effect of each change is measurable rather than guessed.
+> **Status (2026-08-31): everything in this document is implemented.** Tier 1 and Tier 2
+> first, then Tier 3 (re-ranking, hybrid BM25 + RRF, per-document scoping, relevance floor,
+> neighbour expansion) and Tier 4 (evaluation harness, streaming, conversation history with
+> follow-up rewriting, OCR fallback, `top_k` bounds, Groq error handling). See PLAN.md for
+> the changelog and CLAUDE.md for how the pieces fit.
+>
+> This document is kept as the **rationale record** — why each change was made and what it
+> was worth — not as an open backlog. The remaining work is listed in PLAN.md, and the top
+> item is replacing `eval/golden_questions.json` with questions about the real textbooks:
+> until then every number the harness reports describes a 3-page fictional PDF.
 
 **A note on the reference project:** it leans on LangChain for loaders, splitting, and the
 vector store. This project deliberately avoids LangChain (see CLAUDE.md) — that constraint

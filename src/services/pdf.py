@@ -13,11 +13,12 @@ Two things matter here and both used to be wrong:
    RecursiveCharacterTextSplitter, written out plainly.
 """
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pymupdf  # PyMuPDF - the `fitz` import name still works but is deprecated
 
-from app.logging_setup import get_logger
+from src.core.config import OCR_DPI, OCR_ENABLED, OCR_LANG
+from src.core.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -41,17 +42,61 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
-def extract_pages(file_path: str) -> List[Dict]:
-    """Returns [{"page": 1, "text": "..."}, {"page": 2, "text": "..."}, ...]"""
+def _ocr_page(page) -> str:
+    """
+    Last-resort text for a page with no extractable text layer (a scan or an exported
+    image). Rasterises the page with PyMuPDF and runs Tesseract over it.
+
+    Both the Python packages (`pytesseract`, `pillow`) and the Tesseract binary itself are
+    optional - if anything is missing we log once and carry on, and the document is
+    reported as skipped exactly as before.
+    """
+    try:
+        import io
+
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        log.warning(
+            "OCR_ENABLED is set but pytesseract/pillow are not installed "
+            "(pip install pytesseract pillow, plus the Tesseract binary). Skipping OCR."
+        )
+        return ""
+
+    try:
+        pixmap = page.get_pixmap(dpi=OCR_DPI)
+        image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+        return pytesseract.image_to_string(image, lang=OCR_LANG)
+    except Exception as exc:
+        log.warning("OCR failed on page %s (%s).", page.number + 1, exc)
+        return ""
+
+
+def extract_pages(file_path: str, ocr: Optional[bool] = None) -> List[Dict]:
+    """
+    Returns [{"page": 1, "text": "..."}, {"page": 2, "text": "..."}, ...]
+
+    Pages with no text layer are OCR'd when OCR is enabled (config.OCR_ENABLED), so a
+    scanned PDF is usable instead of being skipped outright.
+    """
+    ocr = OCR_ENABLED if ocr is None else ocr
     doc = pymupdf.open(file_path)
     pages: List[Dict] = []
+    ocr_pages = 0
     try:
         for i, page in enumerate(doc, start=1):
             text = _normalize(page.get_text() or "")
+            if not text and ocr:
+                text = _normalize(_ocr_page(page))
+                if text:
+                    ocr_pages += 1
             if text:
                 pages.append({"page": i, "text": text})
     finally:
         doc.close()
+
+    if ocr_pages:
+        log.info("Recovered %d page(s) via OCR.", ocr_pages)
     return pages
 
 

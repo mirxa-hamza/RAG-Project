@@ -1,5 +1,5 @@
 # Secrets — never commit real API keys
-backend/.env
+.env
 
 # Python
 venv/
@@ -8,15 +8,19 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# Vector store + its manifest (rebuilt from data/ by scripts/ingest.py)
-backend/chroma_db/
+# Generated index state (rebuilt from data/ by scripts/ingest.py)
+storage/
 
 # data/ is the live ingestion source (real PDFs, possibly large/copyrighted) — never
 # commit the documents themselves, only the code that processes them.
 data/*.pdf
+data/**/*.pdf
 
 # Generated test fixtures (scripts/make_test_pdf.py writes here, never into data/)
-backend/test_fixtures/
+tests/fixtures/
+
+# Evaluation run outputs
+eval/runs/
 
 # Reference material kept locally for study, not part of this project
 refrence/
@@ -26,3 +30,6 @@ refrence/
 Thumbs.db
 .vscode/
 .idea/
+
+# Legacy pre-restructure index location (stale, safe to delete)
+backend/
