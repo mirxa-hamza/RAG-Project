@@ -10,13 +10,17 @@ at each stage. That's deliberate, given this is a learning project.
 
 | Stage             | Tool                                  |
 |-------------------|----------------------------------------|
-| PDF text extraction | `pypdf`                              |
+| PDF text extraction | `PyMuPDF` (`pymupdf`)                 |
 | Chunking           | custom sliding-window chunker (`pdf_utils.py`) |
 | Embeddings         | `sentence-transformers` (`all-MiniLM-L6-v2`, runs locally, free) |
 | Vector store       | ChromaDB (persistent, local folder, no server to run) |
 | LLM                | Groq API (`openai/gpt-oss-20b` by default) |
 | Backend            | FastAPI + Uvicorn |
 | Frontend           | Plain HTML/CSS/JS (no build step) |
+
+> **License note:** `PyMuPDF` is licensed AGPL-3.0 (unlike the permissively-licensed
+> libraries above). Fine for personal/learning use; if you ever open-source or sell this,
+> either comply with AGPL (source stays open) or buy Artifex's commercial PyMuPDF license.
 
 ## Project layout
 
@@ -45,7 +49,7 @@ rag-project/
 ## How a question actually gets answered (the RAG loop)
 
 **At upload time (once per PDF):**
-1. `pypdf` extracts text page by page.
+1. `PyMuPDF` extracts text page by page.
 2. The text is flattened into a stream of words and sliced into overlapping
    chunks (default: 300 words per chunk, 50-word overlap) — overlap exists so a
    sentence that matters doesn't get cut in half between two chunks and lost.

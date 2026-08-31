@@ -55,7 +55,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Save to a temp file because pypdf reads from a file path/stream, not raw bytes directly
+    # Save to a temp file because PyMuPDF opens from a file path/stream, not raw bytes directly
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name

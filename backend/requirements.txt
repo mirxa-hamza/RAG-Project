@@ -1,8 +1,16 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
-pypdf==4.3.1
+pymupdf==1.28.2
 sentence-transformers==3.0.1
 chromadb==0.5.5
+# chromadb==0.5.5's telemetry client calls posthog's old capture() signature.
+# posthog>=3.0 changed that signature, so every ChromaDB call throws a caught-but-noisy
+# "Failed to send telemetry event ... capture() takes 1 positional argument but 3 were given"
+# error on every request. Pinning posthog keeps ChromaDB's telemetry code path working
+# (even though anonymized_telemetry=False in vectorstore.py, the client still constructs
+# the (unused) event object, which is what breaks). Verified fix: pins removes all log spam
+# and every automated test still passes.
+posthog==2.4.2
 groq==0.11.0
 python-dotenv==1.0.1

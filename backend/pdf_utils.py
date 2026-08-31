@@ -3,18 +3,21 @@ Step 1 of the pipeline: turn a PDF into a list of overlapping text chunks,
 each tagged with the page number it came from (so answers can cite a page).
 """
 from typing import List, Dict
-from pypdf import PdfReader
+import pymupdf  # PyMuPDF - the `fitz` import name still works but is deprecated
 
 
 def extract_pages(file_path: str) -> List[Dict]:
     """Returns [{"page": 1, "text": "..."}, {"page": 2, "text": "..."}, ...]"""
-    reader = PdfReader(file_path)
+    doc = pymupdf.open(file_path)
     pages = []
-    for i, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = " ".join(text.split())  # collapse weird whitespace/newlines from PDF extraction
-        if text.strip():
-            pages.append({"page": i, "text": text})
+    try:
+        for i, page in enumerate(doc, start=1):
+            text = page.get_text() or ""
+            text = " ".join(text.split())  # collapse weird whitespace/newlines from PDF extraction
+            if text.strip():
+                pages.append({"page": i, "text": text})
+    finally:
+        doc.close()
     return pages
 
 
