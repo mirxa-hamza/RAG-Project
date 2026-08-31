@@ -12,21 +12,20 @@
 
   <aside class="side">
     <h1>Document Q&amp;A</h1>
-    <p class="lede">Upload a PDF, then ask it questions. Answers are grounded only in what's on the page.</p>
+    <p class="lede">Ask questions about the documents loaded on the backend. Answers are grounded only in what's on the page.</p>
 
-    <div class="upload-box" id="dropZone">
-      <input type="file" id="fileInput" accept="application/pdf" hidden>
-      <p class="upload-label">Drop a PDF here or</p>
-      <button id="browseBtn" class="btn-secondary">choose a file</button>
-      <p id="uploadStatus" class="status"></p>
+    <div class="sync-box" id="syncBox">
+      <p class="upload-label">Documents come only from the backend's <code>data/</code> folder.</p>
+      <button id="syncBtn" class="btn-secondary">Sync from data folder</button>
+      <p id="syncStatus" class="status"></p>
     </div>
 
     <div class="library">
       <div class="library-head">
         <span>In the store</span>
-        <button id="resetBtn" class="btn-text">clear all</button>
+        <button id="resetBtn" class="btn-text">rebuild</button>
       </div>
-      <ul id="sourceList" class="source-list"><li class="empty">Nothing uploaded yet</li></ul>
+      <ul id="sourceList" class="source-list"><li class="empty">Nothing ingested yet</li></ul>
     </div>
 
     <p class="api-note">Backend: <code id="apiBase">http://localhost:8000</code></p>
@@ -35,7 +34,7 @@
   <main class="chat">
     <div class="messages" id="messages">
       <div class="msg system">
-        Upload a PDF on the left, then ask a question about it here.
+        Ask a question about the documents loaded on the backend.
       </div>
     </div>
 

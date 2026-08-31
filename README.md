@@ -6,6 +6,10 @@ answered by an LLM on Groq, grounded only in what's in the PDF.
 No LangChain/LlamaIndex — every step is plain Python so you can see exactly what's happening
 at each stage. That's deliberate, given this is a learning project.
 
+**Documents come only from the backend's `data/` folder.** There is no upload endpoint —
+the frontend can only ask questions, never add or change what's in the vector store. Drop
+PDFs into `data/`, restart the server (or hit `POST /ingest`), and they're searchable.
+
 ## Stack
 
 | Stage             | Tool                                  |
@@ -27,8 +31,9 @@ at each stage. That's deliberate, given this is a learning project.
 ```
 rag-project/
 ├── backend/
-│   ├── main.py                    FastAPI app: /upload, /chat, /stats, /reset, /health
+│   ├── main.py                    FastAPI app: /ingest, /chat, /stats, /reset, /health
 │   ├── config.py                  loads all settings from .env
+│   ├── ingest.py                  the ONLY path documents enter the system - scans data/
 │   ├── pdf_utils.py                PDF → pages → overlapping chunks
 │   ├── embeddings.py               wraps the sentence-transformers model
 │   ├── vectorstore.py              ChromaDB: add_chunks / query_chunks
@@ -36,26 +41,28 @@ rag-project/
 │   ├── requirements.txt
 │   ├── requirements-dev.txt        adds test-only deps (httpx, reportlab)
 │   ├── .env.example                copy to .env and fill in your Groq key
-│   ├── make_test_pdf.py            generates a sample PDF for testing
+│   ├── make_test_pdf.py            generates a fictional PDF into test_fixtures/ for testing
+│   ├── test_fixtures/              test-only PDFs (gitignored, never mixed with data/)
 │   └── test_pipeline_offline.py    automated end-to-end test (see below)
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
 │   └── script.js
 └── data/
-    └── sample.pdf                  generated test document
+    └── (your real PDFs go here — this folder is the only way to add documents)
 ```
 
 ## How a question actually gets answered (the RAG loop)
 
-**At upload time (once per PDF):**
-1. `PyMuPDF` extracts text page by page.
-2. The text is flattened into a stream of words and sliced into overlapping
+**At ingestion time (server startup, and whenever `POST /ingest` runs):**
+1. The backend scans `data/` for `.pdf` files not already stored.
+2. `PyMuPDF` extracts text page by page from each new one.
+3. The text is flattened into a stream of words and sliced into overlapping
    chunks (default: 300 words per chunk, 50-word overlap) — overlap exists so a
    sentence that matters doesn't get cut in half between two chunks and lost.
-3. Each chunk is embedded (turned into a vector of numbers that captures its
+4. Each chunk is embedded (turned into a vector of numbers that captures its
    meaning) by a local model — no API call, no cost.
-4. The chunk text + its vector + its page number get stored in ChromaDB.
+5. The chunk text + its vector + its page number get stored in ChromaDB.
 
 **At question time (every chat message):**
 1. Your question is embedded with the *same* model.
@@ -82,6 +89,28 @@ The default model is `openai/gpt-oss-20b` — Groq deprecates models periodicall
 so if you get a "model not found" error, check https://console.groq.com/docs/models
 and update `GROQ_MODEL` in `.env`.
 
+**Windows on ARM64 (Snapdragon/Copilot+ PCs):** `requirements.txt` pins `chromadb==1.5.9`
+specifically because older `chromadb` (0.5.x) requires `numpy<2.0`, and numpy has no
+official wheel below 2.0 for Windows ARM64 — that combination crashes at import time with
+`AttributeError: np.float_ was removed in the NumPy 2.0 release`. If you still see a numpy
+`MINGW-W64 ... experimental` warning on startup, that's just numpy's own build note for
+this platform (no official MSVC/OpenBLAS build yet) — harmless on its own.
+
+`requirements.txt` also pins `groq==1.7.0` (not the older `groq==0.11.0`) — the old version
+breaks under `httpx>=0.28` with `TypeError: Client.__init__() got an unexpected keyword
+argument 'proxies'`, since `requirements-dev.txt` pins `httpx==0.28.1` directly.
+
+## Adding documents
+
+Put PDFs directly in the `data/` folder — that's the only way documents get in. Then either:
+
+- **Restart the server** — ingestion runs automatically on startup, or
+- **Call `POST /ingest`** (or click "Sync from data folder" in the frontend sidebar) to pick
+  up new files without a restart.
+
+Either way, files already ingested are skipped (matched by filename), so it's always safe
+to re-run.
+
 ## Running it
 
 ```bash
@@ -90,7 +119,10 @@ uvicorn main:app --reload --port 8000
 ```
 
 First run will download the embedding model (~90MB) — that needs a normal internet
-connection and takes a few seconds to a minute, then it's cached locally for good.
+connection and takes a few seconds to a minute, then it's cached locally for good. It will
+also ingest whatever is already in `data/` before it starts serving requests — for a large
+PDF this can take a while the first time (embedding runs locally, no API cost, but it's CPU
+work), so give it a minute on a big document.
 
 Then open `frontend/index.html` directly in a browser (double-click it, or use
 VS Code's Live Server extension). It talks to `http://localhost:8000` by default —
@@ -98,32 +130,33 @@ change `API_BASE` at the top of `frontend/script.js` if you serve the backend
 elsewhere.
 
 **Try it:**
-1. Upload a PDF using the sidebar.
-2. Ask a question about its content in the chat box.
-3. The answer appears with a "Sources" line showing which page(s) and how
+1. Ask a question about a document's content in the chat box.
+2. The answer appears with a "Sources" line showing which page(s) and how
    similar each retrieved chunk was to your question (0–1, higher = closer match).
+3. Added a new PDF to `data/` while the server's running? Click "Sync from data folder"
+   in the sidebar (or restart the server) to make it searchable.
 
 ## Testing
 
 Two layers of testing are included:
 
 **1. Automated pipeline test (`test_pipeline_offline.py`)**
-Generates a small sample PDF and drives every FastAPI endpoint (`/upload`,
-`/chat`, `/stats`, `/reset`) through `TestClient`, checking that PDF parsing,
-chunking, and ChromaDB storage/retrieval all behave correctly.
+Generates fictional test PDFs into `backend/test_fixtures/` (never `data/`) and drives
+every FastAPI endpoint (`/ingest`, `/chat`, `/stats`, `/reset`, startup ingestion) through
+`TestClient`, checking that PDF parsing, chunking, and ChromaDB storage/retrieval all
+behave correctly.
 
 ```bash
 pip install -r requirements-dev.txt
-python3 make_test_pdf.py
 python3 test_pipeline_offline.py
 ```
 
-This has already been run during development — all checks pass. It swaps in a
-lightweight fake embedding model instead of the real one, purely so it can run
-without a live download in restricted environments; on your machine you can
-freely rely on it since your internet access is normal. It also doesn't call
-Groq (no API key needed) — it just confirms the app correctly reports "no key
-set" instead of crashing, so you know that failure path is handled.
+(`test_pipeline_offline.py` generates its own fixture PDFs via `make_test_pdf.py` — no need
+to run that separately.) This swaps in a lightweight fake embedding model instead of the
+real one, purely so it can run without a live download in restricted environments; on your
+machine you can freely rely on it since your internet access is normal. It also doesn't
+call Groq (no API key needed) — it just confirms the app correctly reports "no key set"
+instead of crashing, so you know that failure path is handled.
 
 **2. Manual smoke test (do this once you have a real GROQ_API_KEY)**
 
@@ -131,21 +164,19 @@ set" instead of crashing, so you know that failure path is handled.
 # terminal 1
 uvicorn main:app --reload --port 8000
 
-# terminal 2
-curl -X POST http://localhost:8000/upload -F "file=@../data/sample.pdf"
+# terminal 2 - if data/ already has a document loaded, just ask about it:
 curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" \
-     -d '{"question": "How much funding did the project receive?"}'
+     -d '{"question": "What is this document about?"}'
 ```
 
-You should get back a JSON answer citing the $1.2 million figure and page 2.
 Then try the same question through the actual frontend in a browser.
 
 **3. Things worth testing deliberately, once it's running:**
 - Ask something *not* in the PDF → the model should say it isn't there, not
   make something up. If it hallucinates, tighten the system prompt in `llm.py`.
-- Upload two different PDFs and ask a question — check `sources` in the
+- Put two different PDFs in `data/` and ask a question — check `sources` in the
   response to confirm retrieval is pulling from the right document.
-- Try a scanned/image-only PDF → `/upload` should return a clear 422 error
+- Try a scanned/image-only PDF → `/ingest` should mark it `"status": "skipped"`
   (this pipeline doesn't do OCR; that'd be a `pytesseract` addition later).
 
 ## Known limitations (fine for a learning project, worth knowing)
@@ -158,10 +189,19 @@ Then try the same question through the actual frontend in a browser.
 - **In-memory chat, no conversation history** — each question is answered
   independently; there's no multi-turn memory yet. (Natural next feature: pass
   recent Q&A pairs into the prompt.)
-- **Single global collection** — all uploaded PDFs go into one ChromaDB
-  collection, so questions retrieve across every uploaded document. Fine for
+- **Single global collection** — all ingested PDFs go into one ChromaDB
+  collection, so questions retrieve across every ingested document. Fine for
   one user testing locally; for multi-user you'd add per-user or per-session
   collections.
+- **No authentication on `/ingest` or `/reset`** — anyone who can reach the API can
+  trigger a re-ingest or wipe the store. Fine for local/personal use; add auth before
+  exposing this beyond your own machine.
+- **Windows ARM64 numpy warning** — you may still see `Numpy built with MINGW-W64 on
+  Windows 64 bits is experimental` on startup even with the fixes above. NumPy doesn't yet
+  publish an MSVC/OpenBLAS build for Windows ARM64, so pip installs a community MINGW-W64
+  build — the warning alone is expected and generally harmless for this project's vector
+  math. `pip install --upgrade numpy` gets the newest available ARM64 wheel if you see
+  actual numeric errors, not just the warning.
 
 ## Natural next steps, if you want to extend it
 
@@ -171,3 +211,4 @@ Then try the same question through the actual frontend in a browser.
 - Add OCR (`pytesseract`) for scanned PDFs.
 - Move from ChromaDB's local persistence to a hosted vector DB if you deploy
   this rather than run it locally.
+- Add simple auth in front of `/ingest` and `/reset` before exposing this beyond localhost.

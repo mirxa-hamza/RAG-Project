@@ -1,10 +1,8 @@
 const API_BASE = "http://localhost:8000";
 document.getElementById("apiBase").textContent = API_BASE;
 
-const dropZone = document.getElementById("dropZone");
-const fileInput = document.getElementById("fileInput");
-const browseBtn = document.getElementById("browseBtn");
-const uploadStatus = document.getElementById("uploadStatus");
+const syncBtn = document.getElementById("syncBtn");
+const syncStatus = document.getElementById("syncStatus");
 const sourceList = document.getElementById("sourceList");
 const resetBtn = document.getElementById("resetBtn");
 
@@ -13,48 +11,34 @@ const chatForm = document.getElementById("chatForm");
 const questionInput = document.getElementById("questionInput");
 const sendBtn = document.getElementById("sendBtn");
 
-// ---------- Upload ----------
-browseBtn.addEventListener("click", () => fileInput.click());
-fileInput.addEventListener("change", () => {
-  if (fileInput.files[0]) uploadFile(fileInput.files[0]);
-});
-
-["dragover", "dragleave", "drop"].forEach(evt => {
-  dropZone.addEventListener(evt, e => e.preventDefault());
-});
-dropZone.addEventListener("dragover", () => dropZone.classList.add("drag"));
-dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag"));
-dropZone.addEventListener("drop", e => {
-  dropZone.classList.remove("drag");
-  const file = e.dataTransfer.files[0];
-  if (file) uploadFile(file);
-});
-
-async function uploadFile(file) {
-  if (!file.name.toLowerCase().endsWith(".pdf")) {
-    setStatus("Only PDF files are supported.", true);
-    return;
-  }
-  setStatus(`Uploading ${file.name}...`, false);
-
-  const formData = new FormData();
-  formData.append("file", file);
-
+// ---------- Sync (no upload - just tells the backend to re-scan its own data folder) ----------
+syncBtn.addEventListener("click", async () => {
+  syncBtn.disabled = true;
+  setStatus("Scanning the data folder...", false);
   try {
-    const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: formData });
+    const res = await fetch(`${API_BASE}/ingest`, { method: "POST" });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Upload failed");
+    if (!res.ok) throw new Error(data.detail || "Sync failed");
 
-    setStatus(`Stored ${data.chunks_stored} chunks from ${data.pages} pages.`, false);
+    const ingested = data.results.filter(r => r.status === "ingested").length;
+    const skipped = data.results.filter(r => r.status === "skipped").length;
+    setStatus(
+      ingested > 0
+        ? `Ingested ${ingested} new document(s).${skipped ? ` ${skipped} skipped (no extractable text).` : ""}`
+        : "Nothing new to ingest - data folder already fully synced.",
+      false
+    );
     await refreshSources();
   } catch (err) {
     setStatus(err.message, true);
+  } finally {
+    syncBtn.disabled = false;
   }
-}
+});
 
 function setStatus(text, isError) {
-  uploadStatus.textContent = text;
-  uploadStatus.className = "status" + (isError ? " error" : "");
+  syncStatus.textContent = text;
+  syncStatus.className = "status" + (isError ? " error" : "");
 }
 
 async function refreshSources() {
@@ -62,7 +46,7 @@ async function refreshSources() {
     const res = await fetch(`${API_BASE}/stats`);
     const data = await res.json();
     if (!data.sources || data.sources.length === 0) {
-      sourceList.innerHTML = `<li class="empty">Nothing uploaded yet</li>`;
+      sourceList.innerHTML = `<li class="empty">Nothing ingested yet</li>`;
       return;
     }
     sourceList.innerHTML = data.sources.map(s => `<li>${escapeHtml(s)}</li>`).join("");
@@ -73,9 +57,10 @@ async function refreshSources() {
 
 resetBtn.addEventListener("click", async () => {
   try {
+    setStatus("Rebuilding from the data folder...", false);
     await fetch(`${API_BASE}/reset`, { method: "POST" });
     await refreshSources();
-    setStatus("Vector store cleared.", false);
+    setStatus("Vector store cleared and rebuilt from the data folder.", false);
   } catch (err) {
     setStatus("Couldn't reach the backend.", true);
   }

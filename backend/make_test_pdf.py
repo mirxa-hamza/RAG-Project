@@ -1,4 +1,10 @@
-"""Generates data/sample.pdf - a small fictional PDF used to test the pipeline end to end."""
+"""
+Generates test_fixtures/sample.pdf - a small fictional PDF used to test the pipeline
+end to end. Deliberately written OUTSIDE the real data/ folder: data/ is now the live
+ingestion source for real documents, and this fake PDF must never mix in with those.
+"""
+import os
+
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
@@ -28,7 +34,8 @@ for early 2025.""",
 ]
 
 
-def make_pdf(path="../data/sample.pdf"):
+def make_pdf(path="test_fixtures/sample.pdf"):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     c = canvas.Canvas(path, pagesize=letter)
     width, height = letter
     for page_text in PAGES:

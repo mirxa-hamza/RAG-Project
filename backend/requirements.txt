@@ -3,14 +3,18 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 pymupdf==1.28.2
 sentence-transformers==3.0.1
-chromadb==0.5.5
-# chromadb==0.5.5's telemetry client calls posthog's old capture() signature.
-# posthog>=3.0 changed that signature, so every ChromaDB call throws a caught-but-noisy
-# "Failed to send telemetry event ... capture() takes 1 positional argument but 3 were given"
-# error on every request. Pinning posthog keeps ChromaDB's telemetry code path working
-# (even though anonymized_telemetry=False in vectorstore.py, the client still constructs
-# the (unused) event object, which is what breaks). Verified fix: pins removes all log spam
-# and every automated test still passes.
-posthog==2.4.2
-groq==0.11.0
+# chromadb==0.5.5 hard-requires numpy<2.0, but numpy<2.0 has no official Windows ARM64
+# wheels - pip is forced onto numpy>=2.0 there, which then crashes chromadb 0.5.5 at
+# import time (AttributeError: np.float_ was removed in NumPy 2.0). chromadb>=1.0 dropped
+# both that numpy<2.0 pin and its posthog telemetry dependency entirely (no more
+# "Failed to send telemetry event ... capture()" spam either). Verified: full offline
+# test suite passes clean on chromadb==1.5.9 + numpy 2.x, no pins or workarounds needed.
+chromadb==1.5.9
+# groq==0.11.0's bundled httpx client construction breaks under httpx>=0.28 (which dropped
+# the `proxies` kwarg httpx.Client used to accept) - TypeError: Client.__init__() got an
+# unexpected keyword argument 'proxies'. Something else in this project's dependency tree
+# pulls in httpx>=0.28 (requirements-dev.txt pins httpx==0.28.1 directly), so bump groq to
+# a version built against modern httpx instead of pinning httpx back down. Verified on
+# groq==1.7.0 + httpx==0.28.1: client constructs fine, full offline test suite still passes.
+groq==1.7.0
 python-dotenv==1.0.1

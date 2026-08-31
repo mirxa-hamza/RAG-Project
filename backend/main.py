@@ -1,27 +1,28 @@
 """
 FastAPI backend for the RAG system.
 
+Documents come ONLY from the backend's data folder (see config.DATA_DIR) - there is no
+upload endpoint, so a user on the frontend can ask questions but can never add or change
+what's in the vector store. Drop a PDF into that folder and either restart the server
+(ingestion runs on startup) or call POST /ingest to pick it up without a restart.
+
 Endpoints:
-  POST /upload   - upload a PDF, it gets chunked + embedded + stored
-  POST /chat     - ask a question, get an answer grounded in the uploaded PDF(s)
+  POST /ingest   - (re)scan the data folder and ingest any PDF not already stored
+  POST /chat     - ask a question, get an answer grounded in the ingested PDF(s)
   GET  /stats    - see what's currently stored
-  POST /reset    - wipe the vector store (handy while testing)
+  POST /reset    - wipe the vector store, then immediately re-ingest the data folder
   GET  /health   - basic liveness check
 
 Run with:  uvicorn main:app --reload --port 8000
 """
-import os
-import shutil
-import tempfile
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from pdf_utils import extract_pages, chunk_document
-from vectorstore import add_chunks, query_chunks, collection_stats, reset_collection
+from config import TOP_K
+from ingest import ingest_data_folder
 from llm import generate_answer
-from config import CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS, TOP_K
+from vectorstore import collection_stats, query_chunks, reset_collection
 
 app = FastAPI(title="RAG API", version="1.0")
 
@@ -45,40 +46,24 @@ class ChatResponse(BaseModel):
     sources: list
 
 
+@app.on_event("startup")
+def on_startup():
+    """Ingests whatever is already sitting in the data folder when the server boots."""
+    results = ingest_data_folder()
+    for r in results:
+        print(f"[startup] {r}")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    # Save to a temp file because PyMuPDF opens from a file path/stream, not raw bytes directly
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
-    try:
-        pages = extract_pages(tmp_path)
-        if not pages:
-            raise HTTPException(
-                status_code=422,
-                detail="Couldn't extract any text from this PDF. It may be a scanned "
-                       "image PDF, which needs OCR (not covered by this basic pipeline).",
-            )
-
-        chunks = chunk_document(pages, CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS)
-        stored = add_chunks(file.filename, chunks)
-
-        return {
-            "filename": file.filename,
-            "pages": len(pages),
-            "chunks_stored": stored,
-        }
-    finally:
-        os.remove(tmp_path)
+@app.post("/ingest")
+def ingest():
+    """Re-scans the data folder and ingests any PDF that isn't already stored. No file
+    upload - this only ever reads what's already on disk on the backend."""
+    return {"results": ingest_data_folder()}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -108,5 +93,9 @@ def stats():
 
 @app.post("/reset")
 def reset():
+    """Wipes the vector store, then immediately re-ingests everything in the data
+    folder - a clean rebuild, not a way to make documents disappear (they only leave
+    the store if you also remove them from the data folder)."""
     reset_collection()
-    return {"status": "vector store cleared"}
+    results = ingest_data_folder()
+    return {"status": "vector store cleared and re-ingested", "results": results}

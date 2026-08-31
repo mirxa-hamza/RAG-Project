@@ -54,18 +54,19 @@ body {
   max-width: 32ch;
 }
 
-.upload-box {
+.sync-box {
   border: 1px dashed var(--line);
   border-radius: var(--radius);
   padding: 22px 16px;
   text-align: center;
   background: var(--paper);
-  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
-.upload-box.drag {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+.sync-box .upload-label code {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 1px 5px;
+  border-radius: 4px;
 }
 
 .upload-label {

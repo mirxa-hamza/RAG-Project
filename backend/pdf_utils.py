@@ -5,6 +5,14 @@ each tagged with the page number it came from (so answers can cite a page).
 from typing import List, Dict
 import pymupdf  # PyMuPDF - the `fitz` import name still works but is deprecated
 
+# Many real-world PDFs (scanned pages, exported figures) carry malformed/unsupported
+# embedded ICC color profiles. MuPDF's C layer logs one "format error:
+# cmsOpenProfileFromMem failed" line per affected image straight to stderr - purely
+# cosmetic (text extraction is unaffected), but it can drown a large book's ingestion
+# log in thousands of near-duplicate lines. Silenced globally here.
+pymupdf.TOOLS.mupdf_display_errors(False)
+pymupdf.TOOLS.mupdf_display_warnings(False)
+
 
 def extract_pages(file_path: str) -> List[Dict]:
     """Returns [{"page": 1, "text": "..."}, {"page": 2, "text": "..."}, ...]"""

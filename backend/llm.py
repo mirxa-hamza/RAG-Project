@@ -10,7 +10,7 @@ _client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant that answers questions strictly using the "
-    "CONTEXT provided below, which was retrieved from a user-uploaded PDF. "
+    "CONTEXT provided below, which was retrieved from the ingested PDF document(s). "
     "Rules:\n"
     "1. Only use information found in the CONTEXT. Do not use outside knowledge.\n"
     "2. If the CONTEXT does not contain the answer, say clearly that the "
