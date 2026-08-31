@@ -1,35 +1,47 @@
-# Secrets — never commit real API keys
+# ─── Secrets ────────────────────────────────────────────────────────────────
+# Never commit real API keys. .env.example IS tracked and is the template.
 .env
+.env.*
+!.env.example
 
-# Python
+# ─── Python ─────────────────────────────────────────────────────────────────
 venv/
 .venv/
+env/
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Generated index state (rebuilt from data/ by scripts/ingest.py)
+# ─── Generated index state ──────────────────────────────────────────────────
+# The vector store is DERIVED data: it is rebuilt from data/ by scripts/ingest.py.
+# It is large, binary, unmergeable, and only valid for the exact embedding model and
+# chunk settings that produced it — so it must never be committed. Each collaborator
+# builds their own.
 storage/
 
-# data/ is the live ingestion source (real PDFs, possibly large/copyrighted) — never
-# commit the documents themselves, only the code that processes them.
-data/*.pdf
-data/**/*.pdf
+# ─── Source documents ───────────────────────────────────────────────────────
+# The PDFs themselves stay out of the repo: they are large, often copyrighted, and
+# change independently of the code. Share them out of band (Drive, USB, S3).
+# data/.gitkeep is tracked so the folder exists after a fresh clone.
+data/*
+!data/.gitkeep
 
-# Generated test fixtures (scripts/make_test_pdf.py writes here, never into data/)
+# ─── Test & evaluation artifacts ────────────────────────────────────────────
 tests/fixtures/
-
-# Evaluation run outputs
 eval/runs/
 
-# Reference material kept locally for study, not part of this project
+# ─── Reference material kept locally for study, not part of this project ────
 refrence/
 
-# OS / editor junk
+# ─── Logs & OS / editor junk ────────────────────────────────────────────────
+*.log
 .DS_Store
 Thumbs.db
+desktop.ini
 .vscode/
 .idea/
-
-# Legacy pre-restructure index location (stale, safe to delete)
-backend/

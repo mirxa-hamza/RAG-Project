@@ -1,0 +1,166 @@
+# Setup guide — getting this running on your machine
+
+Everything runs locally except the answer generation, which calls Groq. Embedding,
+search and re-ranking all happen on your CPU, so there's nothing to pay for there.
+
+Expect the first run to take a few minutes: it downloads two models (~210MB total) and
+then indexes whatever PDFs you put in `data/`.
+
+---
+
+## 1. Prerequisites
+
+- **Python 3.10+** (3.13 is what we develop on) — `python --version`
+- **Git**
+- **A free Groq API key** — make your own at <https://console.groq.com/keys>.
+  Don't reuse anyone else's; keys are personal and rate-limited per account.
+- ~2GB of free disk (PyTorch is the bulk of it) and a normal internet connection for
+  the first run.
+
+---
+
+## 2. Clone and install
+
+```bash
+git clone <REPO_URL>
+cd "My RAG Project"
+
+python -m venv venv
+
+# Windows (PowerShell):
+venv\Scripts\activate
+# macOS / Linux:
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+If `venv\Scripts\activate` is blocked on Windows PowerShell, run
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that terminal first.
+
+---
+
+## 3. Configure your key
+
+```bash
+copy .env.example .env      # Windows
+cp .env.example .env        # macOS / Linux
+```
+
+Open `.env` and set your own key:
+
+```
+GROQ_API_KEY=gsk_your_own_key_here
+```
+
+Everything else in `.env` has a sensible default — leave it alone unless you're
+deliberately experimenting. **`.env` is gitignored; never commit it.**
+
+---
+
+## 4. Add documents
+
+The repo deliberately ships **no PDFs** — they're large, often copyrighted, and change
+independently of the code. There is no upload button either: documents only enter the
+system through the folder.
+
+Put any PDFs you want to query into `data/`:
+
+```
+data/
+├── some-book.pdf
+└── textbooks/            ← subfolders work too
+    └── another.pdf
+```
+
+Then build the index:
+
+```bash
+python scripts/ingest.py
+```
+
+This extracts text, chunks it, embeds every chunk locally, and stores it. A 900-page
+textbook takes a few minutes on CPU — the log prints per-file progress, it isn't hung.
+
+---
+
+## 5. Run it
+
+```bash
+uvicorn src.main:app --reload --port 8000
+```
+
+Open **<http://localhost:8000>** — the web UI is served by the same process, so there's
+no separate HTML file to open. API docs are at `/docs`.
+
+The server also runs an ingestion pass in the background at startup, so step 4 is
+optional; doing it up front just means the app is queryable the moment it boots.
+
+---
+
+## Working with documents day to day
+
+| What you want | Command |
+|---|---|
+| Index new or changed PDFs | `python scripts/ingest.py` |
+| See what's currently indexed | `python scripts/ingest.py --status` |
+| Wipe and rebuild everything | `python scripts/ingest.py --force` |
+| Same, without leaving the browser | the **Sync from data folder** button in the sidebar |
+
+Files are fingerprinted by SHA-256, so re-running is always safe and cheap:
+
+- **new file** → indexed
+- **unchanged file** → skipped instantly (no re-embedding)
+- **edited file** → old chunks deleted, re-indexed
+- **deleted file** → removed from the index automatically
+- **corrupt file** → reported as `failed`, everything else still indexes
+
+You only need `--force` if you change the embedding model or the chunk settings in
+`.env`, since the stored vectors are only valid for the settings that produced them.
+
+---
+
+## Verify it works
+
+```bash
+pip install -r requirements-dev.txt
+python tests/test_pipeline_offline.py
+```
+
+86 checks, fully offline — no API key and no model download needed, because it stubs the
+models. Run this before pushing anything.
+
+To measure *answer quality* rather than plumbing:
+
+```bash
+python eval/run_eval.py            # retrieval hit-rate@k, MRR, refusal rate
+python eval/run_eval.py --judge    # + LLM-as-judge scoring (uses your Groq key)
+```
+
+---
+
+## Things worth knowing
+
+- **The vector store is not in the repo.** `storage/` is gitignored. It's derived data —
+  rebuilt from `data/` in minutes — and it's large, binary, and unmergeable. You build
+  your own with `scripts/ingest.py`.
+- **First question is slower.** The cross-encoder re-ranker (~80MB) downloads lazily on
+  the first question you ask, then it's cached.
+- **If a question isn't covered by the documents**, the app says so instead of guessing.
+  That's the relevance floor doing its job, not a bug.
+- **Answers cite pages.** If a citation looks off by a page, chunks can span a page
+  boundary — that's a known approximation, documented in CLAUDE.md.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'src'` | Run from the **project root**, not from inside `src/`. |
+| `ModuleNotFoundError: rank_bm25` etc. | `pip install -r requirements.txt` again — the venv is stale. |
+| Answer says `GROQ_API_KEY is not set` | `.env` is missing or the key line is empty; restart the server after editing it. |
+| `model not found` from Groq | Groq retires models; check <https://console.groq.com/docs/models> and update `GROQ_MODEL` in `.env`. |
+| Sidebar shows no documents | No PDFs in `data/`, or ingestion hasn't run — click **Sync from data folder**. |
+| `Numpy built with MINGW-W64` warning | Windows-on-ARM only, harmless. |
+
+More detail: `README.md` for the architecture, `CLAUDE.md` for conventions and known
+gotchas, `PLAN.md` for the roadmap.

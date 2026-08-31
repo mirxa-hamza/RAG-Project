@@ -1,0 +1,18 @@
+{
+  "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf": {
+    "sha256": "0d201baef784a7489b181bdf1d0b64c10c3035ffb1bfbe130b8f18671cc61861",
+    "mtime": 1773731849.4058414,
+    "size": 37986705,
+    "pages": 946,
+    "chunks": 1922,
+    "ingested_at": "2026-08-31T11:13:13+00:00"
+  },
+  "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf": {
+    "sha256": "b849f35c781db1d8550f75b4bb6c3dd12cb8983cd607b508bfa7d1cf9e4417a0",
+    "mtime": 1773731860.4601612,
+    "size": 11823047,
+    "pages": 717,
+    "chunks": 1283,
+    "ingested_at": "2026-08-31T11:17:02+00:00"
+  }
+}
