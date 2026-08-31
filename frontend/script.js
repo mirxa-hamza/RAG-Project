@@ -11,60 +11,101 @@ const chatForm = document.getElementById("chatForm");
 const questionInput = document.getElementById("questionInput");
 const sendBtn = document.getElementById("sendBtn");
 
-// ---------- Sync (no upload - just tells the backend to re-scan its own data folder) ----------
-syncBtn.addEventListener("click", async () => {
-  syncBtn.disabled = true;
-  setStatus("Scanning the data folder...", false);
-  try {
-    const res = await fetch(`${API_BASE}/ingest`, { method: "POST" });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Sync failed");
+let polling = false;
 
-    const ingested = data.results.filter(r => r.status === "ingested").length;
-    const skipped = data.results.filter(r => r.status === "skipped").length;
-    setStatus(
-      ingested > 0
-        ? `Ingested ${ingested} new document(s).${skipped ? ` ${skipped} skipped (no extractable text).` : ""}`
-        : "Nothing new to ingest - data folder already fully synced.",
-      false
-    );
-    await refreshSources();
+// ---------- Ingestion (no upload - the backend re-scans its own data folder) ----------
+syncBtn.addEventListener("click", () => runJob("/ingest", "Scanning the data folder..."));
+resetBtn.addEventListener("click", () => runJob("/reset", "Rebuilding the store from the data folder..."));
+
+async function runJob(path, startMessage) {
+  setBusy(true);
+  setStatus(startMessage, false);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    await pollUntilDone();
   } catch (err) {
     setStatus(err.message, true);
-  } finally {
-    syncBtn.disabled = false;
+    setBusy(false);
   }
-});
+}
+
+// Ingestion runs as a background job on the backend, so poll it rather than
+// hanging on one long request - a big PDF takes minutes to embed.
+async function pollUntilDone() {
+  polling = true;
+  while (polling) {
+    let job;
+    try {
+      job = await (await fetch(`${API_BASE}/ingest/status`)).json();
+    } catch {
+      setStatus("Lost contact with the backend.", true);
+      break;
+    }
+
+    if (job.state === "running") {
+      const done = job.files_done ?? 0;
+      const total = job.files_total ?? 0;
+      const current = job.current_file ? ` - ${job.current_file}` : "";
+      setStatus(`Ingesting${current} (${done}/${total || "?"})...`, false);
+      await sleep(1000);
+      continue;
+    }
+
+    if (job.state === "error") {
+      setStatus(`Ingestion failed: ${job.error}`, true);
+    } else {
+      const results = job.results || [];
+      const ingested = results.filter(r => r.status === "ingested").length;
+      const skipped = results.filter(r => r.status === "skipped").length;
+      setStatus(
+        ingested > 0
+          ? `Ingested ${ingested} document(s).${skipped ? ` ${skipped} skipped (no extractable text).` : ""}`
+          : "Nothing new - the data folder is already fully synced.",
+        false
+      );
+    }
+    await refreshSources();
+    break;
+  }
+  polling = false;
+  setBusy(false);
+}
+
+function setBusy(busy) {
+  syncBtn.disabled = busy;
+  resetBtn.disabled = busy;
+}
 
 function setStatus(text, isError) {
   syncStatus.textContent = text;
   syncStatus.className = "status" + (isError ? " error" : "");
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 async function refreshSources() {
   try {
     const res = await fetch(`${API_BASE}/stats`);
     const data = await res.json();
-    if (!data.sources || data.sources.length === 0) {
+
+    if (!data.documents || data.documents.length === 0) {
       sourceList.innerHTML = `<li class="empty">Nothing ingested yet</li>`;
-      return;
+    } else {
+      sourceList.innerHTML = data.documents.map(d => `
+        <li>
+          <span class="doc-name">${escapeHtml(d.filename)}</span>
+          <span class="doc-meta">${d.pages ?? "?"} pages · ${d.chunks ?? "?"} chunks</span>
+        </li>`).join("");
     }
-    sourceList.innerHTML = data.sources.map(s => `<li>${escapeHtml(s)}</li>`).join("");
+
+    // A job may already be running when the page loads (e.g. server just started).
+    if (data.ingesting && !polling) pollUntilDone();
   } catch {
     // backend not reachable yet - fine on first load, ignore
   }
 }
-
-resetBtn.addEventListener("click", async () => {
-  try {
-    setStatus("Rebuilding from the data folder...", false);
-    await fetch(`${API_BASE}/reset`, { method: "POST" });
-    await refreshSources();
-    setStatus("Vector store cleared and rebuilt from the data folder.", false);
-  } catch (err) {
-    setStatus("Couldn't reach the backend.", true);
-  }
-});
 
 // ---------- Chat ----------
 chatForm.addEventListener("submit", async e => {
@@ -85,14 +126,14 @@ chatForm.addEventListener("submit", async e => {
       body: JSON.stringify({ question }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Request failed");
+    if (!res.ok) throw new Error(data.detail?.[0]?.msg || data.detail || "Request failed");
 
     thinkingEl.textContent = data.answer;
     if (data.sources && data.sources.length > 0) {
       const src = document.createElement("div");
       src.className = "sources";
       src.textContent = "Sources: " + data.sources
-        .map(s => `${s.source} p.${s.page} (${s.similarity})`)
+        .map(s => `${s.source} ${s.pages} (${s.similarity})`)
         .join(" · ");
       thinkingEl.appendChild(src);
     }

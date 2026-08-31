@@ -11,145 +11,119 @@ Python — this is a learning project first, a working app second.
 
 **Documents come only from `data/` on the backend's own filesystem.** There is no upload
 endpoint and never should be — a user talking to the frontend can ask questions but can
-never add, replace, or remove what's in the vector store. If you're asked to "add a way to
-upload files from the browser," push back or confirm explicitly — that's a deliberate,
-stated design constraint, not an oversight.
+never add, replace, or remove what's in the vector store. If asked to "add a way to upload
+files from the browser," confirm explicitly first — that's a deliberate, stated design
+constraint, not an oversight.
 
-Flow: PDF → `PyMuPDF` text extraction → sliding-window chunking → local embeddings
-(`sentence-transformers`) → ChromaDB (persistent, on-disk) → cosine retrieval at question
-time → Groq LLM answers strictly from retrieved chunks.
-
-## Stack
-
-| Layer      | Tool                                                |
-|------------|------------------------------------------------------|
-| Backend    | FastAPI + Uvicorn                                    |
-| PDF text   | `PyMuPDF` (`pymupdf`) — AGPL-3.0 licensed, see note below |
-| Chunking   | custom sliding-window chunker (`backend/pdf_utils.py`) |
-| Embeddings | `sentence-transformers` (`all-MiniLM-L6-v2`, local, free) |
-| Vector DB  | ChromaDB (persistent client, no separate server)      |
-| LLM        | Groq API (`openai/gpt-oss-20b` by default)            |
-| Frontend   | Plain HTML/CSS/JS, no build step, no framework        |
+Flow: PDF → `PyMuPDF` extraction (paragraphs preserved) → structure-aware chunking →
+local embeddings (`sentence-transformers`) → ChromaDB (persistent, on-disk) → cosine
+retrieval → Groq LLM answers strictly from retrieved chunks.
 
 ## Layout
 
 ```
 backend/
-  main.py                FastAPI app: /ingest, /chat, /stats, /reset, /health (no /upload)
-  config.py               all settings, loaded once from .env (single source of truth)
-  ingest.py                the ONLY path documents enter the system - scans DATA_DIR
-  pdf_utils.py             PDF -> pages -> overlapping chunks
-  embeddings.py            wraps sentence-transformers (module-level singleton model)
-  vectorstore.py           ChromaDB add_chunks / query_chunks / stats / reset
-  llm.py                   builds the grounded prompt, calls Groq
-  make_test_pdf.py         generates a fictional PDF into test_fixtures/ (never data/)
-  test_fixtures/           test-only PDFs, gitignored
-  test_pipeline_offline.py end-to-end test against a fake embedding model (no internet needed)
-  requirements.txt / requirements-dev.txt
-  .env.example / .env      GROQ_API_KEY, GROQ_MODEL, DATA_DIR, chunking + retrieval knobs
+  app/
+    main.py            FastAPI app: /ingest, /ingest/status, /chat, /stats, /reset, /health
+    config.py          every setting; paths resolve against PROJECT_ROOT, not the CWD
+    ingest.py          single entry point for documents + background job state machine
+    manifest.py        JSON sidecar: what's ingested, with content hashes
+    pdf_utils.py       extraction (keeps paragraph breaks) + paragraph-packing chunker
+    embeddings.py      sentence-transformers singleton, query prefix, truncation guard
+    vectorstore.py     ChromaDB add/query/delete/reset, batched
+    llm.py             grounded prompt + Groq call
+    logging_setup.py   logging config + `timed()` context manager
+  scripts/
+    ingest.py          CLI index builder (--force, --status)
+    make_test_pdf.py   fixture generator -> backend/test_fixtures/, never data/
+  tests/
+    test_pipeline_offline.py   37 checks, offline, no Groq key needed
+  requirements.txt / requirements-dev.txt / .env.example / .env
 frontend/
-  index.html / style.css / script.js   fetches http://localhost:8000 by default (API_BASE in script.js)
+  index.html / style.css / script.js   talks to http://localhost:8000 (API_BASE in script.js)
 data/
-  (real PDFs the user drops here - the live ingestion source, gitignored, never edited by code)
+  real PDFs the user drops here — the live ingestion source, gitignored
+refrence/
+  third-party reference project kept locally for study; gitignored, not part of this codebase
 ```
 
 ## Conventions
 
-- **Every module imports settings from `config.py`**, never `os.getenv()` directly. If you
-  add a new setting, add it there (with a sensible default) and to `.env.example`.
-- **No LangChain/LlamaIndex, no hidden abstractions.** Keep new pipeline code as plain,
-  readable Python — that's the whole point of this project.
-- **`config.py` reads env vars at import time.** Anything that needs a different env var
-  value (e.g. tests) must set `os.environ[...]` *before* `import config` happens anywhere
-  in the import chain, not after.
-- **Embeddings model is a module-level singleton** in `embeddings.py` (loaded once at
-  import, not per-request) — don't change that without a reason, model loads are slow.
-- **`ingest.py` is the single entry point for adding documents.** It's called from
-  `main.py`'s FastAPI `startup` event and from `POST /ingest`. Both use the same
-  `ingest_data_folder()` function, which skips files already stored (matched by filename)
-  so it's always safe to re-run.
-- Chunk page tagging is approximate: a chunk is labeled with the page its *first* word came
-  from. Don't rely on it for pixel-exact citation.
-- The vector store is one **global ChromaDB collection** shared by every ingested PDF —
-  there's no per-user/per-session isolation yet (see PLAN.md).
-- `data/` and `backend/test_fixtures/` are kept strictly separate on purpose: `data/` is
-  real, possibly large/copyrighted, user-supplied documents (gitignored); `test_fixtures/`
-  is synthetic PDFs generated by `make_test_pdf.py` for the test suite. Never point
-  `make_test_pdf.py`'s default output at `data/`.
+- **Every module imports settings from `app.config`**, never `os.getenv()` directly. New
+  setting → add it there with a sensible default, and to `.env.example`.
+- **`config.py` reads env vars at import time**, and resolves relative paths against
+  `PROJECT_ROOT`. Tests that need different values must set `os.environ[...]` *before*
+  `app.config` is first imported anywhere in the chain.
+- **No LangChain/LlamaIndex, no hidden abstractions.** Keep new pipeline code plain and
+  readable — that's the point of this project.
+- **`app/ingest.py` is the single entry point for adding documents.** Called from the CLI,
+  from the FastAPI lifespan startup, and from `POST /ingest`. All three go through
+  `ingest_data_folder()`, which fingerprints files by SHA-256 and skips unchanged ones.
+- **Ingestion never blocks a request.** `start_job()` runs it on a background thread;
+  `/ingest` and `/reset` return 202 and the client polls `/ingest/status`.
+- **Embeddings model is a module-level singleton** — model loads are slow, don't move it
+  into a request path.
+- `data/` and `backend/test_fixtures/` are strictly separate: `data/` is real user
+  documents; `test_fixtures/` is synthetic PDFs from `make_test_pdf.py`. Never point the
+  fixture generator's default output at `data/`.
 
 ## Running it
 
 ```bash
 cd backend
-python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+python -m venv venv && venv\Scripts\activate   # macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then set GROQ_API_KEY
-uvicorn main:app --reload --port 8000
+cp .env.example .env    # then set GROQ_API_KEY
+python scripts/ingest.py               # build the index (or let startup do it)
+uvicorn app.main:app --reload --port 8000
 ```
 
-Startup automatically ingests whatever is already in `data/`. To add documents while the
-server is running, drop a PDF in `data/` and call `POST /ingest` (or restart).
-
-Open `frontend/index.html` directly in a browser (or serve it) — it talks to
-`http://localhost:8000` by default; change `API_BASE` at the top of `frontend/script.js` if
-you serve the backend elsewhere.
+Note the module path is `app.main:app`, run from `backend/`.
 
 ## Testing
 
 ```bash
 cd backend
 pip install -r requirements-dev.txt
-python3 test_pipeline_offline.py
+python tests/test_pipeline_offline.py
 ```
 
-The test generates its own fixture PDFs (via `make_test_pdf.py`) into an isolated `/tmp`
-directory, never `data/` or `test_fixtures/` on a real run. It swaps in a deterministic
-fake embedding model so it runs offline (no HuggingFace download, no Groq key needed),
-and drives every FastAPI endpoint through `TestClient` — including startup ingestion,
-`POST /ingest` (both the "nothing new" and "picks up a new file" cases), and
-`POST /reset` (wipe + re-ingest). It is the fast, CI-friendly check — it does **not**
-prove the real `sentence-transformers` download works or that a live Groq call succeeds.
-Do a manual smoke test with a real `GROQ_API_KEY` before considering a change done (see
-README.md "Manual smoke test").
+Stubs `sentence_transformers` via `sys.modules` so it runs offline, points `DATA_DIR` and
+`CHROMA_DIR` at temp folders, and drives real HTTP endpoints through `TestClient`. It does
+**not** prove the real model downloads or that a live Groq call succeeds — do a manual
+smoke test with a real `GROQ_API_KEY` before considering a change done.
 
 ## Known gotchas (already fixed, keep them fixed)
 
-- **Use `chromadb==1.5.9`, not the 0.5.x line.** `chromadb==0.5.5` hard-requires
-  `numpy<2.0`, but numpy has no official Windows ARM64 wheel below 2.0 — pip is forced onto
-  numpy 2.x there, which then crashes chromadb 0.5.5 at import time
-  (`AttributeError: np.float_ was removed in the NumPy 2.0 release`). chromadb 0.5.5 also
-  had a separate `posthog>=3.0` telemetry incompatibility (noisy but non-fatal
-  `Failed to send telemetry event` spam). `chromadb>=1.0` dropped both the numpy pin and
-  the posthog dependency entirely — verified clean on `chromadb==1.5.9` with numpy 2.x, no
-  extra pins needed. Don't downgrade `chromadb` back to 0.5.x without re-solving both.
-- **Use `groq==1.7.0`, not `groq==0.11.0`.** `groq==0.11.0`'s HTTP client construction
-  passes a `proxies=` kwarg to `httpx.Client(...)` that `httpx>=0.28` no longer accepts —
-  `TypeError: Client.__init__() got an unexpected keyword argument 'proxies'` at import
-  time. `requirements-dev.txt` pins `httpx==0.28.1` directly, so this breaks the moment dev
-  deps are installed too. Bumped `groq` instead of pinning `httpx` back down — verified
-  `Groq(api_key=...)` constructs and `chat.completions.create(...)` still has the same
-  call shape on 1.7.0, full offline test suite passes.
-- `pdf_utils.py` uses `import pymupdf` (not `import fitz` — that name still works but is
-  deprecated and will be removed in a future PyMuPDF release).
-- **PyMuPDF is AGPL-3.0 licensed**, unlike every other dependency here (which are
-  MIT/BSD/Apache-2.0). Fine for personal/local use. If this project is ever open-sourced
-  or sold, you either comply with AGPL (keep the full source open) or buy Artifex's
-  commercial PyMuPDF license — don't silently ship it in closed-source software.
+- **Embedding truncation.** `all-MiniLM-L6-v2` reads only 256 tokens; the project's
+  ~300-word chunks were being silently truncated, so the tail of every chunk never
+  influenced retrieval. Now on `BAAI/bge-small-en-v1.5` (512 tokens), and
+  `embeddings.warn_if_truncated()` logs a warning if chunks ever exceed the window again.
+  If you switch models, check `max_seq_length` and set `EMBEDDING_QUERY_PREFIX`
+  accordingly (bge/e5 want a query-side prefix; MiniLM wants none).
+- **Paragraph structure must survive extraction.** `_normalize()` deliberately keeps
+  `\n\n`. Collapsing all whitespace (`" ".join(text.split())`) destroys the boundaries the
+  chunker packs on and measurably worsened page attribution.
+- **Use `chromadb>=1.0`, not 0.5.x.** 0.5.5 hard-requires `numpy<2.0`, which has no Windows
+  ARM64 wheel — pip is forced onto numpy 2.x and 0.5.5 then crashes at import
+  (`np.float_` removed). 1.x also dropped the posthog telemetry dependency and its log spam.
+- **Use `groq>=1.x`, not 0.11.0.** The old client passes a `proxies` kwarg that
+  `httpx>=0.28` rejects: `TypeError: Client.__init__() got an unexpected keyword argument`.
+- `pdf_utils.py` imports `pymupdf`, not `fitz` (the old name is deprecated), and silences
+  MuPDF's per-image `cmsOpenProfileFromMem` stderr spam.
+- **PyMuPDF is AGPL-3.0**, unlike every other dependency here. Fine for personal/local use;
+  comply with AGPL or buy a commercial license before shipping this closed-source.
 
-## Known limitations (see PLAN.md for what to do about them)
+## Known limitations (see OPTIMIZATIONS.md for the reviewed backlog)
 
-- No OCR — scanned/image-only PDFs extract no text; `ingest_one()` reports
-  `"status": "skipped"` for them instead of raising.
-- No conversation history — every question is answered independently.
-- One global collection — all ingested PDFs are retrieved from together; no per-user
-  isolation.
-- Page tagging on chunks that straddle a page break is approximate, not exact.
-- No auth on `/ingest` or `/reset` — fine for local/personal use, not for exposing beyond
-  localhost as-is.
+- No re-ranking and no keyword/hybrid search — dense vectors only.
+- No evaluation harness; answer quality is unmeasured.
+- No OCR — scanned/image-only PDFs are reported `"status": "skipped"`.
+- No conversation history.
+- One collection, no per-document filter at query time.
+- No auth on `/ingest` or `/reset`.
 
 ## Before you commit
 
-- Never commit `backend/.env` (it holds a real API key) — it's gitignored, keep it that way.
-- Never commit real documents in `data/` — it's gitignored; only the code that processes
-  them belongs in the repo.
-- Run `test_pipeline_offline.py` and confirm all checks still pass.
+- Never commit `backend/.env` (real API key) or documents in `data/` — both gitignored.
+- Run `tests/test_pipeline_offline.py`; all checks must pass.

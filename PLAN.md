@@ -1,96 +1,100 @@
 # PLAN.md
 
-Roadmap for the Document Q&A RAG project. Status as of 2026-08-31.
+Roadmap and changelog for the Document Q&A RAG project. Status as of 2026-08-31.
 
-## Status: working end-to-end, backend-only ingestion
+## Status
 
-The core pipeline (ingest from `data/` → chunk → embed → store → retrieve → answer) is
-implemented and verified: `test_pipeline_offline.py` drives startup ingestion, `/ingest`,
-`/chat`, `/stats`, and `/reset` through a fake embedding model and all checks pass. You've
-already dropped two real PDFs (AI: A Modern Approach, Pattern Classification) into `data/`
-for real use. A manual smoke test with a real `GROQ_API_KEY` still needs to be run on your
-machine (needs live internet + a real key) — see README.md's "Manual smoke test" section.
+Working end-to-end, backend-only ingestion, restructured into a proper `app/` package.
+37 automated checks pass offline. Two real textbooks (AI: A Modern Approach; Pattern
+Classification) live in `data/`.
 
-## Just fixed (this pass)
+**Action required after this change:** the embedding model changed, so the existing index
+is stale and must be rebuilt:
 
-- [x] **Removed the upload endpoint entirely.** Documents now only enter the system via the
-      backend's own `data/` folder — no way for a frontend user to add, replace, or remove
-      documents. `POST /upload` is gone; `backend/ingest.py` is the new single entry point,
-      called on FastAPI startup and via `POST /ingest` (re-scans without a restart).
-      `POST /reset` now wipes the store and immediately re-ingests from `data/`, rather than
-      leaving it empty.
-- [x] **Frontend upload UI removed.** The drag-and-drop box, file picker, and `/upload` call
-      are gone from `index.html`/`script.js`/`style.css`, replaced with a "Sync from data
-      folder" button that calls `POST /ingest`.
-- [x] **Swapped `pypdf` for `PyMuPDF`** (see prior entry, still in effect) — note PyMuPDF is
-      AGPL-3.0 licensed, unlike the rest of the stack.
-- [x] **Test suite rewritten** for the new flow: generates fixture PDFs into an isolated
-      `/tmp` directory (never `data/`), exercises startup ingestion, `/ingest` idempotency
-      (re-running finds nothing new), `/ingest` picking up a newly-added file without a
-      restart, and `/reset`'s wipe-then-re-ingest behavior.
-- [x] **`make_test_pdf.py` output moved out of `data/`** into `backend/test_fixtures/`
-      (gitignored) — `data/` is now the live ingestion source for your real documents and
-      must never get a synthetic test PDF mixed into it.
-- [x] **Upgraded `chromadb==0.5.5` to `chromadb==1.5.9`.** On Windows ARM64, numpy has no
-      wheel below 2.0, but chromadb 0.5.5 hard-requires `numpy<2.0` — that combination
-      crashed at import time with `AttributeError: np.float_ was removed in the NumPy 2.0
-      release`. (0.5.5 also had a separate posthog telemetry incompatibility, previously
-      worked around with a `posthog==2.4.2` pin.) chromadb 1.5.9 drops both the numpy pin
-      and the posthog dependency — verified clean with the full offline test suite, no
-      extra pins needed, no telemetry spam either.
-- [x] **Upgraded `groq==0.11.0` to `groq==1.7.0`.** The old version's HTTP client
-      construction passed `proxies=` to `httpx.Client(...)`, which `httpx>=0.28` (already
-      pinned in `requirements-dev.txt`) no longer accepts —
-      `TypeError: Client.__init__() got an unexpected keyword argument 'proxies'` at
-      startup. Verified `groq==1.7.0` constructs fine and `chat.completions.create(...)`
-      keeps the same call shape `llm.py` relies on.
-- [x] **`.gitignore` covers `backend/venv/`, `__pycache__/`, `backend/chroma_db/`,
-      `backend/test_fixtures/`, `data/*.pdf`, and common OS/editor junk.**
+```bash
+cd backend
+pip install -r requirements.txt
+python scripts/ingest.py --force
+```
 
-## Next steps, in rough priority order
+## Changelog — this pass (Tier 1 + Tier 2 of OPTIMIZATIONS.md)
 
-1. **Run the manual smoke test for real**, now against your actual textbooks in `data/` —
-   confirm the real `all-MiniLM-L6-v2` download + a live Groq call work end-to-end. Note:
-   embedding a large book (the AI: A Modern Approach PDF is ~38MB) on first startup will
-   take noticeably longer than the small fictional test fixture did — that's expected, not
-   a hang.
-2. **Windows ARM64 numpy warning**, if you still see it after the chromadb upgrade above —
-   see the note in README.md and CLAUDE.md. Try `pip install --upgrade numpy` if you hit
-   real numerical issues; so far this is just a noisy warning, not a confirmed correctness
-   bug in this project.
-3. **Conversation history.** Right now each question is answered independently. Natural
-   next step: pass the last N question/answer pairs into the prompt in `llm.py` so
-   follow-up questions ("what about the second one?") work.
-4. **Per-document retrieval scoping.** With two full textbooks now in the store, a question
-   can retrieve chunks from *either* book even if you only care about one. Add a `source`
-   filter option to `/chat` (e.g. `{"question": "...", "source": "Pattern Classification..."}`)
-   so you can scope a question to one document.
-5. **OCR for scanned PDFs.** `pdf_utils.extract_pages` returns nothing for image-only PDFs,
-   and `ingest_one()` correctly reports `"status": "skipped"` rather than silently storing
-   nothing — but there's no path forward for those documents yet. Add `pytesseract` as an
-   opt-in fallback when `extract_text()` comes back empty.
-6. **Retrieval quality tuning**, now that you're testing on real technical textbooks rather
-   than the fictional sample:
-   - Try a larger embedding model if `all-MiniLM-L6-v2` misses on dense technical content.
-   - Tune `CHUNK_SIZE_WORDS` / `CHUNK_OVERLAP_WORDS` / `TOP_K` in `.env` — textbook prose
-     with equations/figures may chunk differently than the fictional test document did.
-7. **If you ever deploy this beyond your own machine:**
-   - Move ChromaDB from local persistence to a hosted vector DB.
-   - Tighten `allow_origins=["*"]` in `main.py`'s CORS middleware to your real frontend
-     origin.
-   - Add auth in front of `/ingest` and `/reset` — there's currently none; anyone who can
-     reach the API can trigger a re-ingest or wipe the store.
+**Retrieval correctness**
 
-## Explicitly out of scope for now
+- [x] **Fixed silent embedding truncation.** `all-MiniLM-L6-v2` reads 256 tokens; ~300-word
+      chunks were ~400+ tokens, so roughly the last third of every chunk never influenced
+      retrieval. Switched to `BAAI/bge-small-en-v1.5` (512-token window) with the
+      query-side instruction prefix these models expect, plus a
+      `warn_if_truncated()` guard that logs if chunks ever exceed the window again.
+- [x] **Structure-aware chunking.** Extraction now preserves paragraph breaks (the old
+      `" ".join(text.split())` destroyed them before the chunker ran), and chunks are
+      packed from whole paragraphs — falling back to sentence splits, then hard word
+      splits, only when a paragraph is oversized. Replaces blind every-N-words slicing.
+- [x] **Page ranges instead of a single guessed page.** Chunks now record `page_start` and
+      `page_end`, and citations render "page 7" or "pages 7-8". (Visible in the test run:
+      the funding question now cites page 2, where the figure actually is — it cited
+      page 1 before.)
+- [x] **Clamped similarity.** Chroma's cosine distance runs 0-2, so `1 - distance` could
+      report a negative similarity.
+- [x] **Content-hash change detection.** Files are fingerprinted by SHA-256; an edited PDF
+      is re-ingested and its old chunks deleted first, instead of being invisible forever
+      (filename-only matching) or duplicated.
 
-- A build step for the frontend (it's deliberately plain HTML/CSS/JS).
-- Swapping in LangChain/LlamaIndex — the point of this project is seeing every step.
-- Any way for the frontend/a user to add, replace, or delete documents — this is a
-  deliberate design constraint, not a missing feature. If it ever needs to change, that's a
-  product decision to make explicitly, not something to slip back in incidentally.
+**Architecture / performance**
 
-## How to keep this file useful
+- [x] **Ingestion no longer blocks the API.** It runs on a background thread; `/ingest` and
+      `/reset` return 202 immediately and the frontend polls `GET /ingest/status` for
+      progress. Server startup is instant.
+- [x] **CLI index builder:** `python scripts/ingest.py [--force|--status]`, so the index
+      can be built offline without running the API at all.
+- [x] **Batched embedding and storage** (`EMBEDDING_BATCH_SIZE`, `CHROMA_ADD_BATCH`) —
+      removes the memory spike from encoding thousands of chunks in one call and stays
+      under Chroma's per-add batch ceiling.
+- [x] **Manifest sidecar** replaces `collection.get(include=["metadatas"])`, which pulled
+      every chunk's metadata on every `/stats` call, every page load, and every ingest.
+      `/stats` now also reports per-document page and chunk counts.
+- [x] **Structured logging with per-stage timings** (`logging_setup.timed`) instead of
+      scattered `print()` calls.
 
-Update the "Just fixed" section into a changelog-style history as you go, and re-prioritize
-"Next steps" as items get done or new gaps get found. Treat CLAUDE.md as the stable
-reference (architecture, conventions) and this file as the living to-do list.
+**Hardening (small items from Tier 4)**
+
+- [x] `top_k` is bounded (`1..MAX_TOP_K`) and blank questions are rejected at validation,
+      so a client can't build an enormous prompt.
+- [x] The assembled CONTEXT is capped by `MAX_CONTEXT_CHARS`, independent of `top_k`.
+- [x] The Groq call is wrapped — a rate limit or deprecated model id returns a readable
+      message instead of an unhandled 500.
+
+**Project structure**
+
+- [x] Backend reorganized into `app/` (package), `scripts/` (CLI entry points), `tests/`.
+      Run target is now `uvicorn app.main:app`.
+- [x] Dropped `python-multipart` — it was only needed by the removed upload endpoint.
+- [x] `refrence/` gitignored (kept on disk for study, not part of this codebase).
+
+## Next steps — the remaining backlog
+
+Full detail and rationale in `OPTIMIZATIONS.md`. In priority order:
+
+1. **Evaluation harness (OPTIMIZATIONS 4.1).** 20-30 golden questions against the two
+   textbooks plus a retrieval hit-rate@k metric. Do this *before* the retrieval-quality
+   work below — otherwise there's no way to tell whether a change helped.
+2. **Cross-encoder re-ranker (3.1).** Retrieve ~30, re-rank, keep 4. The single biggest
+   remaining quality jump; local, free, ~100-300ms.
+3. **Hybrid BM25 + vector search with RRF fusion (3.2).** Fixes exact-term questions
+   ("A* search", "Bayes decision rule") that dense retrieval alone handles poorly.
+4. **Per-document scoping (3.3).** A `source` filter on `/chat` plus a dropdown, so a
+   question can target one textbook.
+5. **Retrieve-more-then-filter + distance floor (3.4).** Answer "not in these documents"
+   without calling the LLM when nothing scores well.
+6. **Neighbor chunk expansion (3.5).** Pull `chunk_index ± 1` around each hit.
+7. **Conversation history (4.5)** — and rewrite follow-up questions to standalone form
+   *before* retrieving, or the retrieval step gets a question that embeds to nothing.
+8. **Streaming responses (4.4).** Groq is fast; the UI currently hides that.
+9. **OCR fallback (4.7)** via `page.get_pixmap()` + `pytesseract` for scanned PDFs.
+
+## Explicitly out of scope
+
+- A build step for the frontend (deliberately plain HTML/CSS/JS).
+- LangChain/LlamaIndex — seeing every step is the point of this project.
+- Any way for the frontend/a user to add, replace, or delete documents. Deliberate design
+  constraint, not a missing feature.

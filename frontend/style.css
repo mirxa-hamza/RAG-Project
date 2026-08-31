@@ -142,6 +142,21 @@ body {
   padding-left: 0;
 }
 
+.doc-name { display: block; overflow-wrap: anywhere; }
+
+.doc-meta {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.btn-secondary:disabled,
+.btn-text:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .api-note {
   font-size: 11px;
   color: var(--ink-soft);

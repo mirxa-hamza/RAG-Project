@@ -1,3 +1,4 @@
+# Test-only dependencies (the app itself does not need these).
 -r requirements.txt
-httpx==0.28.1
-reportlab==4.2.2
+httpx==0.28.1      # FastAPI's TestClient transport
+reportlab==4.2.2   # generates the fictional fixture PDF

@@ -2,20 +2,24 @@
 backend/.env
 
 # Python
-backend/venv/
-backend/__pycache__/
-**/__pycache__/
-*.pyc
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
 
-# ChromaDB local persistence (rebuilt by ingesting the data/ folder)
+# Vector store + its manifest (rebuilt from data/ by scripts/ingest.py)
 backend/chroma_db/
 
-# data/ is the live ingestion source (real PDFs, possibly copyrighted/large) - never commit
-# the documents themselves, only the code that processes them.
+# data/ is the live ingestion source (real PDFs, possibly large/copyrighted) — never
+# commit the documents themselves, only the code that processes them.
 data/*.pdf
 
-# Generated test fixtures (backend/make_test_pdf.py writes here, never into data/)
+# Generated test fixtures (scripts/make_test_pdf.py writes here, never into data/)
 backend/test_fixtures/
+
+# Reference material kept locally for study, not part of this project
+refrence/
 
 # OS / editor junk
 .DS_Store
