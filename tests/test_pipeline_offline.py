@@ -484,4 +484,138 @@ with TestClient(app) as client:
     check("the orphan text itself is gone",
           all("orphaned partial chunk" not in c["text"] for c in stored))
 
+    print("\n--- upload: filename hardening (never trust the client) ---")
+    from src.services import uploads
+
+    for hostile, why in [
+        ("../../.env.pdf", "parent traversal"),
+        ("..\\..\\windows\\system32\\evil.pdf", "windows traversal"),
+        ("/etc/passwd.pdf", "absolute path"),
+        ("C:\\Users\\me\\book.pdf", "windows absolute path"),
+    ]:
+        safe = uploads.safe_filename(hostile)
+        check(f"{why} is reduced to a bare filename ({safe!r})",
+              "/" not in safe and "\\" not in safe and not safe.startswith("."))
+
+    for rejected in ["notes.txt", "script.pdf.exe", "archive.zip", ""]:
+        try:
+            uploads.safe_filename(rejected)
+            check(f"non-PDF name {rejected!r} is rejected", False)
+        except uploads.UploadError:
+            check(f"non-PDF name {rejected!r} is rejected", True)
+
+    check("a normal name survives intact",
+          uploads.safe_filename("Pattern Classification (2nd ed).pdf")
+          == "Pattern Classification (2nd ed).pdf")
+
+    print("\n--- upload endpoint ---")
+    # A DISTINCT pdf: uploading a byte-identical copy is correctly treated as a duplicate
+    # (checked below), which would make it a poor fixture for the ingest path.
+    # A trailing comment after %%EOF is ignored by every PDF reader but changes the
+    # sha256, which is what the duplicate check keys on.
+    pdf_bytes = (TEST_DATA_DIR / "sample.pdf").read_bytes() + b"\n% distinct upload fixture\n"
+
+    r = client.post("/upload", files={"files": ("uploaded book.pdf", pdf_bytes, "application/pdf")})
+    check("upload returns 202", r.status_code == 202)
+    body = r.json()
+    check("upload reports the stored filename",
+          body["accepted"][0]["filename"] == "uploaded book.pdf")
+    check("the PDF is written into the data folder",
+          (TEST_DATA_DIR / "uploaded book.pdf").exists())
+    job = wait_for_ingest(client)
+    check("the uploaded file is indexed",
+          any(res["filename"] == "uploaded book.pdf" and res["status"] == "ingested"
+              for res in job["results"]))
+    check("it now appears in /stats",
+          "uploaded book.pdf" in {d["filename"] for d in client.get("/stats").json()["documents"]})
+
+    # Same name twice must not overwrite - the second becomes " (2)".
+    r = client.post("/upload", files={"files": ("uploaded book.pdf", pdf_bytes, "application/pdf")})
+    check("a colliding name is renamed, not overwritten",
+          r.json()["accepted"][0]["filename"] == "uploaded book (2).pdf")
+    job = wait_for_ingest(client)
+    # One of the two identical copies is skipped rather than indexed a second time; which
+    # of them wins depends on scan order, and either is correct.
+    twins = {res["filename"]: res["status"] for res in job["results"]
+             if res["filename"].startswith("uploaded book")}
+    check("byte-identical content is skipped as a duplicate rather than indexed twice",
+          "skipped" in twins.values() and "ingested" not in list(twins.values())[1:])
+
+    r = client.post("/upload", files={"files": ("fake.pdf", b"MZ this is not a pdf at all", "application/pdf")})
+    check("content that is not a PDF is refused despite the .pdf name", r.status_code == 400)
+    check("the refused file is not left on disk", not (TEST_DATA_DIR / "fake.pdf").exists())
+
+    # The cap is read from the module namespace, so it can be lowered here instead of
+    # actually pushing 100MB through the test.
+    original_cap = uploads.MAX_UPLOAD_BYTES
+    uploads.MAX_UPLOAD_BYTES = 1024
+    try:
+        r = client.post("/upload", files={"files": ("huge.pdf", b"%PDF-1.4\n" + b"x" * 5000, "application/pdf")})
+        check("a file over the size cap is refused", r.status_code == 400)
+        check("no partial file is left behind", not (TEST_DATA_DIR / "huge.pdf").exists())
+        check("no .part temp file is left behind",
+              not any(f.name.startswith(".upload-") for f in TEST_DATA_DIR.iterdir()))
+    finally:
+        uploads.MAX_UPLOAD_BYTES = original_cap
+
+    r = client.post("/upload", files={"files": ("empty.pdf", b"", "application/pdf")})
+    check("an empty file is refused", r.status_code == 400)
+
+    print("\n--- delete endpoint ---")
+    # The duplicate copy is on disk but was never indexed; deleting it must still work,
+    # otherwise a skipped file could never be removed from the UI.
+    r = client.delete("/documents/uploaded book (2).pdf")
+    check("an un-indexed file on disk can still be deleted", r.status_code == 200)
+    check("that PDF is gone from the data folder",
+          not (TEST_DATA_DIR / "uploaded book (2).pdf").exists())
+
+    r = client.delete("/documents/uploaded book.pdf")
+    check("delete returns 200", r.status_code == 200)
+    check("the PDF is gone from the data folder",
+          not (TEST_DATA_DIR / "uploaded book.pdf").exists())
+    remaining = {d["filename"] for d in client.get("/stats").json()["documents"]}
+    check("it is gone from /stats", "uploaded book.pdf" not in remaining)
+    check("its chunks are gone from the store",
+          all(c["source"] != "uploaded book.pdf" for c in vectorstore.all_chunks()))
+    check("other documents are untouched", "sample.pdf" in remaining)
+
+    check("deleting something that isn't there is a 404",
+          client.delete("/documents/never-existed.pdf").status_code == 404)
+
+    # 405 is also a pass: an unencoded "../.." is collapsed by the client/router before it
+    # ever reaches the handler, so the request lands on a path with no DELETE route.
+    for escape in ["../../.env", "..%2F..%2Fsecret.pdf", "/etc/passwd", "..%5C..%5Cwin.pdf"]:
+        code = client.delete(f"/documents/{escape}").status_code
+        check(f"delete refuses to escape the data folder ({escape})", code in (400, 404, 405))
+
+    print("\n--- a file uploaded mid-run is still picked up ---")
+    # A running job listed the folder when it started, so a PDF that arrives while it is
+    # working is invisible to it. start_job() flags a re-scan instead of being ignored.
+    from src.services import ingestion as ing
+
+    calls = []
+    real_scan = ing.ingest_data_folder
+
+    def slow_scan(force=False, progress=None, stage=None):
+        calls.append(force)
+        time.sleep(0.6)          # long enough to fire a second start_job mid-run
+        return []
+
+    ing.ingest_data_folder = slow_scan
+    try:
+        ing.start_job()
+        time.sleep(0.2)
+        second = ing.start_job()          # arrives while the first is still running
+        check("a second start during a run does not spawn a parallel job",
+              second["state"] == "running")
+        for _ in range(60):
+            if not ing.is_running():
+                break
+            time.sleep(0.1)
+        check("the folder is scanned again after the run, so the new file is indexed",
+              len(calls) == 2)
+    finally:
+        ing.ingest_data_folder = real_scan
+        ing._consume_rescan_request()     # leave no flag set for later checks
+
 print(f"\nAll {PASSED} checks passed.")

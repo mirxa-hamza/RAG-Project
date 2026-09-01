@@ -1,9 +1,10 @@
 """
 The only way documents get into this system.
 
-There is deliberately no upload endpoint - a user talking to the frontend can only ask
-questions, never add documents. Whoever runs the backend drops PDFs into DATA_DIR
-(see config.py) and either runs `python scripts/ingest.py` or calls POST /ingest.
+Documents enter in one of two ways, and both end up in DATA_DIR (see config.py): dropped
+into the folder by whoever runs the backend, or uploaded through POST /upload from the web
+UI. Either way, ingestion itself only ever reads that folder - nothing is indexed straight
+out of a request body.
 
 Ingestion is fingerprinted: a file is (re-)ingested when it's new, or when its bytes have
 changed since last time. Matching on filename alone meant an edited PDF was invisible
@@ -73,10 +74,19 @@ def _needs_ingest(filename: str, fingerprint: Dict) -> Optional[str]:
 
 # --------------------------------------------------------------------- ingestion
 
-def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict] = None) -> Dict:
-    """Extracts, chunks, embeds, and stores a single PDF already sitting in DATA_DIR."""
+def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict] = None,
+               on_stage=None) -> Dict:
+    """
+    Extracts, chunks, embeds, and stores a single PDF already sitting in DATA_DIR.
+
+    on_stage: optional callable(stage, done, total) where stage is "extracting" or
+    "embedding". The UI turns this into a per-document progress bar.
+    """
     path = DATA_DIR / filename
     fingerprint = fingerprint or _fingerprint(path)
+
+    if on_stage:
+        on_stage("extracting", 0, 0)
 
     with timed(log, f"extract '{filename}'"):
         pages = extract_pages(str(path))
@@ -105,8 +115,14 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     # the abandoned chunks would pile up as duplicates on every interrupted attempt.
     delete_source(filename)
 
+    if on_stage:
+        on_stage("embedding", 0, len(chunks))
+
     with timed(log, f"embed + store '{filename}'"):
-        stored = add_chunks(filename, chunks)
+        stored = add_chunks(
+            filename, chunks,
+            on_progress=(lambda done, total: on_stage("embedding", done, total)) if on_stage else None,
+        )
 
     manifest.put(
         filename,
@@ -149,7 +165,7 @@ def prune_deleted(present: List[str]) -> List[Dict]:
     return removed
 
 
-def ingest_data_folder(force: bool = False, progress=None) -> List[Dict]:
+def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[Dict]:
     """
     Ingests every PDF in DATA_DIR that is new or has changed on disk, and removes stored
     documents whose file has been deleted. Safe to call repeatedly - unchanged files are
@@ -157,6 +173,7 @@ def ingest_data_folder(force: bool = False, progress=None) -> List[Dict]:
 
     force=True re-ingests everything (used after a reset).
     progress: optional callable(filename, index, total) for job reporting.
+    stage: optional callable(stage_name, done, total) for within-document progress.
 
     A failure on one document never stops the others: a single malformed PDF used to abort
     the whole job, leaving every file after it silently un-indexed.
@@ -197,6 +214,7 @@ def ingest_data_folder(force: bool = False, progress=None) -> List[Dict]:
                 filename,
                 reason="changed" if reason in ("changed", "forced") else "new",
                 fingerprint=fingerprint,
+                on_stage=stage,
             )
         except Exception as exc:
             # Corrupt file, encrypted PDF, unreadable bytes, OOM on one monster document -
@@ -221,6 +239,11 @@ _state: Dict = {
     "current_file": None,
     "files_done": 0,
     "files_total": 0,
+    # Within the current document: "extracting" or "embedding", plus chunk counts, so the
+    # UI can show real progress for one big book instead of a bar stuck at 0/1.
+    "stage": None,
+    "chunks_done": 0,
+    "chunks_total": 0,
     "results": [],
     "error": None,
 }
@@ -242,13 +265,34 @@ def _run(force: bool) -> None:
             _state["current_file"] = filename
             _state["files_done"] = index
             _state["files_total"] = total
+            # A new file starts from scratch; leaving the previous file's counts in place
+            # made the bar jump backwards.
+            _state["stage"] = None
+            _state["chunks_done"] = 0
+            _state["chunks_total"] = 0
+
+    def stage(name: str, done: int, total: int) -> None:
+        with _lock:
+            _state["stage"] = name
+            _state["chunks_done"] = done
+            _state["chunks_total"] = total
 
     try:
-        results = ingest_data_folder(force=force, progress=progress)
+        results = ingest_data_folder(force=force, progress=progress, stage=stage)
+
+        # Anything uploaded while this run was in flight is picked up now, in the same
+        # thread, so the job the client is polling covers it too.
+        while _consume_rescan_request():
+            log.info("Files arrived during ingestion - scanning the data folder again.")
+            results.extend(ingest_data_folder(force=False, progress=progress, stage=stage))
+
         with _lock:
             _state.update(
                 state="idle",
                 current_file=None,
+                stage=None,
+                chunks_done=0,
+                chunks_total=0,
                 files_done=_state["files_total"],
                 results=results,
                 error=None,
@@ -260,13 +304,22 @@ def _run(force: bool) -> None:
             _state.update(state="error", current_file=None, error=str(exc), finished_at=time.time())
 
 
+_rescan_requested = False
+
+
 def start_job(force: bool = False) -> Dict:
     """
     Kicks off ingestion in a background thread and returns immediately, so neither server
     startup nor an HTTP request ever blocks on embedding a large corpus.
+
+    Called while a job is already running, it flags a re-scan instead of starting a second
+    thread. That matters for uploads: the running job listed the folder when it started, so
+    a PDF that lands mid-run would otherwise sit unindexed until someone pressed sync.
     """
+    global _rescan_requested
     with _lock:
         if _state["state"] == "running":
+            _rescan_requested = True
             return dict(_state)
         _state.update(
             state="running",
@@ -281,3 +334,10 @@ def start_job(force: bool = False) -> Dict:
 
     threading.Thread(target=_run, args=(force,), daemon=True, name="ingest").start()
     return job_status()
+
+
+def _consume_rescan_request() -> bool:
+    global _rescan_requested
+    with _lock:
+        wanted, _rescan_requested = _rescan_requested, False
+    return wanted

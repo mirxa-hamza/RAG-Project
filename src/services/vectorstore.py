@@ -33,7 +33,7 @@ def _get_collection():
 _collection = _get_collection()
 
 
-def add_chunks(source_name: str, chunks: List[Dict]) -> int:
+def add_chunks(source_name: str, chunks: List[Dict], on_progress=None) -> int:
     """
     Embeds and stores chunks from one document, in batches.
 
@@ -41,6 +41,9 @@ def add_chunks(source_name: str, chunks: List[Dict]) -> int:
     and Chroma enforces a maximum batch size per add() call that a large book would hit.
 
     chunks: [{"text": "...", "page_start": 3, "page_end": 4}, ...]
+    on_progress: optional callable(stored, total), called after each batch. This is what
+    drives the per-document progress bar in the UI - without it a 1,900-chunk book is a
+    five-minute silence.
     Returns the number of chunks stored.
     """
     if not chunks:
@@ -75,6 +78,11 @@ def add_chunks(source_name: str, chunks: List[Dict]) -> int:
         )
         stored += len(batch)
         log.info("Stored %d/%d chunks of '%s'", stored, len(chunks), source_name)
+        if on_progress:
+            try:
+                on_progress(stored, len(chunks))
+            except Exception:  # a broken reporter must never abort an ingest
+                log.exception("Progress callback failed")
 
     _invalidate_keyword_index()
     return stored

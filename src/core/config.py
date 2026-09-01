@@ -63,6 +63,10 @@ CHROMA_ADD_BATCH = int(os.getenv("CHROMA_ADD_BATCH", "1000"))
 # don't have to read every chunk's metadata out of Chroma.
 MANIFEST_PATH = CHROMA_DIR / "manifest.json"
 
+# Uploads (POST /upload). Enforced while streaming, so an over-sized file is cut off and
+# deleted rather than being written to disk first and measured afterwards.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
+
 # ---------------------------------------------------------------- Chunking
 # 300 words is ~400 tokens for ordinary prose, but dense technical pages (formulae,
 # hyphenated terms, tables) tokenise far worse - the ingest log has shown 616 tokens for a

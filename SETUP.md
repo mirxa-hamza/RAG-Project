@@ -61,10 +61,16 @@ deliberately experimenting. **`.env` is gitignored; never commit it.**
 ## 4. Add documents
 
 The repo deliberately ships **no PDFs** — they're large, often copyrighted, and change
-independently of the code. There is no upload button either: documents only enter the
-system through the folder.
+independently of the code.
 
-Put any PDFs you want to query into `data/`:
+Two ways to add them. The easy one, once the server is running: press **Add documents** in
+the sidebar and drag PDFs into the window that opens (or click to browse). Each file shows
+its own progress — uploading, then reading pages, then indexing — and only joins *Your
+documents* once it is fully indexed and queryable. You can close that window while it
+works; the sidebar keeps reporting. Up to 100MB per file (`MAX_UPLOAD_MB` in `.env`).
+
+The other way, and the one to use for a big batch, is to put the files into `data/`
+yourself:
 
 ```
 data/
@@ -113,7 +119,9 @@ optional; doing it up front just means the app is queryable the moment it boots.
 | Index new or changed PDFs | `python scripts/ingest.py` |
 | See what's currently indexed | `python scripts/ingest.py --status` |
 | Wipe and rebuild everything | `python scripts/ingest.py --force` |
-| Same, without leaving the browser | the **Sync from data folder** button in the sidebar |
+| Same, without leaving the browser | the **Sync documents** button in the sidebar |
+| Add a PDF from the browser | **Add documents** in the sidebar, then drop or browse |
+| Remove a document | the bin icon on its card — deletes its passages **and** the PDF |
 
 Files are fingerprinted by SHA-256, so re-running is always safe and cheap:
 
@@ -160,7 +168,7 @@ pip install -r requirements-dev.txt
 python tests/test_pipeline_offline.py
 ```
 
-86 checks, fully offline — no API key and no model download needed, because it stubs the
+126 checks, fully offline — no API key and no model download needed, because it stubs the
 models. Run this before pushing anything.
 
 To measure *answer quality* rather than plumbing:
@@ -192,7 +200,7 @@ python eval/run_eval.py --judge    # + LLM-as-judge scoring (uses your Groq key)
 | `ModuleNotFoundError: rank_bm25` etc. | `pip install -r requirements.txt` again — the venv is stale. |
 | Answer says `GROQ_API_KEY is not set` | `.env` is missing or the key line is empty; restart the server after editing it. |
 | `model not found` from Groq | Groq retires models; check <https://console.groq.com/docs/models> and update `GROQ_MODEL` in `.env`. |
-| Sidebar shows no documents | No PDFs in `data/`, or ingestion hasn't run — click **Sync from data folder**. |
+| Sidebar shows no documents | No PDFs in `data/`, or ingestion hasn't run — click **Sync documents**. |
 | `Numpy built with MINGW-W64` warning | Windows-on-ARM only, harmless. |
 
 More detail: `README.md` for the architecture, `CLAUDE.md` for conventions and known

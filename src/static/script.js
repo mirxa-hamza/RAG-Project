@@ -21,7 +21,16 @@ const el = {
   sourceList: $("sourceList"),
   docCount: $("docCount"),
   chunkCount: $("chunkCount"),
+  railCount: $("railCount"),
   scopeSelect: $("scopeSelect"),
+  app: document.querySelector(".app"),
+  addBtn: $("addBtn"),
+  uploadModal: $("uploadModal"),
+  uploadNote: $("uploadNote"),
+  dropzone: $("dropzone"),
+  fileInput: $("fileInput"),
+  uploadList: $("uploadList"),
+  maxUploadMb: $("maxUploadMb"),
   messages: $("messages"),
   welcome: $("welcome"),
   chatForm: $("chatForm"),
@@ -122,18 +131,76 @@ function shortDocName(name) {
   return String(name || "document").split("/").pop().replace(/\.pdf$/i, "");
 }
 
-/* ─────────────────────────── Sidebar drawer ─────────────────────────── */
+/* ─────────────────────────── Sidebar ─────────────────────────────────
+   One button, two behaviours, because the sidebar is two different things: a grid column
+   on desktop (toggling collapses it and the chat takes the width) and an off-canvas drawer
+   on narrow screens (toggling slides it over the chat, with a scrim).
+   ==================================================================== */
+
+const isNarrow = () => window.matchMedia("(max-width: 860px)").matches;
 
 function setDrawer(open) {
   el.sidebar.classList.toggle("is-open", open);
   el.scrim.hidden = !open;
-  el.menuBtn.setAttribute("aria-expanded", String(open));
+  syncMenuButton();
 }
 
-el.menuBtn.addEventListener("click", () => setDrawer(!el.sidebar.classList.contains("is-open")));
+function setCollapsed(collapsed) {
+  el.app.classList.toggle("is-collapsed", collapsed);
+  syncMenuButton();
+}
+
+function sidebarVisible() {
+  return isNarrow()
+    ? el.sidebar.classList.contains("is-open")
+    : !el.app.classList.contains("is-collapsed");
+}
+
+function syncMenuButton() {
+  const shown = sidebarVisible();
+  el.menuBtn.setAttribute("aria-expanded", String(shown));
+  el.menuBtn.setAttribute("aria-label", shown ? "Hide the sidebar" : "Show the sidebar");
+}
+
+el.menuBtn.addEventListener("click", () => {
+  if (isNarrow()) setDrawer(!el.sidebar.classList.contains("is-open"));
+  else setCollapsed(!el.app.classList.contains("is-collapsed"));
+});
+
 el.scrim.addEventListener("click", () => setDrawer(false));
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") setDrawer(false);
+  // The dialog handles its own Escape; closing the drawer as well would do two things at once.
+  if (e.key === "Escape" && !el.uploadModal.open) setDrawer(false);
+});
+
+// Crossing the breakpoint leaves the other mode's state behind: a drawer left open becomes
+// a permanently "open" class on a grid column, and vice versa.
+window.matchMedia("(max-width: 860px)").addEventListener("change", () => {
+  el.sidebar.classList.remove("is-open");
+  el.scrim.hidden = true;
+  syncMenuButton();
+});
+syncMenuButton();
+
+/* ─────────────────────────── Add-documents dialog ───────────────────── */
+
+function openUploadModal() {
+  clearFinishedUploads();
+  if (!el.uploadModal.open) el.uploadModal.showModal();
+  setDrawer(false);        // on a phone the drawer would sit over the dialog's backdrop
+}
+
+el.addBtn.addEventListener("click", openUploadModal);
+
+// Clicking the backdrop closes it. The dialog element itself covers the whole viewport, so
+// "outside" means the click landed on the dialog box but not on its content.
+el.uploadModal.addEventListener("click", (e) => {
+  if (e.target !== el.uploadModal) return;
+  const box = el.uploadModal.getBoundingClientRect();
+  const outside =
+    e.clientX < box.left || e.clientX > box.right ||
+    e.clientY < box.top || e.clientY > box.bottom;
+  if (outside) el.uploadModal.close();
 });
 
 /* ─────────────────────────── Server status ──────────────────────────── */
@@ -144,7 +211,170 @@ function setServerStatus(state, label, title) {
   el.serverStatus.title = title || label;
 }
 
-/* ───────────── Ingestion (no upload — the backend re-scans its own folder) ───────────── */
+/* ─────────────────────────── Upload ─────────────────────────────────
+   The browser sends PDFs to POST /upload, which writes them into the server's data folder
+   and starts the same background ingestion job that the sync button uses. Two progress
+   phases, because they fail differently and take wildly different amounts of time:
+   the transfer (XHR, has real byte counts) and the indexing (polled from /ingest/status).
+   ==================================================================== */
+
+let MAX_UPLOAD_MB = 100;   // replaced with the server's real limit by refreshSources()
+const uploadCards = new Map();
+
+function humanSize(bytes) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1e3))} KB`;
+}
+
+/** One row per file, so a batch shows which specific file failed rather than "upload failed". */
+function addUploadCard(name, bytes) {
+  const li = document.createElement("li");
+  li.className = "upload";
+  li.innerHTML = `
+    <div class="upload__top">
+      <span class="upload__name"></span>
+      <span class="upload__size"></span>
+    </div>
+    <div class="upload__bar"><div class="upload__bar-fill"></div></div>
+    <span class="upload__state">Waiting…</span>`;
+  li.querySelector(".upload__name").textContent = shortDocName(name);
+  li.querySelector(".upload__name").title = name;
+  li.querySelector(".upload__size").textContent = humanSize(bytes);
+  el.uploadList.appendChild(li);
+
+  const card = {
+    li,
+    bar: li.querySelector(".upload__bar-fill"),
+    state: li.querySelector(".upload__state"),
+    set(percent, label, tone) {
+      if (percent !== null) this.bar.style.width = `${Math.max(2, Math.min(100, percent))}%`;
+      if (label) this.state.textContent = label;
+      li.dataset.tone = tone || "";
+    },
+  };
+  uploadCards.set(name, card);
+  return card;
+}
+
+function clearFinishedUploads() {
+  for (const [name, card] of uploadCards) {
+    if (card.li.dataset.tone === "done") {
+      card.li.remove();
+      uploadCards.delete(name);
+    }
+  }
+}
+
+/** XHR rather than fetch(): fetch has no upload-progress events, and a 40MB book needs one. */
+function sendFiles(files, cards) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    for (const file of files) form.append("files", file, file.name);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE}/upload`);
+
+    xhr.upload.addEventListener("progress", (e) => {
+      if (!e.lengthComputable) return;
+      const percent = Math.round((e.loaded / e.total) * 100);
+      // One request carries the whole batch, so every card in it shares the transfer bar.
+      for (const card of cards) card.set(percent, `Uploading… ${percent}%`);
+    });
+
+    xhr.addEventListener("load", () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+      else reject(new Error(body.detail || `Upload failed (${xhr.status})`));
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload failed — the server is not reachable.")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
+    xhr.send(form);
+  });
+}
+
+async function uploadFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+
+  clearFinishedUploads();
+
+  // Checked here as well as on the server: no point spending two minutes uploading 300MB
+  // only to be told at the end.
+  const tooBig = files.filter((f) => f.size > MAX_UPLOAD_MB * 1024 * 1024);
+  const notPdf = files.filter((f) => !/\.pdf$/i.test(f.name));
+  const good = files.filter((f) => !tooBig.includes(f) && !notPdf.includes(f));
+
+  for (const f of tooBig) addUploadCard(f.name, f.size).set(100, `Too large (limit ${MAX_UPLOAD_MB} MB)`, "error");
+  for (const f of notPdf) addUploadCard(f.name, f.size).set(100, "Not a PDF", "error");
+  if (!good.length) return;
+
+  const cards = good.map((f) => addUploadCard(f.name, f.size));
+  cards.forEach((c) => c.set(2, "Uploading…"));
+  setBusy(true);
+
+  try {
+    const result = await sendFiles(good, cards);
+
+    for (const bad of result.rejected || []) {
+      const card = uploadCards.get(bad.filename);
+      if (card) card.set(100, bad.error, "error");
+    }
+    // The server renames on collision ("notes (2).pdf"), so track the name it actually used.
+    (result.accepted || []).forEach((ok, i) => {
+      const card = cards[i];
+      if (!card) return;
+      card.set(100, "Uploaded — indexing…", "working");
+      card.serverName = ok.filename;
+      uploadCards.set(ok.filename, card);
+    });
+
+    await pollUntilDone();
+
+    for (const ok of result.accepted || []) {
+      const card = uploadCards.get(ok.filename);
+      if (card && card.li.dataset.tone !== "error") card.set(100, "Ready", "done");
+    }
+  } catch (err) {
+    cards.forEach((c) => c.set(100, err.message, "error"));
+    setStatus(err.message, "error");
+    setBusy(false);
+  }
+}
+
+el.fileInput.addEventListener("change", () => {
+  uploadFiles(el.fileInput.files);
+  el.fileInput.value = "";   // so re-picking the same file fires 'change' again
+});
+
+// Drag and drop. The counter exists because dragleave fires when the pointer crosses onto
+// a child element, which made the highlight flicker.
+let dragDepth = 0;
+["dragenter", "dragover"].forEach((type) => {
+  el.dropzone.addEventListener(type, (e) => {
+    e.preventDefault();
+    if (type === "dragenter") dragDepth++;
+    el.dropzone.classList.add("is-over");
+  });
+});
+["dragleave", "drop"].forEach((type) => {
+  el.dropzone.addEventListener(type, (e) => {
+    e.preventDefault();
+    if (type === "dragleave") dragDepth = Math.max(0, dragDepth - 1);
+    else dragDepth = 0;
+    if (dragDepth === 0) el.dropzone.classList.remove("is-over");
+  });
+});
+el.dropzone.addEventListener("drop", (e) => {
+  if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files);
+});
+// Dropping a PDF anywhere else in the window would otherwise navigate away from the app
+// and open the file in the browser.
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
+
+/* ───────────── Ingestion (the backend re-scans its own folder) ───────────── */
 
 el.syncBtn.addEventListener("click", () => runJob("/ingest", "Scanning the data folder…"));
 el.resetBtn.addEventListener("click", () => {
@@ -187,12 +417,36 @@ async function pollUntilDone() {
       setServerStatus("busy", "Indexing", "An ingestion job is running");
       const done = job.files_done ?? 0;
       const total = job.files_total ?? 0;
+      const chunksDone = job.chunks_done ?? 0;
+      const chunksTotal = job.chunks_total ?? 0;
+
+      // Progress within the current document, so one 900-page book is not a bar frozen at
+      // 0% for five minutes: whole files finished, plus the fraction of the current one.
+      let percent = total > 0 ? (done / total) * 100 : 0;
+      if (total > 0 && chunksTotal > 0) percent += (chunksDone / chunksTotal) * (100 / total);
       if (total > 0) {
         el.syncProgress.classList.remove("progress--indeterminate");
-        el.syncProgressBar.style.width = `${Math.round((done / total) * 100)}%`;
+        el.syncProgressBar.style.width = `${Math.min(100, Math.round(percent))}%`;
       }
+
       const current = job.current_file ? ` — ${shortDocName(job.current_file)}` : "";
-      setStatus(`Indexing ${done}/${total || "?"}${current}`);
+      const detail = job.stage === "extracting"
+        ? " · reading pages"
+        : (chunksTotal ? ` · ${chunksDone}/${chunksTotal} passages` : "");
+      setStatus(`Indexing ${Math.min(done + 1, total || 1)}/${total || "?"}${current}${detail}`);
+
+      // Mirror it onto the upload row for the file currently being processed.
+      const card = job.current_file && uploadCards.get(job.current_file);
+      if (card && card.li.dataset.tone !== "error") {
+        const filePercent = chunksTotal ? Math.round((chunksDone / chunksTotal) * 100) : null;
+        card.set(
+          filePercent,
+          job.stage === "extracting"
+            ? "Reading pages…"
+            : `Indexing… ${filePercent === null ? "" : filePercent + "%"}`.trim(),
+          "working",
+        );
+      }
       await sleep(1000);
       continue;
     }
@@ -247,6 +501,11 @@ async function refreshSources() {
     const docs = data.documents || [];
 
     el.docCount.textContent = docs.length;
+    if (el.railCount) el.railCount.textContent = docs.length;
+    if (data.max_upload_mb) {
+      MAX_UPLOAD_MB = data.max_upload_mb;
+      if (el.maxUploadMb) el.maxUploadMb.textContent = data.max_upload_mb;
+    }
     el.chunkCount.textContent = data.total_chunks
       ? `${data.total_chunks.toLocaleString()} passages`
       : "empty";
@@ -255,12 +514,20 @@ async function refreshSources() {
       setServerStatus("online", "Online", `Connected to ${window.location.origin}`);
     }
 
+    // Only fully-indexed documents appear here: the list comes from the manifest, and a
+    // manifest entry is written after the last chunk of that file is stored.
     el.sourceList.innerHTML = docs.length === 0
       ? `<li class="doc-empty">Nothing ingested yet</li>`
       : docs.map((d) => `
         <li title="${escapeHtml(d.filename)}">
-          <span class="doc-name">${escapeHtml(shortDocName(d.filename))}</span>
-          <span class="doc-meta">${d.pages ?? "?"} pages · ${(d.chunks ?? 0).toLocaleString()} chunks</span>
+          <div class="doc-text">
+            <span class="doc-name">${escapeHtml(shortDocName(d.filename))}</span>
+            <span class="doc-meta">${d.pages ?? "?"} pages · ${(d.chunks ?? 0).toLocaleString()} chunks</span>
+          </div>
+          <button type="button" class="icon-btn doc-remove" data-doc="${escapeHtml(d.filename)}"
+                  title="Remove this document" aria-label="Remove ${escapeHtml(shortDocName(d.filename))}">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+          </button>
         </li>`).join("");
 
     // Keep the scope dropdown in sync with what is actually stored.
@@ -275,6 +542,34 @@ async function refreshSources() {
     setServerStatus("offline", "Offline", "The backend is not responding");
   }
 }
+
+/* ─────────────────────────── Remove a document ───────────────────────── */
+
+el.sourceList.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".doc-remove");
+  if (!btn) return;
+
+  const filename = btn.dataset.doc;
+  if (!confirm(
+    `Remove "${shortDocName(filename)}"?\n\n` +
+    "Its passages are deleted from the index and the PDF is deleted from the server's " +
+    "data folder. This cannot be undone."
+  )) return;
+
+  btn.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(filename)}`, {
+      method: "DELETE",
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `Could not remove it (${res.status})`);
+    setStatus(`Removed ${shortDocName(filename)}.`, "ok");
+    await refreshSources();
+  } catch (err) {
+    btn.disabled = false;
+    setStatus(err.message, "error");
+  }
+});
 
 /* ─────────────────────────── Chat ───────────────────────────── */
 
@@ -639,18 +934,9 @@ async function boot() {
       continue;
     }
 
-    if (!stats.total_chunks) {
-      reveal();
-      title.textContent = "No documents indexed";
-      text.textContent = "Put a PDF in the server's data/ folder, then use “Sync from data folder”.";
-      indeterminate(false);
-      bar.style.width = "100%";
-      skip.hidden = false;
-      skip.textContent = "Continue";
-      await sleep(3000);
-      continue;
-    }
-
+    // An empty index is not a reason to hold the app back any more - "Add documents" is
+    // right there in the sidebar, and blocking the UI would hide the very button that
+    // fixes it.
     break;
   }
 

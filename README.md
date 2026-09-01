@@ -6,8 +6,10 @@ answered by an LLM on Groq, grounded only in what's in the PDF.
 No LangChain/LlamaIndex — every step is plain Python so you can see exactly what's happening
 at each stage. That's deliberate, given this is a learning project.
 
-**Documents come only from the backend's `data/` folder.** There is no upload endpoint —
-the frontend can only ask questions, never add or change what's in the vector store.
+**Everything is indexed from the backend's `data/` folder.** Drop PDFs in there yourself,
+or upload them from the web UI — `POST /upload` writes the file into that same folder and
+then the ordinary ingestion job indexes it. There is no authentication, so keep it on
+localhost unless you add some.
 
 ## Stack
 
@@ -35,7 +37,7 @@ My RAG Project/
 │   ├── main.py                   app assembly: router, CORS, lifespan, static mount
 │   ├── api/                      HTTP layer — thin handlers
 │   │   ├── chat.py               /chat, /chat/stream (SSE)
-│   │   ├── documents.py          /ingest, /ingest/status, /stats, /reset
+│   │   ├── documents.py          /ingest, /ingest/status, /stats, /reset, /upload, DELETE /documents
 │   │   └── system.py             /health, /info
 │   ├── core/
 │   │   ├── config.py             every setting, loaded once from .env
@@ -132,7 +134,7 @@ relative path.
 Files are fingerprinted by content hash, so re-running is always safe: unchanged files are
 skipped, and an edited PDF is re-ingested (its old chunks are deleted first, not
 duplicated). You can also trigger the same scan at runtime with `POST /ingest`, or the
-"Sync from data folder" button in the frontend — both run in the background.
+"Sync documents" button in the frontend — both run in the background.
 
 The first run downloads the embedding model (~130MB) and then caches it. Embedding a large
 book is real CPU work and can take several minutes.
@@ -163,6 +165,8 @@ block on embedding. `GET /ingest/status` reports progress.
 | POST   | `/chat/stream`    | same body, streamed as SSE (`sources`, then `token`s, then `done`) |
 | GET    | `/stats`          | chunk count, per-document pages/chunks, ingestion state |
 | POST   | `/reset`          | wipe the store and rebuild from `data/` (202) |
+| POST   | `/upload`         | upload one or more PDFs (multipart `files`), then index them (202) |
+| DELETE | `/documents/{name}` | remove a document: its vectors, its manifest entry, and the PDF |
 
 Interactive docs at `http://localhost:8000/docs`.
 

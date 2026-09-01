@@ -14,7 +14,7 @@
      installed (Android, ChromeOS); DM Sans is loaded as the closest freely-licensed
      fallback so every other device gets a consistent, near-identical face. -->
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=5">
+<link rel="stylesheet" href="style.css?v=9">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
 </head>
 <body>
@@ -41,7 +41,8 @@
 
   <!-- ───────────────────────── Top bar ───────────────────────── -->
   <header class="topbar">
-    <button class="icon-btn topbar__menu" id="menuBtn" aria-label="Show documents panel" aria-expanded="false" aria-controls="sidebar">
+    <button class="icon-btn topbar__menu" id="menuBtn" title="Show or hide the sidebar"
+            aria-label="Hide the sidebar" aria-expanded="true" aria-controls="sidebar">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
     </button>
 
@@ -75,15 +76,14 @@
           <span class="pill" id="chunkCount" title="Searchable passages in the index">—</span>
         </div>
 
-        <p class="panel__hint">
-          Documents load from the server's <code>data/</code> folder. There's no upload — put a
-          PDF in that folder, then sync.
-        </p>
-
         <div class="btn-row">
-          <button id="syncBtn" class="btn btn--primary btn--block">
+          <button id="addBtn" class="btn btn--primary btn--block" title="Add documents">
+            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            <span>Add documents</span>
+          </button>
+          <button id="syncBtn" class="btn btn--ghost btn--block" title="Re-read the server's data folder and index anything new or changed">
             <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
-            <span>Sync from data folder</span>
+            <span>Sync documents</span>
           </button>
           <button id="resetBtn" class="btn btn--ghost btn--block" title="Wipe the index and rebuild it from the data folder">
             <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
@@ -91,13 +91,15 @@
           </button>
         </div>
 
+        <span class="rail-count" id="railCount" title="Documents in your library">0</span>
+
         <p id="syncStatus" class="status" role="status" aria-live="polite"></p>
         <div class="progress" id="syncProgress" hidden><div class="progress__bar" id="syncProgressBar"></div></div>
       </section>
 
       <section class="panel panel--grow">
         <div class="panel__head">
-          <h2 class="panel__title">Documents</h2>
+          <h2 class="panel__title">Your documents</h2>
           <span class="pill pill--muted" id="docCount">0</span>
         </div>
         <ul id="sourceList" class="doc-list">
@@ -167,6 +169,39 @@
 
 </div>
 
-<script src="script.js?v=5"></script>
+<!-- ───────────────────────── Upload dialog ─────────────────────────
+     A <dialog> rather than a hand-rolled overlay: the browser gives focus trapping,
+     Esc-to-close, inertness of the page behind it and the top-layer stacking for free. -->
+<dialog class="modal" id="uploadModal" aria-labelledby="uploadModalTitle">
+  <form method="dialog" class="modal__close-form">
+    <button class="icon-btn modal__close" id="uploadClose" aria-label="Close">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </form>
+
+  <h2 class="modal__title" id="uploadModalTitle">Add documents</h2>
+  <p class="modal__text">
+    PDFs are uploaded to the server's <code>data/</code> folder and indexed there. A
+    document joins your library once it has finished processing.
+  </p>
+
+  <label class="dropzone" id="dropzone" for="fileInput">
+    <input type="file" id="fileInput" accept="application/pdf,.pdf" multiple hidden>
+    <svg class="dropzone__icon" viewBox="0 0 24 24" aria-hidden="true" width="26" height="26">
+      <path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+    </svg>
+    <span class="dropzone__title">Drag &amp; drop PDFs here</span>
+    <span class="dropzone__hint">or click to browse · up to <span id="maxUploadMb">100</span> MB each</span>
+  </label>
+
+  <ul class="uploads" id="uploadList"></ul>
+
+  <p class="modal__note" id="uploadNote">
+    Large books take a few minutes to index. You can close this window — processing carries
+    on and the progress stays visible in the sidebar.
+  </p>
+</dialog>
+
+<script src="script.js?v=9"></script>
 </body>
 </html>

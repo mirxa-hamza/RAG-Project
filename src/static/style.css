@@ -65,6 +65,9 @@
 
   --topbar-h: 60px;
   --sidebar-w: 312px;
+  /* Collapsed width: the sidebar becomes an icon rail rather than disappearing, so the
+     actions stay one click away. */
+  --rail-w: 64px;
   --measure: 46rem;
 }
 
@@ -137,6 +140,52 @@ svg {
   grid-template-rows: var(--topbar-h) minmax(0, 1fr);
   grid-template-areas: "topbar topbar" "sidebar chat";
   height: 100dvh;
+}
+
+/* Collapsed: the column narrows to an icon rail. The sidebar stays on screen and keeps
+   its buttons - only the labels, the document list and the scope selector go - so adding
+   or syncing a document never needs the panel to be re-opened first. */
+.app.is-collapsed { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+.app { transition: grid-template-columns var(--t-base); }
+.sidebar { transition: transform var(--t-base), visibility var(--t-base); }
+
+.app.is-collapsed .sidebar__inner { padding: 14px 10px; gap: 10px; align-items: center; }
+
+/* Everything that needs width is hidden; the icon buttons remain. */
+.app.is-collapsed .panel__head,
+.app.is-collapsed .panel__hint,
+.app.is-collapsed .doc-list,
+.app.is-collapsed .status,
+.app.is-collapsed .progress,
+.app.is-collapsed .uploads,
+.app.is-collapsed .field__label,
+.app.is-collapsed .field__help,
+.app.is-collapsed .select-wrap { display: none; }
+
+.app.is-collapsed .panel--grow { flex: none; }
+.app.is-collapsed .btn-row { width: 100%; gap: 8px; }
+
+/* Square icon buttons, label removed but kept in the accessibility tree. */
+.app.is-collapsed .sidebar .btn {
+  width: 44px; height: 44px; padding: 0;
+  margin-inline: auto;
+  border-radius: var(--r-md);
+}
+.app.is-collapsed .sidebar .btn > span:not(.btn__icon) {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.app.is-collapsed .sidebar .btn__icon { width: 18px; height: 18px; }
+
+/* A count badge on the rail, so "how many documents" survives the collapse. */
+.app.is-collapsed .rail-count { display: flex; }
+.rail-count {
+  display: none;
+  align-items: center; justify-content: center;
+  width: 44px; padding: 3px 0;
+  font-size: 11px; font-weight: 600;
+  color: var(--text-muted); background: var(--n-100);
+  border: 1px solid var(--border); border-radius: var(--r-full);
 }
 
 /* ── Top bar ───────────────────────────────────────────────── */
@@ -258,9 +307,9 @@ svg {
 .icon-btn:hover:not(:disabled) { background: var(--n-100); color: var(--text); }
 .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
 
-/* Declared after .icon-btn on purpose: both are single-class selectors, so the later
-   rule wins. The drawer toggle is re-enabled in the tablet/phone media query below. */
-.topbar .topbar__menu { display: none; }
+/* The sidebar toggle is available at every width: on desktop it collapses the column, on
+   phones it opens the off-canvas drawer. */
+.topbar .topbar__menu { display: grid; }
 
 /* ── Status + progress ─────────────────────────────────────── */
 .status { font-size: 12.5px; line-height: 1.5; color: var(--text-muted); }
@@ -288,6 +337,88 @@ svg {
   transition: border-color var(--t-fast), background var(--t-fast);
 }
 .doc-list li:hover { border-color: var(--n-300); background: var(--surface); }
+
+/* Room for the remove button beside the text. */
+.doc-list li { display: flex; align-items: flex-start; gap: 8px; }
+.doc-text { flex: 1; min-width: 0; }
+
+.doc-remove {
+  flex: none; width: 28px; height: 28px; margin: -2px -4px 0 0;
+  color: var(--text-subtle);
+  opacity: 0; transition: opacity var(--t-fast), color var(--t-fast), background var(--t-fast);
+}
+.doc-remove svg { width: 15px; height: 15px; }
+.doc-list li:hover .doc-remove,
+.doc-remove:focus-visible { opacity: 1; }
+.doc-remove:hover { color: var(--primary); background: var(--brand-50); }
+.doc-remove:disabled { opacity: .4; cursor: progress; }
+
+/* Touch devices have no hover, so the control must always be visible there. */
+@media (hover: none) {
+  .doc-remove { opacity: 1; }
+}
+
+/* ── Upload ────────────────────────────────────────────────── */
+.dropzone {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 30px 20px;
+  margin-bottom: 12px;
+  text-align: center; cursor: pointer;
+  background: var(--surface-alt);
+  border: 1.5px dashed var(--border);
+  border-radius: var(--r-md);
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.dropzone:hover { border-color: var(--n-300); background: var(--surface); }
+.dropzone:focus-within { border-color: var(--primary); box-shadow: var(--ring); }
+.dropzone.is-over {
+  border-color: var(--primary);
+  border-style: solid;
+  background: rgba(220, 49, 38, .05);
+}
+
+.dropzone__icon {
+  width: 26px; height: 26px; margin-bottom: 4px;
+  fill: none; stroke: var(--primary); stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.dropzone__title { font-size: 14px; font-weight: 500; }
+.dropzone__hint { font-size: 12px; color: var(--text-subtle); }
+
+.uploads { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
+.uploads:empty { display: none; }
+
+.upload {
+  padding: 9px 11px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+.upload__top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.upload__name {
+  font-size: 12.5px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.upload__size { flex: none; font-size: 11px; color: var(--text-subtle); }
+
+.upload__bar {
+  height: 4px; margin: 7px 0 5px;
+  background: var(--n-200);
+  border-radius: 999px; overflow: hidden;
+}
+.upload__bar-fill {
+  height: 100%; width: 2%;
+  background: var(--primary);
+  border-radius: 999px;
+  transition: width var(--t-base);
+}
+.upload__state { font-size: 11px; color: var(--text-subtle); }
+
+.upload[data-tone="done"] .upload__bar-fill { background: var(--success); }
+.upload[data-tone="done"] .upload__state { color: var(--success); }
+.upload[data-tone="error"] .upload__bar-fill { background: var(--danger); }
+.upload[data-tone="error"] .upload__state { color: var(--danger); }
+.upload[data-tone="working"] .upload__state { color: var(--primary); }
 
 .doc-name { display: block; font-size: 12.5px; font-weight: 500; line-height: 1.45; overflow-wrap: anywhere; }
 .doc-meta { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-subtle); }
@@ -434,6 +565,41 @@ svg {
   font-size: 12.5px; line-height: 1.55;
 }
 .md pre code { background: none; border: 0; padding: 0; color: inherit; }
+
+/* ── Modal (upload) ────────────────────────────────────────────
+   A native <dialog>, so focus trapping, Esc-to-close and stacking come from the browser. */
+.modal {
+  width: min(560px, calc(100vw - 32px));
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 18px 48px rgba(24, 24, 29, .18);
+}
+.modal::backdrop { background: rgba(24, 24, 29, .45); }
+.modal[open] { animation: modal-in var(--t-base) ease; }
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(6px) scale(.99); }
+}
+
+.modal__close-form { float: right; margin: -6px -6px 0 0; }
+.modal__close { width: 32px; height: 32px; }
+.modal__close svg { width: 16px; height: 16px; }
+
+.modal__title { font-size: 17px; margin-bottom: 6px; }
+.modal__text {
+  font-size: 13px; line-height: 1.55; color: var(--text-muted);
+  margin-bottom: 16px;
+}
+.modal__note { font-size: 12px; line-height: 1.5; color: var(--text-subtle); }
+
+/* In the dialog the upload rows can grow, so cap them and scroll. */
+.modal .uploads { max-height: 34vh; overflow-y: auto; }
+
+@media (prefers-reduced-motion: reduce) {
+  .modal[open] { animation: none; }
+}
 
 /* ── Thinking indicator ────────────────────────────────────────
    Fills the answer bubble while retrieval runs, so it is never an empty white box. */
@@ -609,7 +775,9 @@ svg {
 
 /* Scrim behind the mobile drawer */
 .scrim {
-  position: fixed; inset: 0; z-index: 25;
+  /* BELOW the drawer (z-index 20), not above it. At 25 the scrim covered the open drawer
+     and swallowed every click inside it - the buttons looked enabled and did nothing. */
+  position: fixed; inset: 0; z-index: 15;
   background: rgba(24, 24, 29, .45);
   animation: fade var(--t-base);
 }
@@ -627,7 +795,6 @@ svg {
     grid-template-areas: "topbar" "chat";
   }
 
-  .topbar .topbar__menu { display: grid; }
   .topbar { padding-inline: 12px; }
   .brand__tag { display: none; }
   .status-dot__label { display: none; }
@@ -644,6 +811,25 @@ svg {
     visibility: hidden;
   }
   .sidebar.is-open { transform: none; visibility: visible; }
+  /* The drawer is positioned, not a grid column, so the desktop rail rules must not apply:
+     on a phone there is no room for a permanent rail, and the drawer hides completely. */
+  .app.is-collapsed { grid-template-columns: minmax(0, 1fr); }
+  .app.is-collapsed .sidebar__inner { padding: 18px; gap: 18px; align-items: stretch; }
+  .app.is-collapsed .panel__head,
+  .app.is-collapsed .panel__hint,
+  .app.is-collapsed .doc-list,
+  .app.is-collapsed .status,
+  .app.is-collapsed .uploads,
+  .app.is-collapsed .field__label,
+  .app.is-collapsed .field__help,
+  .app.is-collapsed .select-wrap { display: revert; }
+  .app.is-collapsed .sidebar .btn {
+    width: 100%; height: auto; padding: 10px 16px; margin-inline: 0;
+  }
+  .app.is-collapsed .sidebar .btn > span:not(.btn__icon) {
+    position: static; width: auto; height: auto; margin: 0; clip: auto;
+  }
+  .app.is-collapsed .rail-count { display: none; }
 
   .messages { padding: 20px 16px 4px; gap: 18px; }
   .composer-wrap { padding: 10px 16px 14px; }
