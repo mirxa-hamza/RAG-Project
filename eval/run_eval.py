@@ -88,6 +88,21 @@ def judge(question: str, answer: str, context: str, reference: str) -> dict:
         return {"error": str(exc)}
 
 
+def _warn_if_unreviewed(questions) -> None:
+    """
+    Says so, loudly, when the golden set has not been reviewed by a person.
+
+    scripts/draft_golden.py produces mechanical question stubs with "reviewed": false. They
+    are useful as a starting point and worthless as a measurement - reporting hit-rate
+    against them looks like evidence while being nothing of the kind.
+    """
+    unreviewed = [q for q in questions if q.get("reviewed") is False]
+    if unreviewed:
+        print(f"\n!! {len(unreviewed)} of {len(questions)} questions are unreviewed drafts.")
+        print("!! These numbers do not mean anything yet - edit them first")
+        print("!! (see scripts/draft_golden.py).\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Measure retrieval and answer quality.")
     parser.add_argument("--set", default=str(DEFAULT_SET), help="path to the golden question JSON")
@@ -100,11 +115,16 @@ def main() -> int:
     args = parser.parse_args()
 
     data = json.loads(Path(args.set).read_text(encoding="utf-8"))
+    # A draft from scripts/draft_golden.py is a bare list; a finished set is an object with
+    # "questions" and "unanswerable". Both load, and an unreviewed one is called out below.
+    if isinstance(data, list):
+        data = {"questions": data, "unanswerable": []}
     questions = data.get("questions", [])
     unanswerable = data.get("unanswerable", [])
     if not questions:
         print(f"No questions in {args.set}")
         return 1
+    _warn_if_unreviewed(questions)
 
     options = dict(
         use_rerank=not args.no_rerank,

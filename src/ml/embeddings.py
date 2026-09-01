@@ -20,7 +20,7 @@ Two details that matter for retrieval quality:
   a plain MiniLM. Configured via EMBEDDING_QUERY_PREFIX (set it to "" for MiniLM).
 """
 import threading
-from typing import List
+from typing import List, Optional
 
 from src.core.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL, EMBEDDING_QUERY_PREFIX
 from src.core.logging import get_logger, timed
@@ -105,6 +105,56 @@ def warn_if_truncated(texts: List[str], sample: int = 25) -> int:
             len(over), len(sampled), limit, max(over),
         )
     return len(over)
+
+
+def split_to_token_limit(chunks: List[dict], limit: Optional[int] = None) -> List[dict]:
+    """
+    Splits any chunk that would be truncated at embedding time, in place of warning about it.
+
+    The chunker packs by WORDS, but the model reads TOKENS, and the ratio is not a constant:
+    ordinary prose runs ~1.3 tokens per word, while dense technical pages - formulae,
+    hyphenated terms, tables - have been measured at 616 tokens for a 300-word chunk here,
+    past bge-small's 512 window. Everything past the window is silently dropped, so the tail
+    of such a chunk never influences retrieval at all.
+
+    Splitting is done on the chunk's own words, in halves, until each piece fits. Page
+    attribution is inherited: a split piece belongs to the same page range as its parent,
+    which is a slight over-estimate at the boundary and the same approximation the chunker
+    already makes.
+    """
+    limit = limit or max_input_tokens()
+    if not limit or not chunks:
+        return chunks
+
+    # Leave headroom: some models add special tokens to every input.
+    budget = max(64, int(limit * 0.95))
+    out: List[dict] = []
+    split_count = 0
+
+    for chunk in chunks:
+        text = chunk["text"]
+        if count_tokens(text) <= budget:
+            out.append(chunk)
+            continue
+
+        # Halve until each piece fits. Iterative rather than recursive so a pathological
+        # chunk cannot blow the stack.
+        pending = [text]
+        while pending:
+            piece = pending.pop(0)
+            words = piece.split()
+            if count_tokens(piece) <= budget or len(words) < 2:
+                out.append(dict(chunk, text=piece))
+                continue
+            middle = len(words) // 2
+            pending.insert(0, " ".join(words[middle:]))
+            pending.insert(0, " ".join(words[:middle]))
+            split_count += 1
+
+    if split_count:
+        log.info("Split %d oversized chunk(s) to fit the model's %d-token window.",
+                 split_count, limit)
+    return out
 
 
 def embed_passages(texts: List[str]) -> List[List[float]]:

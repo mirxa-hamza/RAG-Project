@@ -14,13 +14,15 @@ and delete them from disk. There is no authentication here.
 """
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 
+from src.api.auth import _enforce
 from src.api.deps import get_current_user, user_id_of
-from src.core.config import MAX_UPLOAD_BYTES
+from src.core import ratelimit
+from src.core.config import MAX_UPLOAD_BYTES, MAX_USER_STORAGE_BYTES
 from src.core.logging import get_logger
 from src.ml import embeddings
-from src.services import ingestion, manifest, uploads, vectorstore
+from src.services import answer_cache, database, ingestion, manifest, uploads, vectorstore
 
 log = get_logger(__name__)
 
@@ -69,13 +71,16 @@ def stats(user: dict = Depends(get_current_user)):
         # The UI checks file sizes before uploading, so it needs the server's real limit
         # rather than a hard-coded copy that can drift out of sync with .env.
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+        "storage_used_bytes": uploads.used_bytes(uid),
+        "storage_quota_bytes": MAX_USER_STORAGE_BYTES,
         "username": user["username"],
         **mine,
     }
 
 
 @router.post("/upload", status_code=status.HTTP_202_ACCEPTED)
-async def upload(files: List[UploadFile] = File(...), user: dict = Depends(get_current_user)):
+async def upload(request: Request, files: List[UploadFile] = File(...),
+                 user: dict = Depends(get_current_user)):
     """
     Accepts one or more PDFs, writes them into the data folder, and starts indexing.
 
@@ -88,6 +93,9 @@ async def upload(files: List[UploadFile] = File(...), user: dict = Depends(get_c
         raise HTTPException(status_code=400, detail="No files were sent.")
 
     uid = user_id_of(user)
+    # Per account, not per address: uploads cost minutes of CPU and disk, and the account
+    # is the thing being held responsible.
+    _enforce(ratelimit.UPLOAD, uid)
     accepted, rejected = [], []
     for item in files:
         try:
@@ -114,14 +122,22 @@ async def upload(files: List[UploadFile] = File(...), user: dict = Depends(get_c
             detail=rejected[0]["error"] if rejected else "No files were accepted.",
         )
 
-    ingestion.start_job()
+    for ok in accepted:
+        await database.record_audit(uid, user["username"], "upload", ok["filename"])
+    for bad in rejected:
+        await database.record_audit(uid, user["username"], "upload_rejected",
+                                    f"{bad['filename']}: {bad['error']}", ok=False)
+
+    # Scoped to the uploader: there is no reason to re-walk everyone else's folders, and
+    # with many accounts that walk is the slow part of a small upload.
+    ingestion.start_job(user_id=uid)
     return {"accepted": accepted, "rejected": rejected,
             "job": ingestion.job_status(uid),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
 
 
 @router.delete("/documents/{filename:path}")
-def delete_document(filename: str, user: dict = Depends(get_current_user)):
+async def delete_document(filename: str, user: dict = Depends(get_current_user)):
     """
     Removes a document completely: its vectors, its manifest entry, and the PDF itself.
 
@@ -157,12 +173,14 @@ def delete_document(filename: str, user: dict = Depends(get_current_user)):
     # this document is removed, including ones stored before it had an owner.
     vectorstore.delete_source(filename)
     manifest.remove(filename)
+    answer_cache.bump(uid)
+    await database.record_audit(uid, user["username"], "delete_document", filename)
     log.info("Removed '%s' from the library.", filename)
     return {"filename": filename, "removed": True, "file_deleted": existed_on_disk}
 
 
 @router.post("/reset", status_code=status.HTTP_202_ACCEPTED)
-def reset(user: dict = Depends(get_current_user)):
+async def reset(user: dict = Depends(get_current_user)):
     """
     Rebuilds the caller's documents from their files on disk.
 
@@ -179,7 +197,10 @@ def reset(user: dict = Depends(get_current_user)):
     for name in mine:
         vectorstore.delete_source(name)
         manifest.remove(name)
+    answer_cache.bump(uid)
     log.info("Rebuilding %d document(s) for user %s", len(mine), uid)
+    await database.record_audit(uid, user["username"], "rebuild_index",
+                                f"{len(mine)} document(s)")
 
-    ingestion.start_job()
+    ingestion.start_job(user_id=uid)
     return ingestion.job_status(uid)

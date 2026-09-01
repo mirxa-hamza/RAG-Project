@@ -7,13 +7,23 @@ store happily returns general search-algorithm prose that never mentions A*. BM2
 on literal term overlap, so it nails those; it is correspondingly bad at paraphrase, which
 is what the vector side is for. Fusing the two ranked lists (see retrieval.py) gets both.
 
-The index lives in memory and is built lazily on first use, then reused. Building it means
-reading every chunk out of Chroma once per process - deliberate: an O(corpus) read at
-first query is fine, an O(corpus) read per query would not be. `invalidate()` is called
-whenever ingestion changes the store.
+Indices are PER USER and built lazily, then cached in a small LRU. This is both a
+correctness and a cost decision:
+
+* Correctness: BM25 ranks in memory, so it cannot use Chroma's owner filter. A shared index
+  has to be filtered after ranking, which is easy to get wrong (filter after the limit and
+  you silently return fewer results than asked for).
+* Cost: a single shared index is invalidated by ANY user's upload, and the next question
+  from anybody pays for a full re-read of every chunk plus a rebuild. Measured:
+  0.09s at 3k chunks, 0.52s at 20k, 2.95s at 60k, on top of the Chroma read. Per-user
+  indices mean one person's upload only costs that person.
+
+`invalidate(user_id)` drops one user's index; `invalidate()` with no argument drops all of
+them, which is what a global change (a reset, a model swap) needs.
 """
 import re
 import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from rank_bm25 import BM25Okapi
@@ -24,9 +34,14 @@ log = get_logger(__name__)
 
 _TOKEN = re.compile(r"[a-z0-9][a-z0-9*+\-_.]*")
 
+# How many users' indices to keep in memory at once. Each is roughly the size of that
+# user's text, so this is the memory/rebuild trade-off knob.
+MAX_CACHED_INDICES = 8
+
 _lock = threading.Lock()
-_index: Optional[BM25Okapi] = None
-_rows: List[Dict] = []          # parallel to the index: the chunk each row scores
+# user_id (or "" for the unfiltered index used by the CLI and the eval harness) ->
+# (index, rows). Ordered by use, oldest first, so eviction is plain LRU.
+_cache: "OrderedDict[str, Tuple[Optional[BM25Okapi], List[Dict]]]" = OrderedDict()
 
 
 def tokenize(text: str) -> List[str]:
@@ -38,28 +53,61 @@ def tokenize(text: str) -> List[str]:
     return _TOKEN.findall(text.lower())
 
 
-def invalidate() -> None:
-    """Drops the cached index. Call after anything that changes stored chunks."""
-    global _index, _rows
+def invalidate(user_id: Optional[str] = None) -> None:
+    """
+    Drops cached indices. Call after anything that changes stored chunks.
+
+    With a user_id, only that user's index goes - one person's upload must not make
+    everyone else's next question pay for a rebuild. Without one, everything goes, which is
+    what a store-wide change needs.
+
+    The unfiltered index ("") is always dropped: it contains every user's chunks, so any
+    change anywhere invalidates it.
+    """
     with _lock:
-        _index, _rows = None, []
-    log.debug("BM25 index invalidated.")
+        if user_id is None:
+            _cache.clear()
+            log.debug("All BM25 indices invalidated.")
+        else:
+            _cache.pop(user_id, None)
+            _cache.pop("", None)
+            log.debug("BM25 index for %s invalidated.", user_id)
 
 
-def _build() -> None:
-    global _index, _rows
+def _build(user_id: str) -> Tuple[Optional[BM25Okapi], List[Dict]]:
+    """Builds one index. `user_id` of "" means the whole store (CLI and eval only)."""
     # Imported here rather than at module scope to avoid a circular import
     # (vectorstore -> retrieval -> bm25 -> vectorstore).
     from src.services.vectorstore import all_chunks
 
-    with timed(log, "build BM25 index"):
-        rows = all_chunks()
+    with timed(log, f"build BM25 index ({user_id or 'all documents'})"):
+        rows = all_chunks(user_id=user_id or None)
         if not rows:
-            _index, _rows = None, []
-            return
-        _index = BM25Okapi([tokenize(r["text"]) for r in rows])
-        _rows = rows
-    log.info("BM25 index built over %d chunks.", len(_rows))
+            return None, []
+        index = BM25Okapi([tokenize(r["text"]) for r in rows])
+    log.info("BM25 index built over %d chunks for %s.", len(rows), user_id or "all documents")
+    return index, rows
+
+
+def _get(user_id: str) -> Tuple[Optional[BM25Okapi], List[Dict]]:
+    """The cached index for one user, building it if needed. LRU by last use."""
+    with _lock:
+        cached = _cache.get(user_id)
+        if cached is not None:
+            _cache.move_to_end(user_id)
+            return cached
+
+    # Built OUTSIDE the lock: it reads the whole corpus and can take seconds, and holding
+    # the lock would block every other user's search for that whole time.
+    built = _build(user_id)
+
+    with _lock:
+        _cache[user_id] = built
+        _cache.move_to_end(user_id)
+        while len(_cache) > MAX_CACHED_INDICES:
+            evicted, _ = _cache.popitem(last=False)
+            log.debug("Evicted the BM25 index for %s.", evicted or "all documents")
+    return built
 
 
 def search(question: str, limit: int, source: Optional[str] = None,
@@ -67,16 +115,12 @@ def search(question: str, limit: int, source: Optional[str] = None,
     """
     Returns [(chunk, score), ...] best first. Empty list if the store is empty.
 
-    ISOLATION POINT 2 of 3. The index itself is built over EVERY chunk in the store -
-    rebuilding it per user would mean an O(corpus) read per request - so ownership is
-    enforced when filtering the ranking, before the limit is applied. Filtering after the
-    slice would silently return fewer results than asked for whenever another user's
-    chunks rank highly, so the order here matters.
+    ISOLATION POINT 2 of 3. Each user gets their own index, so another user's chunks are
+    not in the ranking at all. The post-ranking owner filter below is kept anyway as a
+    second line of defence - it costs one comparison per row and it is what would catch a
+    caching mistake here.
     """
-    with _lock:
-        if _index is None:
-            _build()
-        index, rows = _index, _rows
+    index, rows = _get(user_id or "")
 
     if index is None or not rows:
         return []

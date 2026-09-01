@@ -56,7 +56,8 @@ src/
   api/auth.py          /api/signup, /api/login, /api/me
   core/                cross-cutting: imported by everything else
     config.py          every setting; paths resolve against PROJECT_ROOT, not the CWD
-    logging.py         logging config + `timed()` context manager
+    logging.py         text or JSON logging, request ids, `timed()` context manager
+    ratelimit.py       in-process sliding-window limiter (single-worker only)
   models/
     schemas.py         pydantic request/response shapes
   ml/                  model wrappers
@@ -66,7 +67,8 @@ src/
   services/            pipeline logic
     database.py        Motor client + the users collection (accounts only live here)
     security.py        Argon2id hashing (pwdlib) + JWT encode/decode
-    ownership.py       one-off adoption of pre-auth documents; the "owner of record"
+    ownership.py       adoption of pre-auth documents, owner of record, account cleanup
+    answer_cache.py    per-user LRU of finished answers, invalidated by document changes
     ingestion.py       single entry point for documents + background job state machine
     uploads.py         validates + writes browser uploads into DATA_DIR; deletes documents
     manifest.py        JSON sidecar: what's ingested, with content hashes
@@ -78,12 +80,16 @@ src/
 scripts/
   ingest.py            CLI index builder (--force, --status)
   run.py               starts uvicorn, opens the browser once /health answers
+  backup.py            archives data/ + MongoDB; --verify reads a backup back
+  verify_index.py      finds orphan/ownerless/missing chunks; --fix repairs them
+  draft_golden.py      drafts eval questions from the real corpus for a human to edit
+Dockerfile / docker-compose.yml   app + MongoDB + volumes, models baked into the image
   make_test_pdf.py     fixture generator -> tests/fixtures/, never data/
 eval/
   golden_questions.json  golden set (currently fixture questions - replace with real ones)
   run_eval.py            hit-rate@k, MRR, refusal rate, optional LLM-as-judge
 tests/
-  test_pipeline_offline.py   175 checks, offline; no Groq key and no MongoDB needed
+  test_pipeline_offline.py   220 checks, offline; no Groq key and no MongoDB needed
 data/                  the live ingestion source, gitignored
   users/<user_id>/     one folder per account: everything uploaded through the web UI
   <anything else>      hand-copied PDFs; owned by the "owner of record" (first account)
@@ -125,6 +131,44 @@ Endpoint rules that follow from it:
   with several accounts would throw away everyone else's work.
 - **Deduplication is per owner.** Globally, the second person to upload a given book got a
   `skipped` document they could never see, because the only stored copy was someone else's.
+
+## Limits, and why each one exists
+
+Every one of these was added after an audit found a way to spend somebody else's money or
+CPU. Removing one re-opens the specific hole named beside it.
+
+| Limit | Setting | Without it |
+|---|---|---|
+| History field lengths | `Turn` in schemas.py | one request measured at 4,000,671 characters to Groq |
+| Assembled history | `MAX_HISTORY_CHARS` | several legal-sized turns add up to the same thing |
+| Login attempts | `ratelimit.LOGIN` | password guessing, and Argon2 becomes a CPU-exhaustion primitive |
+| Signups per IP | `ratelimit.SIGNUP` | unbounded account creation |
+| Uploads per account | `ratelimit.UPLOAD` | minutes of CPU per request, on demand |
+| Questions per account | `ratelimit.CHAT` | unbounded Groq spend |
+| Per-user storage | `MAX_USER_STORAGE_MB` | one account fills the disk and stops MongoDB for everyone |
+| Job result list | `MAX_JOB_RESULTS` | unbounded memory on a long-lived server |
+
+`src/core/ratelimit.py` and `src/services/answer_cache.py` hold state **in process**. That
+is correct only because the app is single-worker (below); with N workers every limit is
+effectively N times larger.
+
+## Deployment invariants
+
+- **ONE uvicorn worker. Not negotiable.** The ingestion job, the BM25 cache, the rate
+  limiter and the answer cache are all in-process, and ChromaDB's persistent client is
+  single-process. With `--workers 4`: progress bars hang (a random worker answers
+  `/ingest/status`), BM25 goes stale in three workers out of four, rate limits quadruple,
+  and two processes write the same SQLite file. To scale, move the job to a queue and the
+  vectors to a server-based store first.
+- **`/health` is liveness, `/ready` is readiness.** `/health` answers as soon as the process
+  is up - which is before the embedding model has loaded and regardless of MongoDB.
+  Anything that routes traffic must probe `/ready`, which is 503 until both are true.
+- **`data/` is the only copy of user documents.** `storage/` is derived and rebuildable;
+  `data/` is not, and neither is MongoDB. `scripts/backup.py` covers both, and
+  `--verify` exists because a backup nobody has read back is a hope, not a backup.
+- **Models are baked into the Docker image and `HF_HUB_OFFLINE=1` is set**, so a running
+  container never depends on Hugging Face being up, and a model repository cannot change
+  under a pinned name.
 
 ## Conventions
 
@@ -213,6 +257,14 @@ Endpoint rules that follow from it:
   matches. Anything else enumerates accounts.
 - **Username uniqueness is enforced by a unique Mongo index**, created at startup. The
   pre-check in the handler is a courtesy; two simultaneous signups both pass it.
+- **Confirmation failures are 403, never 401.** A wrong *current* password on the change
+  form, or a wrong confirmation on account deletion, is not an authentication failure - the
+  token is fine. Returning 401 made the frontend's "any 401 ends the session" rule sign the
+  user out for a typo, which is how this was found.
+- **`token_version` is what makes a JWT revocable.** It is stamped into every token and
+  compared on every request; a password change or "sign out everywhere" increments it and
+  every older token dies immediately. Any new place that mints a token must pass the
+  account's current version.
 - **Only accounts live in MongoDB.** Documents, vectors and the manifest stay in Chroma and
   on disk. Splitting one document's identity across two databases means a delete can
   half-succeed.
@@ -253,6 +305,14 @@ Three files, no build step, no framework. Conventions that matter:
 - **`resetAppState()` runs on every sign-in and sign-out.** Without it the previous
   account's chat transcript and document rows sit on screen until the first refresh lands,
   which looks exactly like a leak even though the server sent none of it.
+- **Ownership of a JOB is `scope`, not `current_file`.** `job_status(user_id)` reveals
+  progress when the run was started for that user, or when the file in flight is theirs.
+  Deciding from `current_file` alone was a bug: it is None at the start of a run, between
+  files and for the whole finished state, so the counts were blanked exactly when the UI
+  needed them and the progress bar never moved.
+- **The activity trail (`_state["events"]`) is per user and bounded.** It is what the
+  Processing status panel shows - the steps the pipeline actually took, tagged with whose
+  document they concern, so another account's filenames never appear in it.
 - **The app is `hidden` until `/api/me` confirms the stored token.** A token in
   localStorage is not proof of a session - it may be expired or signed with a rotated key.
   The consequence to remember: while it is hidden, nothing inside it can be measured (see
@@ -286,7 +346,7 @@ download).
 Two different questions, two different tools — don't confuse them:
 
 ```bash
-python tests/test_pipeline_offline.py    # does the plumbing work?  (175 checks, offline)
+python tests/test_pipeline_offline.py    # does the plumbing work?  (220 checks, offline)
 python eval/run_eval.py                  # are the answers any good? (needs an index)
 ```
 
@@ -318,9 +378,12 @@ python eval/run_eval.py --no-hybrid           # what is BM25 worth?
 python eval/run_eval.py --top-k 8 --out runs/topk8.json
 ```
 
-`eval/golden_questions.json` currently holds questions about the *fixture* PDF so the
-harness runs out of the box. Replacing them with 20–30 questions about the real documents
-in `data/` is the single highest-value thing left to do.
+`eval/golden_questions.json` still holds questions about the *fixture* PDF so the harness
+runs out of the box. Replacing them with 20-30 questions about the real documents remains
+the single highest-value thing left to do; `scripts/draft_golden.py` does the tedious half
+(finding candidate passages and recording their pages) and marks every entry
+`"reviewed": false` so nobody mistakes a draft for a measurement - `run_eval.py` prints a
+warning when it sees them.
 
 ## Known gotchas (already fixed, keep them fixed)
 
@@ -401,9 +464,9 @@ in `data/` is the single highest-value thing left to do.
   scanned PDFs are reported `"status": "skipped"`.
 - **Conversation history is client-side.** The backend is stateless: the frontend sends the
   recent turns with each question. Nothing is persisted across browser reloads.
-- **A JWT cannot be revoked before it expires** (12h by default). Signing out clears the
-  browser, not the token. Deleting the account is what actually invalidates it, because
-  `get_current_user` re-reads the user on every request.
+- **A JWT is revocable now, but only through `token_version`.** Signing out in one browser
+  still only clears that browser; "sign out on all devices", a password change, or deleting
+  the account are what invalidate outstanding tokens.
 - **The API is plain HTTP.** A token on a shared network is sniffable. Localhost only,
   unless you put TLS in front of it.
 - **Signup is open.** Anyone who can reach the page can create an account and upload.

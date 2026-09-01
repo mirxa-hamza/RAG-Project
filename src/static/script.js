@@ -25,6 +25,17 @@ const el = {
   whoName: $("whoName"),
   whoAvatar: $("whoAvatar"),
   logoutBtn: $("logoutBtn"),
+  accountModal: $("accountModal"),
+  accountName: $("accountName"),
+  accountError: $("accountError"),
+  passwordForm: $("passwordForm"),
+  passwordSubmit: $("passwordSubmit"),
+  currentPassword: $("currentPassword"),
+  newPassword: $("newPassword"),
+  signoutAllBtn: $("signoutAllBtn"),
+  deleteAccountBtn: $("deleteAccountBtn"),
+  quotaText: $("quotaText"),
+  quotaFill: $("quotaFill"),
   menuBtn: $("menuBtn"),
   sidebar: $("sidebar"),
   scrim: $("scrim"),
@@ -41,6 +52,15 @@ const el = {
   scopeSelect: $("scopeSelect"),
   appEl: $("app"),
   addBtn: $("addBtn"),
+  activityBtn: $("activityBtn"),
+  activityDot: $("activityDot"),
+  activityModal: $("activityModal"),
+  activitySummary: $("activitySummary"),
+  activityStage: $("activityStage"),
+  activityPercent: $("activityPercent"),
+  activityBar: $("activityBar"),
+  activityFile: $("activityFile"),
+  activityLog: $("activityLog"),
   uploadModal: $("uploadModal"),
   uploadNote: $("uploadNote"),
   dropzone: $("dropzone"),
@@ -484,6 +504,8 @@ async function pollUntilDone() {
       break;
     }
 
+    renderActivity(job);
+
     if (job.state === "running") {
       setServerStatus("busy", "Indexing", "An ingestion job is running");
       const done = job.files_done ?? 0;
@@ -547,6 +569,7 @@ async function pollUntilDone() {
     break;
   }
   polling = false;
+  setActivityRunning(false);
   setBusy(false);
   el.syncProgress.hidden = true;
   el.syncProgressBar.style.width = "";
@@ -577,6 +600,7 @@ async function refreshSources() {
       MAX_UPLOAD_MB = data.max_upload_mb;
       if (el.maxUploadMb) el.maxUploadMb.textContent = data.max_upload_mb;
     }
+    renderQuota(data.storage_used_bytes || 0, data.storage_quota_bytes || 0);
     // The passage count is not shown in the sidebar any more; the element only exists if
     // someone puts it back.
     if (el.chunkCount) {
@@ -611,6 +635,7 @@ async function refreshSources() {
       docs.map((d) => `<option value="${escapeHtml(d.filename)}">${escapeHtml(shortDocName(d.filename))}</option>`).join("");
     if (docs.some((d) => d.filename === previous)) el.scopeSelect.value = previous;
 
+    setActivityRunning(Boolean(data.ingesting));
     // A job may already be running when the page loads (e.g. the server just started).
     if (data.ingesting && !polling) pollUntilDone();
   } catch {
@@ -979,6 +1004,12 @@ function resetAppState() {
   el.scopeSelect.innerHTML = `<option value="">All documents</option>`;
   el.uploadList.replaceChildren();
   uploadCards.clear();
+  if (el.accountModal.open) el.accountModal.close();
+  if (el.activityModal.open) el.activityModal.close();
+  el.activityLog.innerHTML =
+    `<li class="activity__empty">Nothing yet. Upload a PDF and the steps appear here.</li>`;
+  setActivityRunning(false);
+  el.passwordForm.reset();
   setStatus("");
   el.syncProgress.hidden = true;
   el.questionInput.value = "";
@@ -1046,6 +1077,197 @@ el.authForm.addEventListener("submit", async (e) => {
   } finally {
     el.authSubmit.disabled = false;
     el.authSubmitText.textContent = original;
+  }
+});
+
+/* ─────────────────────────── Processing status ──────────────────────
+   One place that answers "what is it doing with my PDF": the stage, the progress, and the
+   trail of steps the server actually took. The data comes from /ingest/status, which
+   reports only the caller's own files.
+   ==================================================================== */
+
+const STAGE_LABELS = {
+  extracting: "Reading pages",
+  embedding: "Embedding and storing passages",
+};
+
+function jobPercent(job) {
+  const files = job.files_total || 0;
+  if (!files) return job.state === "running" ? null : 100;
+  let percent = (job.files_done / files) * 100;
+  if (job.chunks_total) percent += (job.chunks_done / job.chunks_total) * (100 / files);
+  return Math.min(100, Math.round(percent));
+}
+
+/** Keeps the sidebar button's dot in step with the job, panel open or not. */
+function setActivityRunning(running) {
+  el.activityDot.hidden = !running;
+}
+
+function renderActivity(job) {
+  if (!job) return;
+  const running = job.state === "running";
+  setActivityRunning(running);
+  if (!el.activityModal.open) return;
+
+  const percent = jobPercent(job);
+  el.activityStage.textContent = running
+    ? (STAGE_LABELS[job.stage] || "Preparing")
+    : (job.state === "error" ? "Failed" : "Idle");
+  el.activityPercent.textContent = percent === null ? "—" : `${percent}%`;
+  el.activityBar.style.width = `${percent === null ? 8 : percent}%`;
+  el.activityBar.parentElement.classList.toggle("progress--indeterminate", percent === null);
+
+  el.activityFile.textContent = job.current_file
+    ? `${shortDocName(job.current_file)}${job.chunks_total ? ` · ${job.chunks_done}/${job.chunks_total} passages` : ""}`
+    : (job.other_user_busy ? "The server is busy with someone else's document." : "");
+
+  if (running) {
+    const total = job.files_total || 0;
+    el.activitySummary.textContent = total
+      ? `Processing document ${Math.min(job.files_done + 1, total)} of ${total}.`
+      : "Starting…";
+  } else if (job.state === "error") {
+    el.activitySummary.textContent = job.error || "The last run failed.";
+  } else {
+    const results = job.results || [];
+    const count = (status) => results.filter((r) => r.status === status).length;
+    const parts = [];
+    if (count("ingested")) parts.push(`${count("ingested")} indexed`);
+    if (count("skipped")) parts.push(`${count("skipped")} skipped`);
+    if (count("failed")) parts.push(`${count("failed")} failed`);
+    if (count("removed")) parts.push(`${count("removed")} removed`);
+    el.activitySummary.textContent = parts.length
+      ? `Last run: ${parts.join(" · ")}.`
+      : "Nothing is being processed right now.";
+  }
+
+  const events = job.events || [];
+  if (!events.length) {
+    el.activityLog.innerHTML =
+      `<li class="activity__empty">Nothing yet. Upload a PDF and the steps appear here.</li>`;
+    return;
+  }
+
+  const mark = { done: "✓", warn: "!", error: "✕" };
+  // Newest first: the interesting line is the one that just happened.
+  el.activityLog.innerHTML = [...events].reverse().map((e) => `
+    <li data-kind="${escapeHtml(e.kind || "info")}">
+      <span class="activity__mark" aria-hidden="true">${mark[e.kind] || "·"}</span>
+      <span>
+        ${escapeHtml(e.message)}
+        ${e.file ? `<span class="activity__doc">${escapeHtml(shortDocName(e.file))}</span>` : ""}
+      </span>
+      <span class="activity__time">${new Date(e.at * 1000).toLocaleTimeString()}</span>
+    </li>`).join("");
+}
+
+async function pollActivity() {
+  // Its own gentle loop, so the panel stays live even when no upload is in flight (a
+  // startup scan, or another tab's upload). Stops as soon as the panel closes.
+  while (el.activityModal.open) {
+    try {
+      renderActivity(await (await authFetch("/ingest/status")).json());
+    } catch {
+      break;                                  // signed out, or the server went away
+    }
+    await sleep(1000);
+  }
+}
+
+el.activityBtn.addEventListener("click", async () => {
+  if (!el.activityModal.open) el.activityModal.showModal();
+  setDrawer(false);
+  pollActivity();
+});
+
+el.activityModal.addEventListener("click", (e) => {
+  if (e.target !== el.activityModal) return;
+  const box = el.activityModal.getBoundingClientRect();
+  if (e.clientX < box.left || e.clientX > box.right ||
+      e.clientY < box.top || e.clientY > box.bottom) el.activityModal.close();
+});
+
+/* ─────────────────────────── Account dialog ─────────────────────────
+   Password change, sign-out-everywhere, account deletion, and the storage quota. All four
+   exist because a system that can create accounts and store files has to be able to undo
+   both.
+   ==================================================================== */
+
+el.who.addEventListener("click", () => {
+  el.accountName.textContent = session?.username || "";
+  el.accountError.textContent = "";
+  el.passwordForm.reset();
+  refreshSources();                    // repaints the quota bar with current numbers
+  if (!el.accountModal.open) el.accountModal.showModal();
+});
+
+function renderQuota(used, quota) {
+  if (!quota || !el.quotaFill) return;
+  const pct = Math.min(100, Math.round((used / quota) * 100));
+  el.quotaFill.style.width = `${pct}%`;
+  el.quotaFill.dataset.level = pct >= 95 ? "full" : pct >= 80 ? "warn" : "";
+  el.quotaText.textContent = `${humanSize(used)} of ${humanSize(quota)}`;
+}
+
+el.passwordForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  el.accountError.textContent = "";
+  el.passwordSubmit.disabled = true;
+  try {
+    const res = await authFetch("/api/me/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        current_password: el.currentPassword.value,
+        new_password: el.newPassword.value,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `Could not change it (${res.status}).`);
+
+    // The server bumped this account's token version, so the old token is dead. It hands
+    // back a fresh one; storing it is what keeps this session alive.
+    writeToken(body.access_token);
+    el.passwordForm.reset();
+    el.accountError.textContent = "";
+    setStatus("Password changed. Other devices have been signed out.", "ok");
+    el.accountModal.close();
+  } catch (err) {
+    el.accountError.textContent = err.message;
+  } finally {
+    el.passwordSubmit.disabled = false;
+  }
+});
+
+el.signoutAllBtn.addEventListener("click", async () => {
+  if (!confirm("Sign out on every device, including this one?")) return;
+  try {
+    await authFetch("/api/me/signout-everywhere", { method: "POST" });
+  } catch { /* a 401 already ended the session, which is the intended outcome */ }
+  el.accountModal.close();
+  endSession("Signed out everywhere.");
+});
+
+el.deleteAccountBtn.addEventListener("click", async () => {
+  const password = prompt(
+    "Delete your account?\n\nThis removes your PDFs from the server, their passages from " +
+    "the index, and the account itself. It cannot be undone.\n\nType your password to confirm:"
+  );
+  if (!password) return;
+
+  try {
+    const res = await authFetch("/api/me", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `Could not delete it (${res.status}).`);
+    el.accountModal.close();
+    endSession(`Account deleted (${body.documents_removed} document(s) removed).`);
+  } catch (err) {
+    el.accountError.textContent = err.message;
   }
 });
 

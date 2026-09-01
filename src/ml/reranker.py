@@ -59,6 +59,17 @@ def available() -> bool:
     return _get_model() is not None
 
 
+def is_available() -> bool:
+    """
+    Whether the cross-encoder is loaded and working.
+
+    Exposed on /info because this stage fails OPEN: if the model cannot load, retrieval
+    quietly falls back to a cosine floor and answers get worse with no error anywhere. That
+    is the right runtime behaviour and the wrong thing to leave invisible.
+    """
+    return _model is not None
+
+
 def rerank(question: str, chunks: List[Dict]) -> Optional[List[Tuple[Dict, float]]]:
     """
     Returns [(chunk, score), ...] sorted best first, or None if the re-ranker isn't

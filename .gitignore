@@ -45,3 +45,8 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# Local backups produced by scripts/backup.py - user data, never in git.
+backups/
+# Draft eval questions awaiting human review.
+eval/golden_draft.json

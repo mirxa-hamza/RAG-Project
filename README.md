@@ -11,8 +11,13 @@ or upload them from the web UI — `POST /upload` writes the file into that same
 then the ordinary ingestion job indexes it.
 
 **It is multi-tenant.** Accounts live in a local MongoDB; documents belong to the account
-that uploaded them, and no filter, search or answer ever crosses that line. The API is
-plain HTTP with no revocation, so keep it on localhost unless you add TLS.
+that uploaded them, and no filter, search or answer ever crosses that line. Tokens are
+revocable (`token_version`), requests are rate limited, and each account has a storage
+quota. The API is still plain HTTP, so put TLS in front of it before it leaves localhost.
+
+**Where your data goes.** PDFs are stored on the server and indexed locally - extraction,
+embedding and search never leave the machine. When you ask a question, the passages that
+match it (up to ~24,000 characters) are sent to Groq to write the answer. Nothing else is.
 
 ## Stack
 
@@ -168,7 +173,11 @@ block on embedding. `GET /ingest/status` reports progress.
 | POST   | `/chat/stream`    | same body, streamed as SSE (`sources`, then `token`s, then `done`) |
 | GET    | `/stats`          | chunk count, per-document pages/chunks, ingestion state |
 | POST   | `/reset`          | wipe the store and rebuild from `data/` (202) |
+| GET    | `/ready`          | readiness: 503 until the model is loaded and MongoDB answers |
 | POST   | `/api/signup`     | create an account, returns a JWT (201) |
+| POST   | `/api/me/password` | change password; invalidates every other session |
+| POST   | `/api/me/signout-everywhere` | invalidate all tokens for this account |
+| DELETE | `/api/me`         | delete the account and everything it owns |
 | POST   | `/api/login`      | exchange credentials for a JWT |
 | GET    | `/api/me`         | the signed-in user |
 | GET    | `/api/documents`  | the caller's documents |

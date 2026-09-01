@@ -29,7 +29,7 @@ import unicodedata
 from pathlib import Path
 from typing import BinaryIO, Optional, Tuple
 
-from src.core.config import DATA_DIR, MAX_UPLOAD_BYTES
+from src.core.config import DATA_DIR, MAX_UPLOAD_BYTES, MAX_USER_STORAGE_BYTES
 from src.core.logging import get_logger
 
 log = get_logger(__name__)
@@ -122,6 +122,14 @@ def unique_path(filename: str, user_id: Optional[str] = None) -> Tuple[Path, str
     return candidate, final
 
 
+def used_bytes(user_id: Optional[str]) -> int:
+    """How much disk this account's documents currently occupy."""
+    folder = upload_dir(user_id)
+    if not folder.is_dir():
+        return 0
+    return sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+
+
 def save_pdf(stream: BinaryIO, raw_filename: str, user_id: Optional[str] = None) -> dict:
     """
     Streams one uploaded PDF into the uploader's folder under DATA_DIR.
@@ -133,6 +141,16 @@ def save_pdf(stream: BinaryIO, raw_filename: str, user_id: Optional[str] = None)
     destination, final_name = unique_path(filename, user_id)
     folder = destination.parent
     folder.mkdir(parents=True, exist_ok=True)
+
+    # Checked before the transfer starts, and again against the real byte count while
+    # streaming (below) - Content-Length is a claim, and the quota is about what actually
+    # lands on disk.
+    quota_used = used_bytes(user_id) if user_id else 0
+    if user_id and quota_used >= MAX_USER_STORAGE_BYTES:
+        raise UploadError(
+            f"Your library is full ({quota_used / 1e6:.0f} MB of "
+            f"{MAX_USER_STORAGE_BYTES / 1e6:.0f} MB). Remove a document and try again."
+        )
 
     # Same directory as the destination so the final rename is atomic (a cross-device
     # rename is not, and would leave a partially visible file).
@@ -158,6 +176,11 @@ def save_pdf(stream: BinaryIO, raw_filename: str, user_id: Optional[str] = None)
                     raise UploadError(
                         f"'{final_name}' is larger than the "
                         f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit."
+                    )
+                if user_id and quota_used + written > MAX_USER_STORAGE_BYTES:
+                    raise UploadError(
+                        f"'{final_name}' would take your library past its "
+                        f"{MAX_USER_STORAGE_BYTES // (1024 * 1024)}MB limit."
                     )
                 out.write(block)
 

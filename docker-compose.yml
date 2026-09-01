@@ -1,0 +1,53 @@
+# Everything needed to run this app on a machine that has only Docker:
+#
+#     cp .env.example .env      # then put your Groq key in it
+#     docker compose up --build
+#     open http://localhost:8000
+#
+# Two named volumes hold the state, and they are NOT equivalent:
+#
+#   rag-data     the uploaded PDFs. The ONLY copy. Back this up (scripts/backup.py).
+#   rag-storage  the Chroma index. Derived - it can be rebuilt from rag-data in minutes.
+#   mongo-data   the accounts. Small, and losing it means everyone signs up again and the
+#                first new account adopts every document.
+
+services:
+  mongo:
+    image: mongo:8
+    restart: unless-stopped
+    # Not published to the host: only the app needs it, and an exposed MongoDB with no
+    # authentication is how databases end up in the news.
+    expose:
+      - "27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      # 127.0.0.1 on purpose: the API is plain HTTP with bearer tokens, so it must not be
+      # reachable from the network until there is TLS in front of it.
+      - "127.0.0.1:8000:8000"
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      # Everything else (GROQ_API_KEY, JWT_SECRET, tuning) comes from .env below.
+    env_file:
+      - .env
+    volumes:
+      - rag-data:/data
+      - rag-storage:/storage
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  rag-data:
+  rag-storage:

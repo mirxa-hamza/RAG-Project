@@ -67,10 +67,17 @@ MANIFEST_PATH = CHROMA_DIR / "manifest.json"
 # deleted rather than being written to disk first and measured afterwards.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
 
+# Total bytes one account may store. Without it, a single user can fill the disk 100MB at
+# a time - and a full disk stops MongoDB and every other user, not just the culprit.
+MAX_USER_STORAGE_BYTES = int(os.getenv("MAX_USER_STORAGE_MB", "2048")) * 1024 * 1024
+
 # ---------------------------------------------------------------- Auth (MongoDB + JWT)
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "rag_app")
 USERS_COLLECTION = os.getenv("USERS_COLLECTION", "users")
+# Append-only record of logins, uploads and deletions. The first thing anyone asks for
+# after an incident, and impossible to reconstruct after the fact.
+AUDIT_COLLECTION = os.getenv("AUDIT_COLLECTION", "audit")
 
 # Signing key for JWTs. Generated on first run and written to .env if absent (see
 # src/services/security.py) - a key that changed on every restart would silently log
@@ -127,12 +134,32 @@ NEIGHBOR_EXPANSION = int(os.getenv("NEIGHBOR_EXPANSION", "1"))
 # never blow past the model's context window.
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "24000"))
 
+# Answer cache: repeated questions skip retrieval and the paid LLM call entirely. Entries
+# are per user, die when that user's documents change, and expire after the TTL.
+ANSWER_CACHE_SIZE = int(os.getenv("ANSWER_CACHE_SIZE", "256"))
+ANSWER_CACHE_TTL_SECONDS = int(os.getenv("ANSWER_CACHE_TTL_SECONDS", "3600"))
+# Set false to measure the pipeline without cache hits confusing the numbers.
+ANSWER_CACHE_ENABLED = os.getenv("ANSWER_CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+
 # ---------------------------------------------------------------- Conversation
 # How many previous question/answer pairs to carry into the prompt.
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "4"))
+# Hard ceiling on the conversation carried into the prompt, independent of HISTORY_TURNS.
+# The per-field limits in schemas.py stop one enormous turn; this stops several large ones
+# adding up. CONTEXT has always had such a budget (MAX_CONTEXT_CHARS); history needs one
+# for exactly the same reason.
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "8000"))
 # Rewrite a follow-up ("what about the second one?") into a standalone question before
 # retrieving - the raw follow-up embeds to nothing useful.
 REWRITE_FOLLOWUPS = os.getenv("REWRITE_FOLLOWUPS", "true").lower() in ("1", "true", "yes")
 
+# Origins allowed to call the API from a browser. The UI is served by this same process,
+# so the default is "same-origin only" - a wildcard would let any site on the internet
+# drive this API with a token it obtained by other means. Comma-separated; set it only if
+# you deliberately serve the frontend from somewhere else.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
 # ---------------------------------------------------------------- Misc
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# "text" for a human at a terminal, "json" for anything that ships logs somewhere.
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()

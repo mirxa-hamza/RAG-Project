@@ -120,7 +120,17 @@ land on `ERR_CONNECTION_REFUSED` during the first seconds of a cold start. Plain
 works exactly as before if you prefer it:
 
 ```bash
-uvicorn src.main:app --port 8000        # add --reload only while editing code
+uvicorn src.main:app --port 8000 --workers 1    # add --reload only while editing code
+```
+
+**Always one worker.** The ingestion job, the keyword index, the rate limiter and the answer
+cache all live in the process, and ChromaDB's store is single-process. `--workers 4` makes
+progress bars hang, keyword search go stale, and two processes write the same database file.
+
+Or run the whole thing (app + MongoDB) in containers:
+
+```bash
+docker compose up --build      # http://localhost:8000
 ```
 
 Open **<http://localhost:8000>** — the web UI is served by the same process, so there's
@@ -140,6 +150,7 @@ optional; doing it up front just means the app is queryable the moment it boots.
 | Wipe and rebuild everything | `python scripts/ingest.py --force` |
 | Same, without leaving the browser | the **Sync documents** button in the sidebar |
 | Add a PDF from the browser | **Add documents** in the sidebar, then drop or browse |
+| See what the server is doing with it | **Processing status** in the sidebar |
 | Remove a document | the bin icon on its card — deletes its passages **and** the PDF |
 
 Files are fingerprinted by SHA-256, so re-running is always safe and cheap:
@@ -187,7 +198,7 @@ pip install -r requirements-dev.txt
 python tests/test_pipeline_offline.py
 ```
 
-175 checks, fully offline — no API key and no model download needed, because it stubs the
+220 checks, fully offline — no API key and no model download needed, because it stubs the
 models — and no MongoDB either, because the users collection is faked. Run this before
 pushing anything; the multi-tenant isolation checks are in here.
 
@@ -199,6 +210,31 @@ python eval/run_eval.py --judge    # + LLM-as-judge scoring (uses your Groq key)
 ```
 
 ---
+
+## Looking after it
+
+| Task | Command |
+|---|---|
+| Back up documents + accounts | `python scripts/backup.py --out D:/backups` |
+| Check a backup is readable | `python scripts/backup.py --verify D:/backups/<folder>` |
+| Find index drift (orphans, missing chunks) | `python scripts/verify_index.py` |
+| Repair what can be repaired | `python scripts/verify_index.py --fix` |
+| Draft eval questions from your own PDFs | `python scripts/draft_golden.py` |
+| Is it ready to serve? | `curl localhost:8000/ready` (503 until model + database are up) |
+| Structured logs for shipping somewhere | `LOG_FORMAT=json` in `.env` |
+
+**`data/` is the only copy of uploaded PDFs.** `storage/` is derived and rebuildable in
+minutes; `data/` and MongoDB are not. Schedule `backup.py`, and run `--verify` once so you
+know the restore path works before you need it.
+
+## Your account
+
+Click your name in the top bar for storage use, password change, "sign out on all devices",
+and account deletion. Deleting removes your PDFs from the server, their passages from the
+index, and the account - it cannot be undone.
+
+Changing your password or signing out everywhere invalidates every other session
+immediately, including on other machines.
 
 ## Things worth knowing
 

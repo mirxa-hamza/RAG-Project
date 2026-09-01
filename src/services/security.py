@@ -82,8 +82,15 @@ def get_secret() -> str:
     return config.JWT_SECRET
 
 
-def create_access_token(user_id: str, username: str) -> dict:
-    """Returns {access_token, token_type, expires_in, username} - the login response body."""
+def create_access_token(user_id: str, username: str, token_version: int = 1) -> dict:
+    """
+    Returns {access_token, token_type, expires_in, username} - the login response body.
+
+    `token_version` is what makes revocation possible: it is stamped into the token and
+    compared against the account's current value on every request, so bumping the account's
+    version invalidates every token issued before it. A JWT is otherwise valid until it
+    expires, no matter what happens to the account.
+    """
     from jose import jwt
 
     expires_in = config.JWT_EXPIRE_HOURS * 3600
@@ -91,6 +98,7 @@ def create_access_token(user_id: str, username: str) -> dict:
     payload = {
         "sub": user_id,                     # the Mongo _id; every isolation check keys on it
         "username": username,
+        "ver": token_version,
         "iat": now,
         "exp": now + timedelta(seconds=expires_in),
     }

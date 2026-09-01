@@ -3,6 +3,11 @@
 Reviewed 2026-09-01, against the codebase as it stands after the authentication and
 multi-tenancy work. Written for the person who has to run and defend this thing.
 
+> **Status, 2026-09-01 (same day): most of this has been implemented.** See
+> "Implementation status" at the end for exactly what was done, what was partly done, and
+> what deliberately was not. The findings below are left in their original wording, because
+> the reasoning is the part worth keeping.
+
 Findings are ordered by **what would hurt first**, not by how interesting they are. Each
 one says what is wrong, how I know, and what to do. Where I measured something, the number
 is real and the command that produced it is given.
@@ -391,3 +396,64 @@ change:
   atomically.
 - **The known-gotchas section of `CLAUDE.md`** is the most valuable file in the repository.
   Keep adding to it.
+
+
+---
+
+## 8. Implementation status
+
+Everything below was implemented and tested on the day of the audit. The test suite went
+from 175 to 212 checks; the new ones were each verified by sabotaging the fix and watching
+the specific check fail.
+
+### Done
+
+| § | Finding | What changed |
+|---|---|---|
+| 1.1 | 4M-character requests | `Turn` fields capped, `MAX_HISTORY_CHARS` budget; worst case now 8,571 chars |
+| 1.3 | No rate limiting | `src/core/ratelimit.py`: login (per IP **and** per username), signup, upload, chat |
+| 1.3 | No disk quota | `MAX_USER_STORAGE_MB`, checked before and during the transfer; shown in the account dialog |
+| 2.1 | Undisclosed third-party processing | Privacy notice in the upload dialog and in README |
+| 2.2 | Prompt injection | Chunks fenced in `<document>` tags; system prompt rule 6 says the fence is data |
+| 2.3 | Unrevocable tokens | `token_version` in the JWT, compared on every request |
+| 2.4 | `CORS *` | Off by default; `CORS_ORIGINS` opts in |
+| 2.5 | No account lifecycle | Password change, sign-out-everywhere, `DELETE /api/me` (documents first, then account) |
+| 2.6 | No audit trail | `audit` collection: signup, login, failed login, upload, delete, rebuild, deletion |
+| 3.2 | Chunks over the token window | `split_to_token_limit()` splits by tokens after chunking |
+| 3.6 | No caching | Per-user answer cache, invalidated by that user's document changes |
+| 3.7 | Global BM25 rebuild | Per-user indices in an LRU; one upload no longer costs everyone |
+| 3.8 | One serial queue | Uploads trigger a scan scoped to the uploader; queued scans remember whose |
+| 4.1 | No deployment story | `Dockerfile` (models baked in, non-root, healthcheck) + `docker-compose.yml` |
+| 4.2 | No backups | `scripts/backup.py` with retention and `--verify` |
+| 4.4 | Meaningless health check | `/ready` (model + database) separate from `/health` |
+| 4.5 | Unstructured logs | `LOG_FORMAT=json`, request ids via middleware and `X-Request-ID`, `duration_ms` on every timed stage |
+| 5.1 | Full scan per upload | Scoped scans (see 3.8) |
+| 5.2 | Unbounded results list | `MAX_JOB_RESULTS` |
+| 5.3 | No index verification | `scripts/verify_index.py`, with `--fix` |
+| 5.4 | Cancelled questions kept generating | `request.is_disconnected()` checked between tokens |
+| 5.5 | No concurrency tests | Four simultaneous signups; exactly one wins |
+| 5.6 | Silent re-ranker degradation | `reranker_available` on `/info` |
+
+One bug was found *by* this work: a wrong current password on the change form returned 401,
+which the frontend's "any 401 ends the session" rule turned into a sign-out. Confirmation
+failures are now 403.
+
+### Partly done
+
+- **§1.2 multiple workers.** Documented as a hard invariant (`CLAUDE.md`, Dockerfile CMD,
+  a note in `ratelimit.py`) rather than fixed. Fixing it properly means a job queue and a
+  server-based vector store - a different architecture, not a patch.
+- **§3.1 the golden set.** `scripts/draft_golden.py` extracts candidate passages with their
+  pages and writes question stubs marked `"reviewed": false`; `run_eval.py` warns when it
+  sees them. **The questions still need a person.** Fabricating them would produce a number
+  that looks like evidence and is not.
+
+### Deliberately not done
+
+- **§2.3 TLS.** Belongs in the reverse proxy, not the app. The compose file binds to
+  `127.0.0.1` so this cannot be forgotten silently.
+- **§3.3 structure-aware chunking** and **§3.4 query expansion.** Both are retrieval-quality
+  changes, and there is no trustworthy way to measure them until the golden set is real.
+  Doing them first would be guessing.
+- **§3.5 exact page citations.** Needs per-sentence offsets through extraction and chunking;
+  worth doing, too large to bundle with security work.

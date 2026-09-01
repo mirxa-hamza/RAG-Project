@@ -16,5 +16,14 @@
     "chunks": 1283,
     "ingested_at": "2026-09-01T09:21:09+00:00",
     "user_id": "6a96cb5e5fe44475542df3db"
+  },
+  "users/6a96cb5e5fe44475542df3db/intel_book.pdf": {
+    "sha256": "fcddd0f895987ea57c3b0a3db9d2fb85512a1d79e627dc88e97dfbbd0de3f992",
+    "mtime": 1788271397.7550352,
+    "size": 9234469,
+    "pages": 943,
+    "chunks": 1716,
+    "user_id": "6a96cb5e5fe44475542df3db",
+    "ingested_at": "2026-09-01T14:09:35+00:00"
   }
 }

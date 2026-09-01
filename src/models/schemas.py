@@ -22,6 +22,16 @@ class Credentials(BaseModel):
     password: str = Field(..., min_length=8, max_length=200)
 
 
+class PasswordChange(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=200)
+    new_password: str = Field(..., min_length=8, max_length=200)
+
+
+class ConfirmPassword(BaseModel):
+    """Deleting an account is irreversible, so the password is required again."""
+    password: str = Field(..., min_length=1, max_length=200)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -35,9 +45,16 @@ class UserPublic(BaseModel):
 
 
 class Turn(BaseModel):
-    """One previous exchange, sent by the client (the backend is stateless)."""
-    question: str = ""
-    answer: str = ""
+    """
+    One previous exchange, sent by the client (the backend is stateless).
+
+    The lengths are capped because this is client-supplied text that goes STRAIGHT into the
+    LLM request. Unbounded, one request could carry 4,000,000 characters of "history" -
+    measured, not hypothetical - which is somebody else's money and the model's context
+    window. `HISTORY_TURNS` limits how many turns are used; it does not limit their size.
+    """
+    question: str = Field("", max_length=4000)
+    answer: str = Field("", max_length=12000)
 
 
 class ChatRequest(BaseModel):
@@ -46,8 +63,9 @@ class ChatRequest(BaseModel):
     top_k: int = Field(TOP_K, ge=1, le=MAX_TOP_K)
     # Optional: restrict retrieval to one ingested document.
     source: Optional[str] = None
-    # Recent conversation, oldest first. Only the last HISTORY_TURNS are used.
-    history: List[Turn] = Field(default_factory=list, max_length=50)
+    # Recent conversation, oldest first. Only the last HISTORY_TURNS are used, and the
+    # assembled history is clamped again by characters in llm._history_messages().
+    history: List[Turn] = Field(default_factory=list, max_length=20)
 
     @field_validator("question")
     @classmethod

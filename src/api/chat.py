@@ -7,15 +7,18 @@ retrieval behaviour can never drift between them.
 import json
 from typing import Dict, List, Tuple
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from src.api.auth import _enforce
 from src.api.deps import get_current_user, user_id_of
+from src.core import ratelimit
 from src.core.config import HISTORY_TURNS
 from src.core.logging import get_logger, timed
 from src.ml.llm import generate_answer, rewrite_question, stream_answer
 from src.models.schemas import ChatRequest, ChatResponse, Source
-from src.services import retrieval
+from src.core.config import ANSWER_CACHE_ENABLED
+from src.services import answer_cache, retrieval
 from src.services.pdf import format_pages
 
 log = get_logger(__name__)
@@ -57,19 +60,36 @@ def _sse(event: str, payload: dict) -> str:
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
+    uid = user_id_of(user)
+    _enforce(ratelimit.CHAT, uid)
+
+    # Only the first question of a conversation is cacheable: with history, the same words
+    # mean different things ("and the second one?"), so the key would be a lie.
+    cacheable = ANSWER_CACHE_ENABLED and not req.history
+    if cacheable:
+        cached = answer_cache.get(uid, req.question, req.source, req.top_k)
+        if cached is not None:
+            log.info("Answer cache hit.")
+            return ChatResponse(**cached)
+
     with timed(log, "chat request"):
-        history, search_query, chunks = _prepare(req, user_id_of(user))
+        history, search_query, chunks = _prepare(req, uid)
         answer = generate_answer(req.question, chunks, history)
 
-    return ChatResponse(
+    response = ChatResponse(
         answer=answer,
         sources=_to_sources(chunks),
         search_query=search_query if search_query != req.question else None,
     )
+    # Never cache "the key is missing" or a transport failure as if it were an answer.
+    if cacheable and chunks:
+        answer_cache.put(uid, req.question, req.source, req.top_k, response.model_dump())
+    return response
 
 
 @router.post("/chat/stream")
-def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
+async def chat_stream(req: ChatRequest, request: Request,
+                      user: dict = Depends(get_current_user)):
     """
     Server-Sent Events version of /chat.
 
@@ -77,15 +97,22 @@ def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     `token` events, then `done`. Retrieval happens before the generator starts, so a
     failure there surfaces as a normal HTTP error rather than mid-stream.
     """
+    _enforce(ratelimit.CHAT, user_id_of(user))
     history, search_query, chunks = _prepare(req, user_id_of(user))
     sources = [s.model_dump() for s in _to_sources(chunks)]
 
-    def events():
+    async def events():
         yield _sse("sources", {
             "sources": sources,
             "search_query": search_query if search_query != req.question else None,
         })
         for piece in stream_answer(req.question, chunks, history):
+            # A closed tab used to keep the generation running to completion - tokens
+            # nobody would ever read, billed all the same. Checked between tokens, so the
+            # abandoned request stops at the next one rather than at the end.
+            if await request.is_disconnected():
+                log.info("Client disconnected mid-answer; stopping generation.")
+                return
             yield _sse("token", {"text": piece})
         yield _sse("done", {})
 

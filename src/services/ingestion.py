@@ -17,17 +17,21 @@ import hashlib
 import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from src.services import manifest
+from src.services import answer_cache, manifest
 from src.core.config import CHUNK_OVERLAP_WORDS, CHUNK_SIZE_WORDS, DATA_DIR
 from src.core.logging import get_logger, timed
+from src.ml.embeddings import split_to_token_limit
 from src.services.pdf import chunk_document, extract_pages
 from src.services.vectorstore import add_chunks, delete_source
 
 log = get_logger(__name__)
 
 _HASH_CHUNK = 1024 * 1024  # 1MB reads while fingerprinting
+
+# Cap on the per-job result list. It is held in memory and returned on every status poll.
+MAX_JOB_RESULTS = 500
 
 # Uploads live in data/users/<user_id>/<filename>, so a document's owner is recoverable
 # from its path alone. That matters after a crash: the manifest may be stale, but the
@@ -68,23 +72,48 @@ def owner_from_path(filename: str) -> Optional[str]:
 
 # --------------------------------------------------------------------- helpers
 
-def _pdf_filenames() -> List[str]:
+def _pdf_filenames(user_id: Optional[str] = None) -> List[str]:
     """
-    Every PDF under DATA_DIR, including nested folders, as paths relative to DATA_DIR
-    with forward slashes (so a document's identity is stable across Windows and POSIX).
+    Every PDF under DATA_DIR, as paths relative to DATA_DIR with forward slashes (so a
+    document's identity is stable across Windows and POSIX).
 
     Recursion matters: dropping a PDF into `data/textbooks/` used to make it silently
     invisible, with no warning and no entry in /stats.
+
+    With a user_id, only that user's folder is walked. An upload triggers a scan, and
+    walking every other account's folders to find one new file is wasted work that grows
+    with the number of users.
     """
     if not DATA_DIR.is_dir():
         log.warning("Data folder %s does not exist - nothing to ingest.", DATA_DIR)
         return []
 
-    names = [
-        path.relative_to(DATA_DIR).as_posix()
-        for path in DATA_DIR.rglob("*")
-        if path.is_file() and path.suffix.lower() == ".pdf"
-    ]
+    if not user_id:
+        roots = [DATA_DIR]
+    else:
+        # The user's own uploads...
+        roots = [user_dir(user_id)]
+        # ...plus, for the owner of record, the hand-copied files that live outside
+        # users/. They belong to that account, so a scoped pass that skipped them would
+        # "prune" every one of them as deleted.
+        from src.services import ownership
+
+        if ownership.owner_of_record() == user_id:
+            roots.append(DATA_DIR)
+
+    names = set()
+    users_root = (DATA_DIR / USERS_DIRNAME).resolve()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() != ".pdf":
+                continue
+            # When scanning DATA_DIR for the owner of record, skip other people's folders.
+            if user_id and root == DATA_DIR and users_root in path.resolve().parents:
+                if owner_from_path(path.relative_to(DATA_DIR).as_posix()) != user_id:
+                    continue
+            names.add(path.relative_to(DATA_DIR).as_posix())
     return sorted(names)
 
 
@@ -124,11 +153,13 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
 
     if on_stage:
         on_stage("extracting", 0, 0)
+    _event("Reading pages", filename, owner)
 
     with timed(log, f"extract '{filename}'"):
         pages = extract_pages(str(path))
 
     if not pages:
+        _event("No extractable text - skipped (is it a scan?)", filename, owner, kind="warn")
         return {
             "filename": filename,
             "user_id": owner,
@@ -137,6 +168,10 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
         }
 
     chunks = chunk_document(pages, CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS)
+    # The chunker counts words; the model counts tokens. Anything still over the window is
+    # split here rather than being silently truncated at embedding time.
+    chunks = split_to_token_limit(chunks)
+    _event(f"Split {len(pages)} pages into {len(chunks)} passages", filename, owner)
     log.info(
         "'%s': %d pages -> %d chunks. Embedding on CPU - a large document takes "
         "several minutes, this is not a hang.",
@@ -160,6 +195,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
 
     if on_stage:
         on_stage("embedding", 0, len(chunks))
+    _event(f"Embedding and storing {len(chunks)} passages", filename, owner)
 
     with timed(log, f"embed + store '{filename}'"):
         stored = add_chunks(
@@ -167,6 +203,10 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
             on_progress=(lambda done, total: on_stage("embedding", done, total)) if on_stage else None,
             user_id=owner,
         )
+
+    # Answers built from the previous version of this document are now wrong.
+    answer_cache.bump(owner)
+    _event(f"Ready - {stored} passages searchable", filename, owner, kind="done")
 
     manifest.put(
         filename,
@@ -188,7 +228,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     }
 
 
-def prune_deleted(present: List[str]) -> List[Dict]:
+def prune_deleted(present: List[str], user_id: Optional[str] = None) -> List[Dict]:
     """
     Drops documents that are in the store but no longer on disk.
 
@@ -197,7 +237,7 @@ def prune_deleted(present: List[str]) -> List[Dict]:
     the app that the file is gone.
     """
     removed = []
-    for filename in manifest.sources():
+    for filename in manifest.sources(user_id):
         if filename in present:
             continue
         owner = owner_of(filename)
@@ -205,6 +245,8 @@ def prune_deleted(present: List[str]) -> List[Dict]:
         try:
             delete_source(filename)   # unscoped: see the note in ingest_one()
             manifest.remove(filename)
+            answer_cache.bump(owner)
+            _event("Removed - the file is gone from the data folder", filename, owner)
             removed.append({"filename": filename, "user_id": owner, "status": "removed"})
         except Exception as exc:
             log.exception("Failed to remove '%s'", filename)
@@ -213,7 +255,8 @@ def prune_deleted(present: List[str]) -> List[Dict]:
     return removed
 
 
-def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[Dict]:
+def ingest_data_folder(force: bool = False, progress=None, stage=None,
+                       user_id: Optional[str] = None) -> List[Dict]:
     """
     Ingests every PDF in DATA_DIR that is new or has changed on disk, and removes stored
     documents whose file has been deleted. Safe to call repeatedly - unchanged files are
@@ -222,12 +265,17 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[D
     force=True re-ingests everything (used after a reset).
     progress: optional callable(filename, index, total) for job reporting.
     stage: optional callable(stage_name, done, total) for within-document progress.
+    user_id: restrict the whole pass to one account's folder. Uploads use this; startup and
+    the CLI do not, because they are reconciling the entire folder.
 
     A failure on one document never stops the others: a single malformed PDF used to abort
     the whole job, leaving every file after it silently un-indexed.
     """
-    filenames = _pdf_filenames()
-    results: List[Dict] = list(prune_deleted(filenames))
+    filenames = _pdf_filenames(user_id)
+    # Pruning compares the manifest against what is on disk, so a scoped pass must compare
+    # only that user's entries - otherwise every other account's documents look "deleted"
+    # and get dropped from the index.
+    results: List[Dict] = list(prune_deleted(filenames, user_id=user_id))
     seen_hashes: Dict[tuple, str] = {}
 
     for index, filename in enumerate(filenames):
@@ -253,6 +301,7 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[D
         twin = seen_hashes.get(dedupe_key)
         if twin:
             log.warning("'%s' is byte-identical to '%s' - skipping the duplicate.", filename, twin)
+            _event(f"Skipped - identical to '{twin}'", filename, owner, kind="warn")
             results.append({"filename": filename, "user_id": owner, "status": "skipped",
                             "reason": f"duplicate of '{twin}'"})
             continue
@@ -276,6 +325,7 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[D
             # Corrupt file, encrypted PDF, unreadable bytes, OOM on one monster document -
             # report it and carry on with the rest of the corpus.
             log.exception("Failed to ingest '%s'", filename)
+            _event(f"Failed: {type(exc).__name__}", filename, owner_of(filename), kind="error")
             result = {"filename": filename, "user_id": owner_of(filename),
                       "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -292,6 +342,10 @@ _state: Dict = {
     "state": "idle",          # idle | running | error
     "started_at": None,
     "finished_at": None,
+    # Whose scan this is: a user id for an upload-triggered pass, None for a full one
+    # (startup, the CLI, "sync"). This is what tells job_status() that a run belongs to the
+    # caller even at moments when no file is being processed.
+    "scope": None,
     "current_file": None,
     "files_done": 0,
     "files_total": 0,
@@ -301,8 +355,30 @@ _state: Dict = {
     "chunks_done": 0,
     "chunks_total": 0,
     "results": [],
+    # A short, human-readable trail of what the pipeline actually did, newest last. The
+    # progress bar answers "how far"; this answers "what is it doing", which is the question
+    # people actually ask while watching a 900-page book index.
+    "events": [],
     "error": None,
 }
+
+# Kept small: it is returned on every status poll.
+MAX_JOB_EVENTS = 60
+
+
+def _event(message: str, filename: Optional[str] = None, user_id: Optional[str] = None,
+           kind: str = "info") -> None:
+    """Appends one line to the activity trail, tagged with whose document it concerns."""
+    with _lock:
+        _state["events"].append({
+            "at": time.time(),
+            "kind": kind,              # info | done | warn | error
+            "message": message,
+            "file": filename,
+            "user_id": user_id,
+        })
+        if len(_state["events"]) > MAX_JOB_EVENTS:
+            del _state["events"][:-MAX_JOB_EVENTS]
 
 
 def job_status(user_id: Optional[str] = None) -> Dict:
@@ -321,9 +397,19 @@ def job_status(user_id: Optional[str] = None) -> Dict:
         return snapshot
 
     results = [r for r in snapshot.get("results", []) if r.get("user_id") == user_id]
-    mine = owner_from_path(snapshot.get("current_file") or "") == user_id
+    events = [e for e in snapshot.get("events", []) if e.get("user_id") in (user_id, None)]
+
+    # The run belongs to the caller if it was started FOR them, or if the file being
+    # processed right now is theirs.
+    #
+    # Checking only `current_file` was a bug: it is None at the start of a run, between
+    # files, and for the whole finished state - so the counts were blanked at exactly the
+    # moments the UI needed them, and the progress bar sat at 0% and then jumped to nothing.
+    mine = (snapshot.get("scope") == user_id
+            or owner_from_path(snapshot.get("current_file") or "") == user_id)
 
     snapshot["results"] = results
+    snapshot["events"] = events
     if not mine:
         snapshot["current_file"] = None
         snapshot["stage"] = None
@@ -341,7 +427,7 @@ def is_running() -> bool:
         return _state["state"] == "running"
 
 
-def _run(force: bool) -> None:
+def _run(force: bool, user_id: Optional[str] = None) -> None:
     def progress(filename: str, index: int, total: int) -> None:
         with _lock:
             _state["current_file"] = filename
@@ -360,13 +446,26 @@ def _run(force: bool) -> None:
             _state["chunks_total"] = total
 
     try:
-        results = ingest_data_folder(force=force, progress=progress, stage=stage)
+        results = ingest_data_folder(force=force, progress=progress, stage=stage,
+                                     user_id=user_id)
 
         # Anything uploaded while this run was in flight is picked up now, in the same
         # thread, so the job the client is polling covers it too.
-        while _consume_rescan_request():
-            log.info("Files arrived during ingestion - scanning the data folder again.")
-            results.extend(ingest_data_folder(force=False, progress=progress, stage=stage))
+        while True:
+            wanted, scopes = _consume_rescan_request()
+            if not wanted:
+                break
+            log.info("Files arrived during ingestion - scanning again (%s).",
+                     ", ".join(scope or "all documents" for scope in scopes))
+            for scope in scopes:
+                results.extend(ingest_data_folder(force=False, progress=progress,
+                                                  stage=stage, user_id=scope))
+            # A long-lived server with many uploads would otherwise accumulate every result
+            # from every rescan in memory and ship the lot to each polling client.
+            if len(results) > MAX_JOB_RESULTS:
+                dropped = len(results) - MAX_JOB_RESULTS
+                results = results[-MAX_JOB_RESULTS:]
+                log.info("Job result list trimmed; dropped %d older entries.", dropped)
 
         with _lock:
             _state.update(
@@ -387,39 +486,53 @@ def _run(force: bool) -> None:
 
 
 _rescan_requested = False
+# Whose folders still need scanning after the current run. `None` means "everything".
+_queued_scopes: List[Optional[str]] = []
 
 
-def start_job(force: bool = False) -> Dict:
+def start_job(force: bool = False, user_id: Optional[str] = None) -> Dict:
     """
     Kicks off ingestion in a background thread and returns immediately, so neither server
     startup nor an HTTP request ever blocks on embedding a large corpus.
 
-    Called while a job is already running, it flags a re-scan instead of starting a second
-    thread. That matters for uploads: the running job listed the folder when it started, so
-    a PDF that lands mid-run would otherwise sit unindexed until someone pressed sync.
+    Called while a job is already running, it queues the request instead of starting a
+    second thread - two threads writing Chroma is not a supported configuration. The queued
+    entry remembers WHOSE scan was asked for, so an upload during someone else's long
+    indexing run is picked up as a scoped pass rather than a full re-walk of everything.
     """
     global _rescan_requested
     with _lock:
         if _state["state"] == "running":
             _rescan_requested = True
+            _queued_scopes.append(user_id)
             return dict(_state)
         _state.update(
             state="running",
+            scope=user_id,
             started_at=time.time(),
             finished_at=None,
             current_file=None,
             files_done=0,
             files_total=0,
+            stage=None,
+            chunks_done=0,
+            chunks_total=0,
             results=[],
+            events=[],
             error=None,
         )
 
-    threading.Thread(target=_run, args=(force,), daemon=True, name="ingest").start()
+    threading.Thread(target=_run, args=(force, user_id), daemon=True, name="ingest").start()
     return job_status()
 
 
-def _consume_rescan_request() -> bool:
-    global _rescan_requested
+def _consume_rescan_request() -> Tuple[bool, List[Optional[str]]]:
+    """Returns (was one requested, the scopes to scan). Clears both."""
+    global _rescan_requested, _queued_scopes
     with _lock:
         wanted, _rescan_requested = _rescan_requested, False
-    return wanted
+        scopes, _queued_scopes = _queued_scopes, []
+    # De-duplicated, and a single None ("everything") makes the scoped entries redundant.
+    if None in scopes:
+        return wanted, [None]
+    return wanted, list(dict.fromkeys(scopes)) or [None]

@@ -39,6 +39,38 @@ def set_owner_of_record(user_id: str) -> None:
     log.info("Documents added outside the web UI will belong to user %s", user_id)
 
 
+def delete_all_documents(user_id: str) -> int:
+    """
+    Removes every document belonging to one account: chunks, manifest entries, and files.
+
+    Used by account deletion. Each document is removed independently so one failure (a file
+    already gone, a locked handle) does not strand the rest, and the caller can retry.
+    """
+    from src.services import uploads
+
+    names = manifest.sources(user_id)
+    removed = 0
+    for name in names:
+        try:
+            vectorstore.delete_source(name)
+            manifest.remove(name)
+            uploads.delete_document(name, user_id=user_id)
+            removed += 1
+        except Exception:
+            log.exception("Could not fully remove '%s' during account deletion", name)
+
+    # The now-empty per-user folder goes too; it is named after an id that will never
+    # resolve again.
+    try:
+        folder = uploads.upload_dir(user_id)
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+    except OSError:
+        pass
+
+    return removed
+
+
 def unowned_documents() -> List[str]:
     return manifest.unowned()
 

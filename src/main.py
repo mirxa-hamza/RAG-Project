@@ -28,8 +28,8 @@ from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api import api_router
-from src.core.config import STATIC_DIR
-from src.core.logging import get_logger, quiet_access_log
+from src.core.config import CORS_ORIGINS, STATIC_DIR
+from src.core.logging import get_logger, new_request_id, quiet_access_log, request_id
 from src.ml import embeddings
 from src.services import database, ingestion
 
@@ -111,6 +111,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    """
+    Tags every log line emitted while serving one request with the same id, and returns it
+    in `X-Request-ID` so a user reporting "it failed" can hand you the exact id to grep.
+    """
+    token = request_id.set(request.headers.get("X-Request-ID") or new_request_id())
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id.get("")
+        return response
+    finally:
+        request_id.reset(token)
+
+
 @app.exception_handler(database.DatabaseUnavailable)
 async def database_unavailable(request: Request, exc: database.DatabaseUnavailable):
     """
@@ -122,14 +137,17 @@ async def database_unavailable(request: Request, exc: database.DatabaseUnavailab
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
-# The UI is same-origin now, so CORS is only needed if you point another origin (a dev
-# server, a separate front end) at this API. Tighten this before deploying publicly.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# The UI is served by this process, so cross-origin access is not needed at all by default
+# and the middleware is only added when CORS_ORIGINS names somewhere specific. The previous
+# allow_origins=["*"] let any website in the world call this API.
+if CORS_ORIGINS:
+    log.info("CORS enabled for: %s", ", ".join(CORS_ORIGINS))
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 # API routes are registered BEFORE the static mount below, so /chat, /stats and friends
 # always win over a same-named file in src/static/.

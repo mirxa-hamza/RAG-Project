@@ -46,7 +46,14 @@ async def get_current_user(
     user = await database.find_user_by_id(claims["sub"])
     if user is None:
         # A valid signature for an account that no longer exists: the token outlived the
-        # user. Tokens cannot be revoked, so this check is what makes deletion effective.
+        # user. Re-reading the user on every request is what makes deletion effective.
+        raise _UNAUTHORISED
+
+    # Revocation. A token minted before a password change or a "sign out everywhere"
+    # carries an older version than the account now has, and stops working immediately.
+    if int(claims.get("ver", 1)) != int(user.get("token_version", 1)):
+        log.info("Rejected a token for '%s' issued before its version was bumped.",
+                 user.get("username"))
         raise _UNAUTHORISED
 
     return user

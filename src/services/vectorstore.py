@@ -92,7 +92,7 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
             except Exception:  # a broken reporter must never abort an ingest
                 log.exception("Progress callback failed")
 
-    _invalidate_keyword_index()
+    _invalidate_keyword_index(user_id)
     return stored
 
 
@@ -103,11 +103,15 @@ def delete_source(source_name: str, user_id: Optional[str] = None) -> None:
     log.info("Deleted existing chunks for '%s'", source_name)
 
 
-def _invalidate_keyword_index() -> None:
-    """The BM25 index caches the corpus in memory; anything that changes it must reset it.
-    Imported lazily because bm25 reads back from this module."""
+def _invalidate_keyword_index(user_id: Optional[str] = None) -> None:
+    """
+    BM25 caches chunk text in memory; anything that changes the store must reset it.
+
+    Scoped when the caller knows whose documents changed, so one upload does not force a
+    rebuild for every other user. Imported lazily because bm25 reads back from this module.
+    """
     from src.services import bm25
-    bm25.invalidate()
+    bm25.invalidate(user_id)
 
 
 def _row(text: str, meta: Dict, distance: Optional[float] = None) -> Dict:
@@ -245,15 +249,17 @@ def set_owner(source_name: str, user_id: str) -> int:
     return len(ids)
 
 
-def all_chunks() -> List[Dict]:
+def all_chunks(user_id: Optional[str] = None) -> List[Dict]:
     """
-    Every stored chunk, for building the in-memory BM25 index.
+    Every stored chunk, or one user's, for building a BM25 index.
 
-    This is an O(corpus) read and is called once per process (see bm25.py), not per query.
+    This is an O(corpus) read, done once per cached index (see bm25.py), not per query.
+    Scoping it by user is what keeps one person's upload from making everyone else pay to
+    rebuild.
     """
     if _collection.count() == 0:
         return []
-    got = _collection.get(include=["documents", "metadatas"])
+    got = _collection.get(where=owner_filter(user_id), include=["documents", "metadatas"])
     return [_row(text, meta) for text, meta in zip(got["documents"], got["metadatas"])]
 
 

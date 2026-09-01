@@ -14,7 +14,7 @@
      installed (Android, ChromeOS); DM Sans is loaded as the closest freely-licensed
      fallback so every other device gets a consistent, near-identical face. -->
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=12">
+<link rel="stylesheet" href="style.css?v=15">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
 </head>
 <body>
@@ -101,10 +101,10 @@
         <span class="status-dot__light" aria-hidden="true"></span>
         <span class="status-dot__label">Checking</span>
       </span>
-      <span class="who" id="who" title="Signed in">
+      <button type="button" class="who" id="who" title="Account settings">
         <span class="who__avatar" id="whoAvatar" aria-hidden="true">?</span>
         <span class="who__name" id="whoName"></span>
-      </span>
+      </button>
       <button type="button" class="icon-btn" id="logoutBtn" title="Sign out" aria-label="Sign out">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>
       </button>
@@ -130,6 +130,11 @@
           <button id="resetBtn" class="btn btn--ghost btn--block" title="Wipe the index and rebuild it from the data folder">
             <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
             <span>Rebuild index</span>
+          </button>
+          <button id="activityBtn" class="btn btn--ghost btn--block" title="What the server is doing with your PDFs">
+            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+            <span>Processing status</span>
+            <span class="btn__dot" id="activityDot" hidden aria-hidden="true"></span>
           </button>
         </div>
 
@@ -242,8 +247,97 @@
     Large books take a few minutes to index. You can close this window — processing carries
     on and the progress stays visible in the sidebar.
   </p>
+  <p class="modal__note modal__note--privacy">
+    <strong>Where your documents go.</strong> PDFs are stored on this server and indexed
+    locally — extraction, embedding and search never leave the machine. When you ask a
+    question, the passages that match it (up to ~24,000 characters) are sent to Groq to
+    write the answer. Don't upload anything you can't share with that service.
+  </p>
 </dialog>
 
-<script src="script.js?v=12"></script>
+<!-- ───────────────────────── Account dialog ───────────────────────── -->
+<dialog class="modal" id="accountModal" aria-labelledby="accountTitle">
+  <form method="dialog" class="modal__close-form">
+    <button class="icon-btn modal__close" aria-label="Close">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </form>
+
+  <h2 class="modal__title" id="accountTitle">Account</h2>
+  <p class="modal__text">Signed in as <strong id="accountName"></strong>.</p>
+
+  <div class="quota">
+    <div class="quota__head">
+      <span>Storage</span>
+      <span id="quotaText">—</span>
+    </div>
+    <div class="quota__bar"><div class="quota__fill" id="quotaFill"></div></div>
+  </div>
+
+  <form id="passwordForm" class="auth__form">
+    <label class="field">
+      <span class="field__label" for="currentPassword">Current password</span>
+      <input class="input" id="currentPassword" type="password" autocomplete="current-password"
+             minlength="1" maxlength="200" required>
+    </label>
+    <label class="field">
+      <span class="field__label" for="newPassword">New password</span>
+      <input class="input" id="newPassword" type="password" autocomplete="new-password"
+             minlength="8" maxlength="200" required>
+    </label>
+    <p class="auth__error" id="accountError" role="alert"></p>
+    <button type="submit" class="btn btn--primary btn--block" id="passwordSubmit">
+      <span>Change password</span>
+    </button>
+  </form>
+
+  <div class="account__danger">
+    <button type="button" class="btn btn--ghost btn--block" id="signoutAllBtn">
+      <span>Sign out on all devices</span>
+    </button>
+    <button type="button" class="btn btn--ghost btn--block btn--danger" id="deleteAccountBtn">
+      <span>Delete account and all documents</span>
+    </button>
+    <p class="modal__note">
+      Deleting removes your PDFs from the server, their passages from the index, and the
+      account itself. It cannot be undone.
+    </p>
+  </div>
+</dialog>
+
+<!-- ───────────────────────── Processing status ─────────────────────────
+     The progress bar answers "how far"; this answers "what is it doing", which is what
+     people actually want while a 900-page book is indexing. -->
+<dialog class="modal" id="activityModal" aria-labelledby="activityTitle">
+  <form method="dialog" class="modal__close-form">
+    <button class="icon-btn modal__close" aria-label="Close">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </form>
+
+  <h2 class="modal__title" id="activityTitle">Processing status</h2>
+  <p class="modal__text" id="activitySummary">Nothing is being processed right now.</p>
+
+  <div class="activity__progress">
+    <div class="activity__head">
+      <span id="activityStage">Idle</span>
+      <span id="activityPercent">—</span>
+    </div>
+    <div class="progress"><div class="progress__bar" id="activityBar"></div></div>
+    <p class="activity__file" id="activityFile"></p>
+  </div>
+
+  <h3 class="activity__subtitle">What happened</h3>
+  <ol class="activity__log" id="activityLog">
+    <li class="activity__empty">Nothing yet. Upload a PDF and the steps appear here.</li>
+  </ol>
+
+  <p class="modal__note">
+    Steps run in order: read the pages, split them into passages, embed each passage, store
+    it. A document only joins your library once every passage is stored.
+  </p>
+</dialog>
+
+<script src="script.js?v=15"></script>
 </body>
 </html>

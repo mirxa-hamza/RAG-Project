@@ -12,13 +12,14 @@ can substitute a fake collection without a server anywhere.
 """
 from typing import Any, Optional
 
-from src.core.config import MONGO_DB, MONGO_URI, USERS_COLLECTION
+from src.core.config import AUDIT_COLLECTION, MONGO_DB, MONGO_URI, USERS_COLLECTION
 from src.core.logging import get_logger
 
 log = get_logger(__name__)
 
 _client = None
 _users = None
+_audit = None
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -75,10 +76,20 @@ def users() -> Any:
     return _users
 
 
-def set_users_collection(collection: Any) -> None:
-    """Injection point for tests: swap in a fake collection, no server needed."""
-    global _users
+def audit() -> Any:
+    """The audit collection: who did what, when."""
+    global _audit
+    if _audit is None:
+        _audit = get_client()[MONGO_DB][AUDIT_COLLECTION]
+    return _audit
+
+
+def set_users_collection(collection: Any, audit_collection: Any = None) -> None:
+    """Injection point for tests: swap in fake collections, no server needed."""
+    global _users, _audit
     _users = collection
+    if audit_collection is not None:
+        _audit = audit_collection
 
 
 async def ensure_indexes() -> None:
@@ -126,11 +137,62 @@ async def create_user(username: str, password_hash: str) -> dict:
     document = {
         "username": username,
         "password_hash": password_hash,
+        # Bumped on password change and on "sign out everywhere". Every token carries the
+        # version it was minted with, and a mismatch is rejected - which is the only way to
+        # invalidate a JWT before it expires.
+        "token_version": 1,
         "created_at": datetime.now(timezone.utc),
     }
     result = await _guard(users().insert_one(document))
     document["_id"] = result.inserted_id
     return document
+
+
+async def set_password(user_id: str, password_hash: str) -> None:
+    """Changes the password AND invalidates every existing token for that account."""
+    from bson import ObjectId
+
+    await _guard(users().update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"password_hash": password_hash},
+         "$inc": {"token_version": 1}},
+    ))
+
+
+async def bump_token_version(user_id: str) -> None:
+    """Signs the account out everywhere, without changing the password."""
+    from bson import ObjectId
+
+    await _guard(users().update_one({"_id": ObjectId(user_id)}, {"$inc": {"token_version": 1}}))
+
+
+async def delete_user(user_id: str) -> None:
+    from bson import ObjectId
+
+    await _guard(users().delete_one({"_id": ObjectId(user_id)}))
+
+
+async def record_audit(user_id: Optional[str], username: Optional[str], action: str,
+                       detail: Optional[str] = None, ok: bool = True) -> None:
+    """
+    Appends one line to the audit trail.
+
+    Never raises: an audit write that fails must not turn a successful login into a 500.
+    A missing audit line is a gap in the record; a failed request is a broken app.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        await audit().insert_one({
+            "user_id": user_id,
+            "username": username,
+            "action": action,
+            "detail": detail,
+            "ok": ok,
+            "at": datetime.now(timezone.utc),
+        })
+    except Exception:
+        log.warning("Could not write the audit entry for %r", action, exc_info=True)
 
 
 async def count_users() -> int:
