@@ -506,9 +506,13 @@ async function refreshSources() {
       MAX_UPLOAD_MB = data.max_upload_mb;
       if (el.maxUploadMb) el.maxUploadMb.textContent = data.max_upload_mb;
     }
-    el.chunkCount.textContent = data.total_chunks
-      ? `${data.total_chunks.toLocaleString()} passages`
-      : "empty";
+    // The passage count is not shown in the sidebar any more; the element only exists if
+    // someone puts it back.
+    if (el.chunkCount) {
+      el.chunkCount.textContent = data.total_chunks
+        ? `${data.total_chunks.toLocaleString()} passages`
+        : "empty";
+    }
 
     if (!polling) {
       setServerStatus("online", "Online", `Connected to ${window.location.origin}`);
