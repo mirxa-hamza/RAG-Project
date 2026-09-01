@@ -64,6 +64,11 @@ CHROMA_ADD_BATCH = int(os.getenv("CHROMA_ADD_BATCH", "1000"))
 MANIFEST_PATH = CHROMA_DIR / "manifest.json"
 
 # ---------------------------------------------------------------- Chunking
+# 300 words is ~400 tokens for ordinary prose, but dense technical pages (formulae,
+# hyphenated terms, tables) tokenise far worse - the ingest log has shown 616 tokens for a
+# 300-word chunk, i.e. past bge-small's 512 window, and the tail of such a chunk is dropped
+# at embedding time. Set CHUNK_SIZE_WORDS=220 in .env and re-run `python scripts/ingest.py
+# --force` if warn_if_truncated() keeps firing on your corpus.
 CHUNK_SIZE_WORDS = int(os.getenv("CHUNK_SIZE_WORDS", "300"))
 CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "50"))
 

@@ -9,6 +9,7 @@ what is already on its disk.
 from fastapi import APIRouter, HTTPException, status
 
 from src.core.logging import get_logger
+from src.ml import embeddings
 from src.services import ingestion, manifest, vectorstore
 
 log = get_logger(__name__)
@@ -36,6 +37,9 @@ def stats():
     return {
         "total_chunks": vectorstore.count(),
         "ingesting": ingestion.is_running(),
+        # The model loads in the background after the port opens; the UI holds its loading
+        # screen until this is true, so the first question is never the thing that waits.
+        "embedding_model_ready": embeddings.is_ready(),
         **manifest.summary(),
     }
 

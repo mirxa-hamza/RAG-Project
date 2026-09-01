@@ -87,7 +87,15 @@ textbook takes a few minutes on CPU — the log prints per-file progress, it isn
 ## 5. Run it
 
 ```bash
-uvicorn src.main:app --reload --port 8000
+python scripts/run.py
+```
+
+This starts the server and opens the browser **once it actually answers**, so you never
+land on `ERR_CONNECTION_REFUSED` during the first seconds of a cold start. Plain uvicorn
+works exactly as before if you prefer it:
+
+```bash
+uvicorn src.main:app --port 8000        # add --reload only while editing code
 ```
 
 Open **<http://localhost:8000>** — the web UI is served by the same process, so there's
@@ -119,6 +127,31 @@ You only need `--force` if you change the embedding model or the chunk settings 
 `.env`, since the stored vectors are only valid for the settings that produced them.
 
 ---
+
+## Why the first start is slow (and how to make later ones fast)
+
+A cold start on a machine with two big textbooks in `data/` looks like this:
+
+| Phase | Time | Happens again? |
+|---|---|---|
+| Import torch + load the embedding model | ~10–20s | every start |
+| Extract and chunk the PDFs | ~20s | only for new/changed files |
+| Embed ~3,200 chunks on CPU | 8–9 min | only for new/changed files |
+
+The server is answering requests during the whole embedding phase — it runs in a
+background thread, and the loading screen shows its progress. The second start of the same
+corpus takes seconds, because every file is fingerprinted with SHA-256 and skipped when
+unchanged.
+
+To make it quicker anyway:
+
+- **Index before you serve**: `python scripts/ingest.py`, then start uvicorn. Same total
+  work, but the server comes up already queryable.
+- **Drop `--reload` when you're not editing code.** The reloader starts a second process
+  and a file watcher over the whole project, which roughly doubles the boot cost.
+- **Nothing else is worth tuning.** Embedding is CPU-bound matrix maths; batch size
+  changes it by a few percent, not by minutes. A CUDA GPU would cut it to well under a
+  minute — nothing else will.
 
 ## Verify it works
 

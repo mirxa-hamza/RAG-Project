@@ -225,6 +225,9 @@ async function pollUntilDone() {
   setBusy(false);
   el.syncProgress.hidden = true;
   el.syncProgressBar.style.width = "";
+  // refreshSources() above ran while `polling` was still true, so it deliberately left the
+  // status dot alone; the job is over now, so put it back to "Online".
+  setServerStatus("online", "Online", `Connected to ${window.location.origin}`);
 }
 
 function setBusy(busy) {
@@ -290,11 +293,26 @@ el.questionInput.addEventListener("keydown", (e) => {
   }
 });
 
-// Grow the textarea with its content, up to the CSS max-height.
-el.questionInput.addEventListener("input", () => {
-  el.questionInput.style.height = "auto";
-  el.questionInput.style.height = `${el.questionInput.scrollHeight}px`;
-});
+/**
+ * Grow the textarea with its content, up to the CSS max-height (4 lines).
+ *
+ * overflow-y stays 'hidden' in CSS and is only switched to 'auto' once the content really
+ * exceeds that height. Leaving it on the browser default ('auto') showed a scrollbar
+ * gutter on a single line, because scrollHeight rounds up past clientHeight at fractional
+ * line heights.
+ */
+function autoGrow() {
+  const ta = el.questionInput;
+  ta.style.height = "auto";
+  const max = parseFloat(getComputedStyle(ta).maxHeight) || Infinity;
+  const needed = ta.scrollHeight;
+  ta.style.height = `${Math.min(needed, max)}px`;
+  // 1px of slack absorbs sub-pixel rounding, so the bar appears only on a real overflow.
+  ta.style.overflowY = needed > max + 1 ? "auto" : "hidden";
+}
+
+el.questionInput.addEventListener("input", autoGrow);
+autoGrow();
 
 el.chatForm.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -305,16 +323,31 @@ el.chatForm.addEventListener("submit", async (e) => {
   addMessage("user", question);
 
   el.questionInput.value = "";
-  el.questionInput.style.height = "auto";
+  autoGrow();
   el.sendBtn.disabled = true;
 
   const answerMsg = addMessage("assistant", "");
-  answerMsg.row.classList.add("msg--streaming");
+  // Retrieval (embed -> hybrid search -> re-rank) runs before the first token arrives, so
+  // the bubble would otherwise sit empty and blank for a second or two. Show what the
+  // server is actually doing instead.
+  const thinking = document.createElement("div");
+  thinking.className = "thinking";
+  thinking.innerHTML =
+    '<span class="thinking__dots" aria-hidden="true"><i></i><i></i><i></i></span>' +
+    '<span class="thinking__label">Searching your documents…</span>';
+  answerMsg.body.appendChild(thinking);
+
+  const setThinking = (label) => {
+    const el_ = thinking.querySelector(".thinking__label");
+    if (el_) el_.textContent = label;
+  };
+  const clearThinking = () => thinking.remove();
 
   let answer = "";
   let frame = null;
   const paint = () => {
     frame = null;
+    clearThinking();
     answerMsg.body.innerHTML = renderMarkdown(answer);
     scrollToBottom();
   };
@@ -337,8 +370,14 @@ el.chatForm.addEventListener("submit", async (e) => {
     // Server-Sent Events: `sources` first, then a stream of `token`s, then `done`.
     for await (const { event, data } of readSSE(res)) {
       if (event === "sources") {
+        // Retrieval is done; the model is now writing.
+        setThinking("Writing the answer…");
         renderSources(answerMsg.wrapper, data);
       } else if (event === "token") {
+        if (!answer) {
+          clearThinking();
+          answerMsg.row.classList.add("msg--streaming");
+        }
         answer += data.text;
         // Repainting on every token would re-parse the whole answer per chunk; one paint
         // per animation frame keeps it smooth on long replies.
@@ -354,6 +393,7 @@ el.chatForm.addEventListener("submit", async (e) => {
     history.push({ question, answer });
     if (history.length > 8) history = history.slice(-8);
   } catch (err) {
+    clearThinking();
     answerMsg.row.className = "msg msg--error";
     answerMsg.avatar.textContent = "!";
     answerMsg.role.textContent = "Error";
@@ -507,4 +547,115 @@ function scrollToBottom() {
 }
 
 /* ─────────────────────────── Boot ───────────────────────────── */
+
+/**
+ * Hold a loading screen up until the app is actually usable.
+ *
+ * Two things used to look like breakage on a cold start: opening the page while uvicorn
+ * was still importing torch (the browser shows a connection error, so the overlay retries
+ * instead of giving up), and opening it during the first ingest (the index is empty, so
+ * every question would answer "not in these documents"). The overlay reports which of the
+ * two is happening and lets you in anyway.
+ */
+async function boot() {
+  const box = $("boot");
+  const title = $("bootTitle");
+  const text = $("bootText");
+  const bar = $("bootBar");
+  const skip = $("bootSkip");
+
+  let dismissed = false;
+  const close = () => {
+    if (dismissed) return;
+    dismissed = true;
+    if (!box.hidden) {
+      box.classList.add("boot--closing");
+      setTimeout(() => { box.hidden = true; }, 300);
+    }
+    el.questionInput.focus();
+  };
+  skip.addEventListener("click", close);
+
+  // The overlay starts hidden and is only revealed if the app is NOT immediately usable.
+  // On a warm start /stats answers in a few milliseconds, so nothing flashes over the UI
+  // at all; the loading screen exists for the cold start, not for every page load.
+  const reveal = () => {
+    if (!dismissed) box.hidden = false;
+  };
+
+  const indeterminate = (on) =>
+    bar.classList.toggle("boot__bar-fill--indeterminate", on);
+  indeterminate(true);
+
+  const startedAt = Date.now();
+
+  while (!dismissed) {
+    let stats = null;
+    try {
+      stats = await (await fetch(`${API_BASE}/stats`)).json();
+    } catch {
+      // Server not listening yet — normal for the first ~20s while the models load.
+      reveal();
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      title.textContent = "Starting up…";
+      text.textContent = secs > 5
+        ? `Waiting for the server (${secs}s). It loads the embedding model on startup.`
+        : "Waiting for the server.";
+      await sleep(1000);
+      continue;
+    }
+
+    if (stats.embedding_model_ready === false && !stats.ingesting) {
+      // Port is open but the embedding model is still loading in its warm-up thread.
+      reveal();
+      title.textContent = "Loading the search model…";
+      text.textContent = "About 15 seconds. It only happens once per server start.";
+      indeterminate(true);
+      skip.hidden = false;
+      await sleep(1000);
+      continue;
+    }
+
+    if (stats.ingesting) {
+      let job = {};
+      try {
+        job = await (await fetch(`${API_BASE}/ingest/status`)).json();
+      } catch { /* transient; the next loop retries */ }
+      const done = job.files_done ?? 0;
+      const total = job.files_total ?? 0;
+      reveal();
+      title.textContent = "Indexing your documents…";
+      const current = job.current_file ? ` — ${shortDocName(job.current_file)}` : "";
+      text.textContent = total
+        ? `Document ${Math.min(done + 1, total)} of ${total}${current}. Only happens once per file; later starts reuse the index.`
+        : "Reading the data folder…";
+      if (total) {
+        indeterminate(false);
+        bar.style.width = `${Math.round((done / total) * 100) || 4}%`;
+      }
+      // Nothing to answer from yet, but a partially built index is already queryable.
+      skip.hidden = (stats.total_chunks || 0) === 0;
+      await sleep(1500);
+      continue;
+    }
+
+    if (!stats.total_chunks) {
+      reveal();
+      title.textContent = "No documents indexed";
+      text.textContent = "Put a PDF in the server's data/ folder, then use “Sync from data folder”.";
+      indeterminate(false);
+      bar.style.width = "100%";
+      skip.hidden = false;
+      skip.textContent = "Continue";
+      await sleep(3000);
+      continue;
+    }
+
+    break;
+  }
+
+  close();
+}
+
 refreshSources();
+boot();

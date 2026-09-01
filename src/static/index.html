@@ -14,12 +14,28 @@
      installed (Android, ChromeOS); DM Sans is loaded as the closest freely-licensed
      fallback so every other device gets a consistent, near-identical face. -->
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=5">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
 </head>
 <body>
 
 <a class="skip-link" href="#questionInput">Skip to the question box</a>
+
+<!-- Boot overlay. Starts HIDDEN and is revealed by script.js only when the app is not yet
+     usable - the server is still starting, the model is still loading, or documents are
+     still being indexed. On a warm start it never appears, so the app is the first and
+     only thing you see. -->
+<div class="boot" id="boot" role="status" aria-live="polite" hidden>
+  <div class="boot__card">
+    <span class="boot__mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="26" height="26"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+    </span>
+    <h1 class="boot__title" id="bootTitle">Starting up…</h1>
+    <p class="boot__text" id="bootText">Waiting for the server.</p>
+    <div class="boot__bar"><div class="boot__bar-fill" id="bootBar"></div></div>
+    <button type="button" class="btn btn--ghost boot__skip" id="bootSkip" hidden>Use it anyway</button>
+  </div>
+</div>
 
 <div class="app">
 
@@ -151,6 +167,6 @@
 
 </div>
 
-<script src="script.js"></script>
+<script src="script.js?v=5"></script>
 </body>
 </html>

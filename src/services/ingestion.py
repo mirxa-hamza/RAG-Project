@@ -95,9 +95,15 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
         filename, len(pages), len(chunks),
     )
 
-    if reason == "changed":
-        # Replace, don't duplicate: drop the old vectors for this document first.
-        delete_source(filename)
+    # Replace, don't duplicate: drop any existing vectors for this document first.
+    #
+    # This runs for reason == "new" as well, which looks redundant but is not. A job killed
+    # part-way (Ctrl+C, or `uvicorn --reload` restarting on a file save) leaves whatever
+    # chunks it had already stored in Chroma, while the manifest entry - written only once
+    # the whole file finishes - never gets written. The next run therefore treats the file
+    # as "new" and re-embeds it from scratch under a fresh run_id, so without this delete
+    # the abandoned chunks would pile up as duplicates on every interrupted attempt.
+    delete_source(filename)
 
     with timed(log, f"embed + store '{filename}'"):
         stored = add_chunks(filename, chunks)

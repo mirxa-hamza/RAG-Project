@@ -31,6 +31,25 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+class _QuietPollFilter(logging.Filter):
+    """Drops uvicorn access lines for the endpoints the UI polls while a job runs."""
+
+    NOISY = ("/ingest/status", "/stats")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not (any(p in msg for p in self.NOISY) and " 200 " in msg)
+
+
+def quiet_access_log() -> None:
+    """
+    The page polls /ingest/status and /stats about once a second, which buries the real
+    ingestion progress under a wall of 200s. Only successful polls are filtered out;
+    errors and every other request still log normally.
+    """
+    logging.getLogger("uvicorn.access").addFilter(_QuietPollFilter())
+
+
 @contextmanager
 def timed(logger: logging.Logger, label: str, level: int = logging.INFO):
     """`with timed(log, "embed 1781 chunks"):` -> logs "embed 1781 chunks took 12.4s"."""
