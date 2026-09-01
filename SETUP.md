@@ -12,6 +12,11 @@ then indexes whatever PDFs you put in `data/`.
 
 - **Python 3.10+** (3.13 is what we develop on) — `python --version`
 - **Git**
+- **MongoDB running locally** on `mongodb://localhost:27017` — it stores user accounts
+  (nothing else). Windows: install MongoDB Community Server and it runs as a service, so
+  `net start MongoDB` in an admin terminal is usually all that is needed. With Docker:
+  `docker run -d -p 27017:27017 --name mongo mongo`. Check it with `mongosh` or by
+  visiting <http://localhost:8000/api/health/auth> once the app is up.
 - **A free Groq API key** — make your own at <https://console.groq.com/keys>.
   Don't reuse anyone else's; keys are personal and rate-limited per account.
 - ~2GB of free disk (PyTorch is the bulk of it) and a normal internet connection for
@@ -58,7 +63,21 @@ deliberately experimenting. **`.env` is gitignored; never commit it.**
 
 ---
 
-## 4. Add documents
+## 4. Create your account
+
+Start the app (step 5), open it, and press **Create an account**. Signup is open, so pick a
+password you would not mind typing again — there is no reset flow.
+
+The **first** account is special in one way: it inherits every document that was indexed
+before accounts existed, and it becomes the owner of anything you copy into `data/` by hand
+afterwards. Every later account starts empty and sees only what it uploads.
+
+Sessions last 12 hours (`JWT_EXPIRE_HOURS`). The signing key is generated on first run and
+appended to `.env`; changing or deleting it signs everyone out.
+
+---
+
+## 4b. Add documents
 
 The repo deliberately ships **no PDFs** — they're large, often copyrighted, and change
 independently of the code.
@@ -168,8 +187,9 @@ pip install -r requirements-dev.txt
 python tests/test_pipeline_offline.py
 ```
 
-126 checks, fully offline — no API key and no model download needed, because it stubs the
-models. Run this before pushing anything.
+175 checks, fully offline — no API key and no model download needed, because it stubs the
+models — and no MongoDB either, because the users collection is faked. Run this before
+pushing anything; the multi-tenant isolation checks are in here.
 
 To measure *answer quality* rather than plumbing:
 
@@ -200,7 +220,10 @@ python eval/run_eval.py --judge    # + LLM-as-judge scoring (uses your Groq key)
 | `ModuleNotFoundError: rank_bm25` etc. | `pip install -r requirements.txt` again — the venv is stale. |
 | Answer says `GROQ_API_KEY is not set` | `.env` is missing or the key line is empty; restart the server after editing it. |
 | `model not found` from Groq | Groq retires models; check <https://console.groq.com/docs/models> and update `GROQ_MODEL` in `.env`. |
-| Sidebar shows no documents | No PDFs in `data/`, or ingestion hasn't run — click **Sync documents**. |
+| Sidebar shows no documents | No PDFs in `data/`, or ingestion hasn't run — click **Sync documents**. Remember documents are per-account: another account's uploads are invisible by design. |
+| Sign-in says the server can't be reached | MongoDB is down. Start it, then check <http://localhost:8000/api/health/auth>. |
+| Everyone was signed out after a restart | `JWT_SECRET` changed or was cleared in `.env`. |
+| A document you uploaded vanished | You are signed in as a different account than the one that uploaded it. |
 | `Numpy built with MINGW-W64` warning | Windows-on-ARM only, harmless. |
 
 More detail: `README.md` for the architecture, `CLAUDE.md` for conventions and known

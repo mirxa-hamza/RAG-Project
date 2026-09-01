@@ -125,6 +125,9 @@ def main() -> int:
         source = item.get("expected_source")
         pages = item.get("expected_pages", [])
 
+        # No user_id: the harness measures retrieval quality over the WHOLE store, which
+        # is exactly what a request path must never do. It is offline and never serves a
+        # response to anyone.
         chunks = retrieval.retrieve(question, top_k=args.top_k, **options)
         # Neighbour chunks count as retrieved, but rank is measured on the primary hits.
         primary = [c for c in chunks if "neighbor_of" not in c]

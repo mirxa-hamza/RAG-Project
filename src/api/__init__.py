@@ -6,9 +6,10 @@ The pipeline itself lives in src/services/ and src/ml/.
 """
 from fastapi import APIRouter
 
-from src.api import chat, documents, system
+from src.api import auth, chat, documents, system
 
 api_router = APIRouter()
+api_router.include_router(auth.router)
 api_router.include_router(system.router)
 api_router.include_router(documents.router)
 api_router.include_router(chat.router)

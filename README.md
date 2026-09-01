@@ -8,8 +8,11 @@ at each stage. That's deliberate, given this is a learning project.
 
 **Everything is indexed from the backend's `data/` folder.** Drop PDFs in there yourself,
 or upload them from the web UI — `POST /upload` writes the file into that same folder and
-then the ordinary ingestion job indexes it. There is no authentication, so keep it on
-localhost unless you add some.
+then the ordinary ingestion job indexes it.
+
+**It is multi-tenant.** Accounts live in a local MongoDB; documents belong to the account
+that uploaded them, and no filter, search or answer ever crosses that line. The API is
+plain HTTP with no revocation, so keep it on localhost unless you add TLS.
 
 ## Stack
 
@@ -165,6 +168,10 @@ block on embedding. `GET /ingest/status` reports progress.
 | POST   | `/chat/stream`    | same body, streamed as SSE (`sources`, then `token`s, then `done`) |
 | GET    | `/stats`          | chunk count, per-document pages/chunks, ingestion state |
 | POST   | `/reset`          | wipe the store and rebuild from `data/` (202) |
+| POST   | `/api/signup`     | create an account, returns a JWT (201) |
+| POST   | `/api/login`      | exchange credentials for a JWT |
+| GET    | `/api/me`         | the signed-in user |
+| GET    | `/api/documents`  | the caller's documents |
 | POST   | `/upload`         | upload one or more PDFs (multipart `files`), then index them (202) |
 | DELETE | `/documents/{name}` | remove a document: its vectors, its manifest entry, and the PDF |
 

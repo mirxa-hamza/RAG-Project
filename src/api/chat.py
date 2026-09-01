@@ -7,9 +7,10 @@ retrieval behaviour can never drift between them.
 import json
 from typing import Dict, List, Tuple
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
+from src.api.deps import get_current_user, user_id_of
 from src.core.config import HISTORY_TURNS
 from src.core.logging import get_logger, timed
 from src.ml.llm import generate_answer, rewrite_question, stream_answer
@@ -36,11 +37,17 @@ def _to_sources(chunks: List[dict]) -> List[Source]:
     ]
 
 
-def _prepare(req: ChatRequest) -> Tuple[List[Dict], str, List[Dict]]:
-    """Rewrite the follow-up if there's history, then retrieve."""
+def _prepare(req: ChatRequest, user_id: str) -> Tuple[List[Dict], str, List[Dict]]:
+    """
+    Rewrite the follow-up if there's history, then retrieve - scoped to `user_id`.
+
+    Both routes go through here so retrieval, and with it the isolation filter, can never
+    drift between the buffered and the streamed answer.
+    """
     history = [turn.model_dump() for turn in req.history][-HISTORY_TURNS:]
     search_query = rewrite_question(req.question, history)
-    chunks = retrieval.retrieve(search_query, top_k=req.top_k, source=req.source)
+    chunks = retrieval.retrieve(search_query, top_k=req.top_k, source=req.source,
+                                user_id=user_id)
     return history, search_query, chunks
 
 
@@ -49,9 +56,9 @@ def _sse(event: str, payload: dict) -> str:
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     with timed(log, "chat request"):
-        history, search_query, chunks = _prepare(req)
+        history, search_query, chunks = _prepare(req, user_id_of(user))
         answer = generate_answer(req.question, chunks, history)
 
     return ChatResponse(
@@ -62,7 +69,7 @@ def chat(req: ChatRequest):
 
 
 @router.post("/chat/stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     """
     Server-Sent Events version of /chat.
 
@@ -70,7 +77,7 @@ def chat_stream(req: ChatRequest):
     `token` events, then `done`. Retrieval happens before the generator starts, so a
     failure there surfaces as a normal HTTP error rather than mid-stream.
     """
-    history, search_query, chunks = _prepare(req)
+    history, search_query, chunks = _prepare(req, user_id_of(user))
     sources = [s.model_dump() for s in _to_sources(chunks)]
 
     def events():

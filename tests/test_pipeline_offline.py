@@ -13,6 +13,7 @@ detection, ChromaDB storage/retrieval, the background ingestion job, and every F
 endpoint. It does NOT prove that the real embedding model downloads (needs open internet)
 or that a live Groq call succeeds (needs a real API key).
 """
+import asyncio
 import hashlib
 import json
 import os
@@ -107,12 +108,58 @@ os.environ["CHUNK_SIZE_WORDS"] = "50"      # sample PDF is ~90 words/page, so sm
 os.environ["CHUNK_OVERLAP_WORDS"] = "10"   # to get more than one chunk per page
 os.environ["EMBEDDING_QUERY_PREFIX"] = ""
 os.environ["LOG_LEVEL"] = "WARNING"        # keep the test output readable
+os.environ["JWT_SECRET"] = "offline-test-secret-not-used-anywhere-real"
 
 from scripts.make_test_pdf import make_pdf  # noqa: E402
 
 make_pdf(str(TEST_DATA_DIR / "sample.pdf"))
 
 from fastapi.testclient import TestClient  # noqa: E402
+
+# ---- 2b. A fake users collection, so auth is exercised without a MongoDB server --------
+#
+# Only the handful of Motor methods the app actually calls are implemented. Everything
+# above it - hashing, JWT signing, the dependency, every isolation filter - is the real
+# code path.
+from bson import ObjectId  # noqa: E402
+from pymongo.errors import DuplicateKeyError  # noqa: E402
+
+
+class FakeUsers:
+    def __init__(self):
+        self.docs = []
+        self.unique = set()
+
+    async def create_index(self, field, unique=False):
+        if unique:
+            self.unique.add(field)
+        return field
+
+    async def find_one(self, query):
+        for doc in self.docs:
+            if all(doc.get(k) == v for k, v in query.items()):
+                return dict(doc)
+        return None
+
+    async def insert_one(self, document):
+        for field in self.unique:
+            if any(d.get(field) == document.get(field) for d in self.docs):
+                raise DuplicateKeyError(f"duplicate {field}")
+        stored = dict(document, _id=ObjectId())
+        self.docs.append(stored)
+        return type("Result", (), {"inserted_id": stored["_id"]})()
+
+    async def count_documents(self, query):
+        if not query:
+            return len(self.docs)
+        return sum(1 for d in self.docs if all(d.get(k) == v for k, v in query.items()))
+
+
+from src.services import database  # noqa: E402
+
+fake_users = FakeUsers()
+database.set_users_collection(fake_users)
+asyncio.new_event_loop().run_until_complete(fake_users.create_index("username", unique=True))
 
 from src.ml import reranker  # noqa: E402
 from src.services import bm25, manifest, retrieval, vectorstore  # noqa: E402
@@ -130,11 +177,11 @@ def check(label, condition):
     PASSED += 1
 
 
-def wait_for_ingest(client, timeout=120):
+def wait_for_ingest(client, timeout=120, headers=None):
     """The ingest job is a background thread now - poll until it finishes."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        body = client.get("/ingest/status").json()
+        body = client.get("/ingest/status", headers=headers).json()
         if body["state"] != "running":
             return body
         time.sleep(0.05)
@@ -182,6 +229,50 @@ check("overlap >= chunk size does not explode",
 # `with TestClient(app)` runs the lifespan startup, which kicks off the background
 # ingestion job - the "server boots and picks up the data folder" path, for real.
 with TestClient(app) as client:
+    print("\n--- authentication is required before anything else ---")
+    for method, path in [("get", "/stats"), ("get", "/ingest/status"), ("post", "/ingest"),
+                         ("get", "/api/documents"), ("post", "/reset")]:
+        code = getattr(client, method)(path).status_code
+        check(f"{method.upper()} {path} without a token is 401", code == 401)
+    check("POST /chat without a token is 401",
+          client.post("/chat", json={"question": "hello"}).status_code == 401)
+    check("POST /upload without a token is 401",
+          client.post("/upload", files={"files": ("x.pdf", b"%PDF-1.4\n", "application/pdf")}
+                      ).status_code == 401)
+    check("a garbage token is 401",
+          client.get("/stats", headers={"Authorization": "Bearer not.a.token"}).status_code == 401)
+    check("the wrong scheme is 401",
+          client.get("/stats", headers={"Authorization": "Basic abc"}).status_code == 401)
+
+    r = client.post("/api/signup", json={"username": "alice", "password": "alicepassword"})
+    check("signup returns 201", r.status_code == 201)
+    alice_token = r.json()["access_token"]
+    check("signup returns a bearer token", r.json()["token_type"] == "bearer" and alice_token)
+
+    check("a duplicate username is refused with 409",
+          client.post("/api/signup",
+                      json={"username": "alice", "password": "otherpassword"}).status_code == 409)
+    check("a short password is rejected",
+          client.post("/api/signup",
+                      json={"username": "carol", "password": "short"}).status_code == 422)
+    check("a username with a path separator is rejected",
+          client.post("/api/signup",
+                      json={"username": "a/../b", "password": "password123"}).status_code == 422)
+    check("the wrong password is 401",
+          client.post("/api/login",
+                      json={"username": "alice", "password": "wrongpassword"}).status_code == 401)
+    check("an unknown user is 401",
+          client.post("/api/login",
+                      json={"username": "nobody", "password": "password123"}).status_code == 401)
+    r = client.post("/api/login", json={"username": "alice", "password": "alicepassword"})
+    check("login with the right password returns a token", r.status_code == 200)
+
+    # Every remaining check in this file runs as alice.
+    client.headers.update({"Authorization": f"Bearer {alice_token}"})
+    alice_id = client.get("/api/me").json()["id"]
+    check("/api/me identifies the signed-in user",
+          client.get("/api/me").json()["username"] == "alice")
+
     print("\n--- /health (must answer while ingestion runs in the background) ---")
     r = client.get("/health")
     check("health returns 200 immediately", r.status_code == 200)
@@ -518,32 +609,39 @@ with TestClient(app) as client:
     r = client.post("/upload", files={"files": ("uploaded book.pdf", pdf_bytes, "application/pdf")})
     check("upload returns 202", r.status_code == 202)
     body = r.json()
-    check("upload reports the stored filename",
-          body["accepted"][0]["filename"] == "uploaded book.pdf")
+    stored_name = body["accepted"][0]["filename"]
+    # Uploads land in the uploader's own folder, and the document's identity is that path.
+    check("upload stores the file under the uploader's folder",
+          stored_name == f"users/{alice_id}/uploaded book.pdf")
     check("the PDF is written into the data folder",
-          (TEST_DATA_DIR / "uploaded book.pdf").exists())
+          (TEST_DATA_DIR / "users" / alice_id / "uploaded book.pdf").exists())
     job = wait_for_ingest(client)
     check("the uploaded file is indexed",
-          any(res["filename"] == "uploaded book.pdf" and res["status"] == "ingested"
+          any(res["filename"] == stored_name and res["status"] == "ingested"
               for res in job["results"]))
     check("it now appears in /stats",
-          "uploaded book.pdf" in {d["filename"] for d in client.get("/stats").json()["documents"]})
+          stored_name in {d["filename"] for d in client.get("/stats").json()["documents"]})
+    check("it appears in /api/documents too",
+          stored_name in {d["filename"] for d in client.get("/api/documents").json()["documents"]})
 
     # Same name twice must not overwrite - the second becomes " (2)".
     r = client.post("/upload", files={"files": ("uploaded book.pdf", pdf_bytes, "application/pdf")})
+    second_name = r.json()["accepted"][0]["filename"]
     check("a colliding name is renamed, not overwritten",
-          r.json()["accepted"][0]["filename"] == "uploaded book (2).pdf")
+          second_name == f"users/{alice_id}/uploaded book (2).pdf")
     job = wait_for_ingest(client)
     # One of the two identical copies is skipped rather than indexed a second time; which
-    # of them wins depends on scan order, and either is correct.
+    # of them wins depends on scan order, and either is correct. (Deduplication is scoped
+    # per owner - see the cross-user check further down.)
     twins = {res["filename"]: res["status"] for res in job["results"]
-             if res["filename"].startswith("uploaded book")}
+             if "uploaded book" in res["filename"]}
     check("byte-identical content is skipped as a duplicate rather than indexed twice",
           "skipped" in twins.values() and "ingested" not in list(twins.values())[1:])
 
     r = client.post("/upload", files={"files": ("fake.pdf", b"MZ this is not a pdf at all", "application/pdf")})
     check("content that is not a PDF is refused despite the .pdf name", r.status_code == 400)
-    check("the refused file is not left on disk", not (TEST_DATA_DIR / "fake.pdf").exists())
+    check("the refused file is not left on disk",
+          not (TEST_DATA_DIR / "users" / alice_id / "fake.pdf").exists())
 
     # The cap is read from the module namespace, so it can be lowered here instead of
     # actually pushing 100MB through the test.
@@ -552,9 +650,11 @@ with TestClient(app) as client:
     try:
         r = client.post("/upload", files={"files": ("huge.pdf", b"%PDF-1.4\n" + b"x" * 5000, "application/pdf")})
         check("a file over the size cap is refused", r.status_code == 400)
-        check("no partial file is left behind", not (TEST_DATA_DIR / "huge.pdf").exists())
+        check("no partial file is left behind",
+              not (TEST_DATA_DIR / "users" / alice_id / "huge.pdf").exists())
         check("no .part temp file is left behind",
-              not any(f.name.startswith(".upload-") for f in TEST_DATA_DIR.iterdir()))
+              not any(f.name.startswith(".upload-")
+                      for f in (TEST_DATA_DIR / "users" / alice_id).iterdir()))
     finally:
         uploads.MAX_UPLOAD_BYTES = original_cap
 
@@ -564,19 +664,19 @@ with TestClient(app) as client:
     print("\n--- delete endpoint ---")
     # The duplicate copy is on disk but was never indexed; deleting it must still work,
     # otherwise a skipped file could never be removed from the UI.
-    r = client.delete("/documents/uploaded book (2).pdf")
+    r = client.delete(f"/documents/{second_name}")
     check("an un-indexed file on disk can still be deleted", r.status_code == 200)
     check("that PDF is gone from the data folder",
-          not (TEST_DATA_DIR / "uploaded book (2).pdf").exists())
+          not (TEST_DATA_DIR / "users" / alice_id / "uploaded book (2).pdf").exists())
 
-    r = client.delete("/documents/uploaded book.pdf")
+    r = client.delete(f"/documents/{stored_name}")
     check("delete returns 200", r.status_code == 200)
     check("the PDF is gone from the data folder",
-          not (TEST_DATA_DIR / "uploaded book.pdf").exists())
+          not (TEST_DATA_DIR / "users" / alice_id / "uploaded book.pdf").exists())
     remaining = {d["filename"] for d in client.get("/stats").json()["documents"]}
-    check("it is gone from /stats", "uploaded book.pdf" not in remaining)
+    check("it is gone from /stats", stored_name not in remaining)
     check("its chunks are gone from the store",
-          all(c["source"] != "uploaded book.pdf" for c in vectorstore.all_chunks()))
+          all(c["source"] != stored_name for c in vectorstore.all_chunks()))
     check("other documents are untouched", "sample.pdf" in remaining)
 
     check("deleting something that isn't there is a 404",
@@ -617,5 +717,111 @@ with TestClient(app) as client:
     finally:
         ing.ingest_data_folder = real_scan
         ing._consume_rescan_request()     # leave no flag set for later checks
+
+    print("\n--- multi-tenant isolation: two users, two documents ---")
+    from src.services import retrieval as retrieval_mod
+
+    r = client.post("/api/signup", json={"username": "bob", "password": "bobpassword1"})
+    check("a second account can be created", r.status_code == 201)
+    bob_token = r.json()["access_token"]
+    BOB = {"Authorization": f"Bearer {bob_token}"}
+    bob_id = client.get("/api/me", headers=BOB).json()["id"]
+    check("the two accounts have different ids", bob_id != alice_id)
+
+    # Byte-identical to alice's fixture on purpose: globally-scoped deduplication would
+    # skip it, leaving bob with a document he can neither see nor search.
+    same_bytes = (TEST_DATA_DIR / "sample.pdf").read_bytes()
+    r = client.post("/upload", files={"files": ("shared title.pdf", same_bytes, "application/pdf")},
+                    headers=BOB)
+    check("bob can upload", r.status_code == 202)
+    bob_doc = r.json()["accepted"][0]["filename"]
+    check("bob's upload lands in bob's folder", bob_doc == f"users/{bob_id}/shared title.pdf")
+    job = wait_for_ingest(client, headers=BOB)
+    check("the same bytes are still indexed for a different owner - dedupe is per user",
+          any(res["filename"] == bob_doc and res["status"] == "ingested"
+              for res in job["results"]))
+
+    alice_docs = {d["filename"] for d in client.get("/stats").json()["documents"]}
+    bob_docs = {d["filename"] for d in client.get("/stats", headers=BOB).json()["documents"]}
+    check("bob sees his own document", bob_doc in bob_docs)
+    check("bob does not see alice's documents", not (bob_docs & alice_docs))
+    check("alice does not see bob's document", bob_doc not in alice_docs)
+    check("/api/documents is scoped too",
+          {d["filename"] for d in client.get("/api/documents", headers=BOB).json()["documents"]}
+          == bob_docs)
+
+    # ---- the three isolation points, each checked on its own ----
+    question = "How many tags did the team deploy?"
+
+    dense = vectorstore.query_chunks(question, top_k=20, user_id=bob_id)
+    check("vector search returns only the caller's chunks",
+          dense and all(c["user_id"] == bob_id for c in dense))
+
+    lexical = bm25.search(question, limit=20, user_id=bob_id)
+    check("BM25 returns only the caller's chunks",
+          lexical and all(c["user_id"] == bob_id for c, _ in lexical))
+
+    # Neighbour expansion is the sneaky one: it fetches by chunk_index, not by search.
+    neighbours = vectorstore.get_neighbors_bulk({bob_doc: {0, 1, 2}}, user_id=alice_id)
+    check("neighbour expansion cannot reach another user's chunks", neighbours == {})
+    own_neighbours = vectorstore.get_neighbors_bulk({bob_doc: {0, 1}}, user_id=bob_id)
+    check("neighbour expansion still works for your own document", len(own_neighbours) > 0)
+
+    bob_hits = retrieval_mod.retrieve(question, top_k=6, user_id=bob_id)
+    check("end-to-end retrieval returns only bob's chunks",
+          bob_hits and all(c["user_id"] == bob_id for c in bob_hits))
+    check("and only from bob's document",
+          {c["source"] for c in bob_hits} == {bob_doc})
+
+    alice_hits = retrieval_mod.retrieve(question, top_k=6, user_id=alice_id)
+    check("alice's identical question never reaches bob's document",
+          all(c["source"] != bob_doc for c in alice_hits))
+
+    r = client.post("/chat", json={"question": question}, headers=BOB)
+    check("/chat answers bob from his own document only",
+          r.status_code == 200
+          and {s["source"] for s in r.json()["sources"]} <= {bob_doc})
+
+    # ---- cross-user writes ----
+    check("alice cannot delete bob's document (404, not 403)",
+          client.delete(f"/documents/{bob_doc}").status_code == 404)
+    check("bob's document survived that attempt",
+          bob_doc in {d["filename"] for d in client.get("/stats", headers=BOB).json()["documents"]})
+    check("a traversal out of your own folder is refused",
+          client.delete(f"/documents/users/{bob_id}/../../sample.pdf").status_code in (400, 404))
+
+    # ---- the job's progress must not name other people's files ----
+    status_for_bob = client.get("/ingest/status", headers=BOB).json()
+    check("job results are filtered to the caller",
+          all(res.get("user_id") == bob_id for res in status_for_bob.get("results", [])))
+
+    # ---- tokens ----
+    from src.services import security as security_mod
+
+    forged = security_mod.create_access_token(bob_id, "bob")["access_token"]
+    check("a token signed with the right key works",
+          client.get("/api/me", headers={"Authorization": f"Bearer {forged}"}).status_code == 200)
+
+    import jose.jwt as _jwt
+    wrong_key = _jwt.encode({"sub": bob_id, "username": "bob"}, "a-different-secret",
+                            algorithm="HS256")
+    check("a token signed with a different key is rejected",
+          client.get("/api/me",
+                     headers={"Authorization": f"Bearer {wrong_key}"}).status_code == 401)
+
+    unknown = security_mod.create_access_token("6a" * 12, "ghost")["access_token"]
+    check("a validly-signed token for a deleted account is rejected",
+          client.get("/api/me", headers={"Authorization": f"Bearer {unknown}"}).status_code == 401)
+
+    print("\n--- password hashing ---")
+    h = security_mod.hash_password("correct horse battery staple")
+    check("the hash is not the password", "correct horse" not in h)
+    check("argon2id is used", h.startswith("$argon2id$"))
+    check("the right password verifies", security_mod.verify_password("correct horse battery staple", h))
+    check("the wrong password does not", not security_mod.verify_password("wrong", h))
+    check("a corrupt stored hash fails closed rather than raising",
+          not security_mod.verify_password("anything", "not-a-hash"))
+    check("two hashes of the same password differ (salted)",
+          security_mod.hash_password("same") != security_mod.hash_password("same"))
 
 print(f"\nAll {PASSED} checks passed.")

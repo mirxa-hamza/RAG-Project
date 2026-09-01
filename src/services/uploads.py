@@ -27,7 +27,7 @@ import shutil
 import tempfile
 import unicodedata
 from pathlib import Path
-from typing import BinaryIO, Tuple
+from typing import BinaryIO, Optional, Tuple
 
 from src.core.config import DATA_DIR, MAX_UPLOAD_BYTES
 from src.core.logging import get_logger
@@ -75,43 +75,68 @@ def safe_filename(raw: str) -> str:
     return f"{stem[:120]}.pdf"
 
 
-def unique_path(filename: str) -> Tuple[Path, str]:
+def upload_dir(user_id: Optional[str]) -> Path:
     """
-    Resolves a free path inside DATA_DIR. Returns (path, final_filename).
+    Where a user's uploads live: data/users/<user_id>/.
 
-    An existing name is never overwritten - two people uploading different books both
-    called "notes.pdf" would otherwise silently destroy one of them. The second becomes
-    "notes (2).pdf", which is also what a browser download does.
+    Per-user folders are not cosmetic. They keep two people's "notes.pdf" apart, they make
+    ownership recoverable from the path when the manifest is stale, and they scope
+    duplicate detection - globally, the second person to upload a given book would get a
+    "skipped" document they could never see.
     """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not user_id:
+        return DATA_DIR
+    # The id comes from a Mongo ObjectId (24 hex chars), never from the client, but this
+    # value becomes a directory name, so it is validated rather than trusted.
+    ident = str(user_id)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", ident):
+        raise UploadError("Invalid user id.")
+    return DATA_DIR / "users" / ident
+
+
+def unique_path(filename: str, user_id: Optional[str] = None) -> Tuple[Path, str]:
+    """
+    Resolves a free path inside the user's folder. Returns (path, name_relative_to_DATA_DIR).
+
+    An existing name is never overwritten - the same person uploading two different books
+    both called "notes.pdf" would otherwise silently destroy one of them. The second
+    becomes "notes (2).pdf", which is also what a browser download does.
+    """
+    folder = upload_dir(user_id)
+    folder.mkdir(parents=True, exist_ok=True)
+
     stem = filename[:-4]
-    candidate = DATA_DIR / filename
+    candidate = folder / filename
     counter = 2
     while candidate.exists():
-        candidate = DATA_DIR / f"{stem} ({counter}).pdf"
+        candidate = folder / f"{stem} ({counter}).pdf"
         counter += 1
 
-    final = candidate.name
-    # Belt and braces: whatever the name did, the result has to be directly inside DATA_DIR.
-    if candidate.resolve().parent != DATA_DIR.resolve():
+    # Belt and braces: whatever the name did, the result has to be inside the user's folder.
+    if candidate.resolve().parent != folder.resolve():
         raise UploadError("Invalid filename.")
+
+    # Documents are identified everywhere by their POSIX path relative to DATA_DIR
+    # ("users/<id>/book.pdf"), which is what carries the owner.
+    final = candidate.resolve().relative_to(DATA_DIR.resolve()).as_posix()
     return candidate, final
 
 
-def save_pdf(stream: BinaryIO, raw_filename: str) -> dict:
+def save_pdf(stream: BinaryIO, raw_filename: str, user_id: Optional[str] = None) -> dict:
     """
-    Streams one uploaded PDF into DATA_DIR.
+    Streams one uploaded PDF into the uploader's folder under DATA_DIR.
 
-    Returns {"filename": <name on disk>, "bytes": <size>}; raises UploadError with a
-    user-facing message on anything invalid.
+    Returns {"filename": <path relative to DATA_DIR>, "bytes": <size>}; raises UploadError
+    with a user-facing message on anything invalid.
     """
     filename = safe_filename(raw_filename)
-    destination, final_name = unique_path(filename)
+    destination, final_name = unique_path(filename, user_id)
+    folder = destination.parent
+    folder.mkdir(parents=True, exist_ok=True)
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     # Same directory as the destination so the final rename is atomic (a cross-device
     # rename is not, and would leave a partially visible file).
-    fd, temp_path = tempfile.mkstemp(prefix=".upload-", suffix=".part", dir=str(DATA_DIR))
+    fd, temp_path = tempfile.mkstemp(prefix=".upload-", suffix=".part", dir=str(folder))
     written = 0
     header = b""
 
@@ -147,11 +172,12 @@ def save_pdf(stream: BinaryIO, raw_filename: str) -> dict:
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)   # never leave a partial upload behind
 
-    log.info("Uploaded '%s' (%.1f MB) into the data folder.", final_name, written / 1e6)
+    log.info("Uploaded '%s' (%.1f MB)%s", final_name, written / 1e6,
+             f" for user {user_id}" if user_id else " (no owner)")
     return {"filename": final_name, "bytes": written}
 
 
-def resolve_document(filename: str) -> Path:
+def resolve_document(filename: str, user_id: Optional[str] = None) -> Path:
     """
     Maps a document name from a request onto its file inside DATA_DIR.
 
@@ -165,18 +191,25 @@ def resolve_document(filename: str) -> Path:
         raise UploadError("Invalid document name.")
     if candidate.suffix.lower() != ".pdf":
         raise UploadError("Only PDF documents can be removed this way.")
+    if user_id is not None:
+        # Ownership is checked against the resolved path, after symlinks and "..", so a
+        # crafted name cannot point at someone else's file from inside your own folder.
+        owner_root = upload_dir(user_id).resolve()
+        if owner_root not in candidate.parents:
+            raise UploadError("Invalid document name.")
     return candidate
 
 
-def delete_document(filename: str) -> bool:
+def delete_document(filename: str, user_id: Optional[str] = None) -> bool:
     """Deletes the PDF from DATA_DIR. Returns False if it was already gone."""
-    path = resolve_document(filename)
+    path = resolve_document(filename, user_id)
     if not path.exists():
         return False
     path.unlink()
     # Tidy up a subfolder that the deletion just emptied; ignore anything still in use.
+    # A user's own folder is kept even when empty - they will upload again.
     parent = path.parent
-    if parent != DATA_DIR.resolve():
+    if parent != DATA_DIR.resolve() and parent != upload_dir(user_id).resolve():
         try:
             parent.rmdir()
         except OSError:

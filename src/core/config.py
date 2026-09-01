@@ -67,6 +67,18 @@ MANIFEST_PATH = CHROMA_DIR / "manifest.json"
 # deleted rather than being written to disk first and measured afterwards.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
 
+# ---------------------------------------------------------------- Auth (MongoDB + JWT)
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB = os.getenv("MONGO_DB", "rag_app")
+USERS_COLLECTION = os.getenv("USERS_COLLECTION", "users")
+
+# Signing key for JWTs. Generated on first run and written to .env if absent (see
+# src/services/security.py) - a key that changed on every restart would silently log
+# everyone out, and a hard-coded default would let anyone mint a valid token.
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "12"))
+
 # ---------------------------------------------------------------- Chunking
 # 300 words is ~400 tokens for ordinary prose, but dense technical pages (formulae,
 # hyphenated terms, tables) tokenise far worse - the ingest log has shown 616 tokens for a

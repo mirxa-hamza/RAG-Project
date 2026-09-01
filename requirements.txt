@@ -13,3 +13,11 @@ python-dotenv==1.0.1
 rank-bm25==0.2.2
 # Multipart form parsing - required by FastAPI for the PDF upload endpoint.
 python-multipart==0.0.20
+# --- Authentication -------------------------------------------------------------------
+# Async MongoDB driver (pymongo comes with it, and is used directly for ObjectId/errors).
+motor==3.7.1
+# JWT encode/decode. [cryptography] pulls the backend jose needs for HS256.
+python-jose[cryptography]==3.5.0
+# Password hashing with Argon2id. Deliberately NOT passlib: it is unmaintained and breaks
+# against recent bcrypt releases.
+pwdlib[argon2]==0.3.1

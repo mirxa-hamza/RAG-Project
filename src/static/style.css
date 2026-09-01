@@ -144,6 +144,9 @@ svg {
   grid-template-areas: "topbar topbar" "sidebar chat";
   height: 100dvh;
 }
+/* `display: grid` beats the hidden attribute on its own, and the app is hidden until a
+   session exists. */
+.app[hidden] { display: none; }
 
 /* Collapsed: the column narrows to an icon rail. The sidebar stays on screen and keeps
    its buttons - only the labels, the document list and the scope selector go - so adding
@@ -206,7 +209,7 @@ svg {
   z-index: 30;
 }
 
-.topbar__right { margin-left: auto; }
+.topbar__right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 
 .brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
 
@@ -634,6 +637,96 @@ svg {
 }
 .md pre code { background: none; border: 0; padding: 0; color: inherit; }
 
+/* ── Auth screen ───────────────────────────────────────────────
+   Covers everything until a session exists. Same tokens as the app, so signing in does not
+   feel like a different product. */
+.auth {
+  position: fixed; inset: 0; z-index: 70;
+  display: grid; place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  overflow-y: auto;
+}
+.auth[hidden] { display: none; }
+
+.auth__card {
+  width: 100%; max-width: 380px;
+  padding: 28px 26px 22px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-md);
+  animation: card-in var(--t-base) var(--ease-out);
+}
+
+.auth__mark {
+  display: grid; place-items: center;
+  width: 46px; height: 46px; margin-bottom: 16px;
+  border-radius: var(--r-md);
+  background: var(--primary); color: #fff;
+}
+.auth__mark svg { width: 24px; height: 24px; }
+
+.auth__title { font-size: 20px; margin-bottom: 5px; }
+.auth__text { font-size: 13px; color: var(--text-muted); margin-bottom: 20px; }
+
+.auth__form { display: flex; flex-direction: column; gap: 13px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+
+.input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+.input:focus { outline: none; border-color: var(--primary); box-shadow: var(--ring); }
+.input:disabled { background: var(--n-50); color: var(--text-subtle); }
+
+.auth__error {
+  font-size: 12.5px; line-height: 1.5; color: var(--danger);
+  min-height: 1.2em;
+}
+.auth__error:empty { min-height: 0; }
+
+.auth__switch {
+  margin-top: 16px; padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12.5px; color: var(--text-muted);
+  text-align: center;
+}
+
+.linkish {
+  padding: 2px 4px;
+  color: var(--primary); background: none; border: 0;
+  font-size: inherit; font-weight: 500;
+  cursor: pointer; border-radius: 5px;
+}
+.linkish:hover { text-decoration: underline; }
+
+/* ── Signed-in identity in the top bar ─────────────────────────── */
+.who {
+  display: inline-flex; align-items: center; gap: 8px;
+  max-width: 190px;
+  padding: 4px 12px 4px 4px;
+  background: var(--n-50);
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  font-size: 12.5px; font-weight: 500;
+}
+.who__avatar {
+  display: grid; place-items: center;
+  width: 24px; height: 24px; flex: none;
+  border-radius: 50%;
+  background: var(--primary); color: #fff;
+  font-size: 11.5px; font-weight: 600;
+}
+.who__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ── Modal (upload) ────────────────────────────────────────────
    A native <dialog>, so focus trapping, Esc-to-close and stacking come from the browser. */
 .modal {
@@ -762,6 +855,10 @@ svg {
      at a time up to here; script.js only turns overflow back on once it is full, so a
      one-line question never shows a scrollbar. */
   max-height: 116px;
+  /* One line plus the vertical padding. A floor as well as a ceiling, so the box can never
+     collapse - JS writes an inline height, and a measurement taken while the app was
+     hidden used to write 0. */
+  min-height: 48px;
   border: 0; background: none; resize: none;
   overflow-y: hidden;
   font-size: 14.5px; line-height: 1.55;
@@ -867,6 +964,8 @@ svg {
   .brand__tag { display: none; }
   .status-dot__label { display: none; }
   .status-dot { padding: 6px; }
+  .who { max-width: none; padding: 3px; }
+  .who__name { display: none; }
 
   .sidebar {
     position: fixed;

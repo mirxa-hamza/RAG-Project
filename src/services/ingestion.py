@@ -29,6 +29,42 @@ log = get_logger(__name__)
 
 _HASH_CHUNK = 1024 * 1024  # 1MB reads while fingerprinting
 
+# Uploads live in data/users/<user_id>/<filename>, so a document's owner is recoverable
+# from its path alone. That matters after a crash: the manifest may be stale, but the
+# filesystem still says whose file this is.
+USERS_DIRNAME = "users"
+
+
+def user_dir(user_id: str):
+    """The folder a user's uploads live in."""
+    return DATA_DIR / USERS_DIRNAME / str(user_id)
+
+
+def owner_of(filename: str) -> Optional[str]:
+    """
+    Who a document belongs to: the user named by its path, or - for a file copied into
+    data/ by hand or indexed by the CLI - the owner of record (the first account created).
+
+    Ownerless documents are invisible to every filter, so a PDF dropped into data/ after
+    the first signup would otherwise be indexed and then seen by nobody.
+    """
+    from src.services import ownership
+
+    return owner_from_path(filename) or ownership.owner_of_record()
+
+
+def owner_from_path(filename: str) -> Optional[str]:
+    """
+    'users/652.../book.pdf' -> '652...'; anything else -> None (an ownerless document).
+
+    Ownership is derived from the path rather than trusted from the manifest, so a
+    hand-edited or half-written manifest cannot hand one user another user's document.
+    """
+    parts = filename.split("/")
+    if len(parts) >= 3 and parts[0] == USERS_DIRNAME and parts[1]:
+        return parts[1]
+    return None
+
 
 # --------------------------------------------------------------------- helpers
 
@@ -84,6 +120,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     """
     path = DATA_DIR / filename
     fingerprint = fingerprint or _fingerprint(path)
+    owner = owner_of(filename)
 
     if on_stage:
         on_stage("extracting", 0, 0)
@@ -94,6 +131,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     if not pages:
         return {
             "filename": filename,
+            "user_id": owner,
             "status": "skipped",
             "reason": "no extractable text - likely a scanned/image PDF (no OCR yet)",
         }
@@ -113,6 +151,11 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     # the whole file finishes - never gets written. The next run therefore treats the file
     # as "new" and re-embeds it from scratch under a fresh run_id, so without this delete
     # the abandoned chunks would pile up as duplicates on every interrupted attempt.
+    # Unscoped by owner ON PURPOSE. A document's name is its path relative to data/, and
+    # uploads live under users/<id>/, so one document's name can never match another
+    # user's file. Scoping the delete by owner would leave behind chunks written before an
+    # owner existed - an interrupted pre-auth ingest, for instance - which no later delete
+    # would ever match.
     delete_source(filename)
 
     if on_stage:
@@ -122,6 +165,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
         stored = add_chunks(
             filename, chunks,
             on_progress=(lambda done, total: on_stage("embedding", done, total)) if on_stage else None,
+            user_id=owner,
         )
 
     manifest.put(
@@ -131,10 +175,12 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
         size=fingerprint["size"],
         pages=len(pages),
         chunks=stored,
+        user_id=owner,
     )
 
     return {
         "filename": filename,
+        "user_id": owner,
         "status": "ingested",
         "reason": reason,
         "pages": len(pages),
@@ -154,14 +200,16 @@ def prune_deleted(present: List[str]) -> List[Dict]:
     for filename in manifest.sources():
         if filename in present:
             continue
+        owner = owner_of(filename)
         log.info("'%s' is gone from the data folder - removing it from the store.", filename)
         try:
-            delete_source(filename)
+            delete_source(filename)   # unscoped: see the note in ingest_one()
             manifest.remove(filename)
-            removed.append({"filename": filename, "status": "removed"})
+            removed.append({"filename": filename, "user_id": owner, "status": "removed"})
         except Exception as exc:
             log.exception("Failed to remove '%s'", filename)
-            removed.append({"filename": filename, "status": "remove_failed", "error": str(exc)})
+            removed.append({"filename": filename, "user_id": owner,
+                            "status": "remove_failed", "error": str(exc)})
     return removed
 
 
@@ -180,7 +228,7 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[D
     """
     filenames = _pdf_filenames()
     results: List[Dict] = list(prune_deleted(filenames))
-    seen_hashes: Dict[str, str] = {}
+    seen_hashes: Dict[tuple, str] = {}
 
     for index, filename in enumerate(filenames):
         if progress:
@@ -190,22 +238,30 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[D
             fingerprint = _fingerprint(DATA_DIR / filename)
         except OSError as exc:
             log.warning("Could not read '%s': %s", filename, exc)
-            results.append({"filename": filename, "status": "failed", "error": str(exc)})
+            results.append({"filename": filename, "user_id": owner_of(filename),
+                            "status": "failed", "error": str(exc)})
             continue
 
         # Same bytes under two names would be indexed twice and then compete with itself
         # for every retrieval slot, crowding out other documents.
-        twin = seen_hashes.get(fingerprint["sha256"])
+        #
+        # Scoped PER OWNER: globally, two users uploading the same textbook would leave the
+        # second one with a "skipped" document they can never see or search, because the
+        # only stored copy belongs to somebody else.
+        owner = owner_of(filename)
+        dedupe_key = (owner, fingerprint["sha256"])
+        twin = seen_hashes.get(dedupe_key)
         if twin:
             log.warning("'%s' is byte-identical to '%s' - skipping the duplicate.", filename, twin)
-            results.append({"filename": filename, "status": "skipped",
+            results.append({"filename": filename, "user_id": owner, "status": "skipped",
                             "reason": f"duplicate of '{twin}'"})
             continue
-        seen_hashes[fingerprint["sha256"]] = filename
+        seen_hashes[dedupe_key] = filename
 
         reason = "forced" if force else _needs_ingest(filename, fingerprint)
         if reason is None:
-            results.append({"filename": filename, "status": "already_stored"})
+            results.append({"filename": filename, "user_id": owner_of(filename),
+                            "status": "already_stored"})
             continue
 
         log.info("Ingesting '%s' (%s)...", filename, reason)
@@ -220,8 +276,8 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None) -> List[D
             # Corrupt file, encrypted PDF, unreadable bytes, OOM on one monster document -
             # report it and carry on with the rest of the corpus.
             log.exception("Failed to ingest '%s'", filename)
-            result = {"filename": filename, "status": "failed", "error":
-                      f"{type(exc).__name__}: {exc}"}
+            result = {"filename": filename, "user_id": owner_of(filename),
+                      "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
         log.info("%s", result)
         results.append(result)
@@ -249,9 +305,35 @@ _state: Dict = {
 }
 
 
-def job_status() -> Dict:
+def job_status(user_id: Optional[str] = None) -> Dict:
+    """
+    The job's state. With a user_id, it is redacted to what that user may know.
+
+    The job is global - one thread indexes everybody's uploads - but its progress is not
+    public: `current_file` and `results` would otherwise tell you the filenames of every
+    other user's documents. Someone else's file in progress is reported as busy with no
+    name, so the UI can still say "indexing" without naming what.
+    """
     with _lock:
-        return dict(_state)
+        snapshot = dict(_state)
+
+    if user_id is None:
+        return snapshot
+
+    results = [r for r in snapshot.get("results", []) if r.get("user_id") == user_id]
+    mine = owner_from_path(snapshot.get("current_file") or "") == user_id
+
+    snapshot["results"] = results
+    if not mine:
+        snapshot["current_file"] = None
+        snapshot["stage"] = None
+        snapshot["chunks_done"] = 0
+        snapshot["chunks_total"] = 0
+        # Progress counts describe the whole queue, most of which may not be theirs.
+        snapshot["files_done"] = 0
+        snapshot["files_total"] = 0
+        snapshot["other_user_busy"] = snapshot["state"] == "running"
+    return snapshot
 
 
 def is_running() -> bool:

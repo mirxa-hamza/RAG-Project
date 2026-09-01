@@ -17,6 +17,21 @@ def health():
     return {"status": "ok", "embedding_model_ready": embeddings.is_ready()}
 
 
+@router.get("/api/health/auth")
+async def auth_health():
+    """
+    Whether MongoDB is reachable. The login screen calls this so a failure says "the
+    database is down" rather than "incorrect username or password".
+    """
+    from src.services import database
+
+    try:
+        await database.ping()
+        return {"database": "ok"}
+    except database.DatabaseUnavailable as exc:
+        return {"database": "unavailable", "detail": str(exc)}
+
+
 @router.get("/info")
 def info():
     """Which models this instance is actually running - the first thing to check when

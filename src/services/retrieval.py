@@ -62,7 +62,8 @@ def fuse(ranked_lists: List[List[Dict]], k: int = RRF_K) -> List[Dict]:
     return fused
 
 
-def _expand_neighbors(chunks: List[Dict], radius: int) -> List[Dict]:
+def _expand_neighbors(chunks: List[Dict], radius: int,
+                      user_id: Optional[str] = None) -> List[Dict]:
     """
     Adds each hit's neighbouring chunks, keeping documents in reading order.
 
@@ -85,7 +86,7 @@ def _expand_neighbors(chunks: List[Dict], radius: int) -> List[Dict]:
             if offset and index + offset >= 0:
                 bucket.add(index + offset)
 
-    found = vectorstore.get_neighbors_bulk(wanted) if wanted else {}
+    found = vectorstore.get_neighbors_bulk(wanted, user_id=user_id) if wanted else {}
 
     out: List[Dict] = []
     for chunk in chunks:
@@ -113,6 +114,7 @@ def retrieve(
     top_k: int = 4,
     source: Optional[str] = None,
     *,
+    user_id: Optional[str] = None,
     use_rerank: Optional[bool] = None,
     use_hybrid: Optional[bool] = None,
     expand: Optional[int] = None,
@@ -121,7 +123,13 @@ def retrieve(
     Returns the chunks to answer `question` from, best first, or [] when nothing clears
     the relevance floor (the caller should then say so instead of calling the LLM).
 
-    The keyword arguments exist so the eval harness can measure each stage's contribution.
+    `user_id` scopes retrieval to one person's documents and MUST be passed on every
+    request path. It is threaded into all three stages that can reach stored text - the
+    vector query, the BM25 ranking, and neighbour expansion - and asserted again on the
+    way out. Only offline callers with no user (the CLI, eval/run_eval.py) may omit it.
+
+    The remaining keyword arguments exist so the eval harness can measure each stage's
+    contribution.
     """
     use_rerank = RERANK_ENABLED if use_rerank is None else use_rerank
     use_hybrid = HYBRID_ENABLED if use_hybrid is None else use_hybrid
@@ -132,14 +140,16 @@ def retrieve(
     candidate_count = max(RETRIEVAL_CANDIDATES, top_k)
 
     with timed(log, "retrieval"):
-        dense = vectorstore.query_chunks(question, top_k=candidate_count, source=source)
+        dense = vectorstore.query_chunks(question, top_k=candidate_count, source=source,
+                                         user_id=user_id)
         if not dense and not use_hybrid:
             return []
 
         lists = [dense]
         if use_hybrid:
             lexical = [chunk for chunk, _score in
-                       bm25.search(question, limit=candidate_count, source=source)]
+                       bm25.search(question, limit=candidate_count, source=source,
+                                   user_id=user_id)]
             if lexical:
                 lists.append(lexical)
             log.debug("candidates: %d dense, %d lexical", len(dense), len(lexical))
@@ -170,4 +180,18 @@ def retrieve(
             candidates = floored
 
         hits = candidates[:top_k]
-        return _expand_neighbors(hits, expand)
+        expanded = _expand_neighbors(hits, expand, user_id=user_id)
+
+        # Defence in depth. Every stage above already filters by owner; this catches the
+        # case where a future stage forgets to. It is cheap (a list comprehension over at
+        # most a few dozen dicts) and it turns a silent data leak into a loud log line.
+        if user_id:
+            clean = [c for c in expanded if c.get("user_id") == user_id]
+            if len(clean) != len(expanded):
+                log.error(
+                    "Retrieval returned %d chunk(s) not owned by %s - dropped. This is a "
+                    "bug in an isolation filter, not a normal condition.",
+                    len(expanded) - len(clean), user_id,
+                )
+            return clean
+        return expanded

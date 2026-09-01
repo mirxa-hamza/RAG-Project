@@ -16,13 +16,11 @@ uploaded through `POST /upload` from the web UI. Nothing is ever embedded straig
 request body — `/upload` validates and writes the file, then the normal ingestion job picks
 it up off disk like any other PDF.
 
-Browser upload was added deliberately (2026-09-01), replacing an earlier rule that there
-should be no upload endpoint at all. The trade-off that rule protected is still real and
-worth restating: **there is no authentication anywhere in this app**, so anyone who can
-reach it can now add documents to the corpus and delete them, PDF and all, from the
-server's disk. That is acceptable on localhost and not acceptable on a public address. Put
-it behind auth before exposing it, or set `UPLOAD_ENABLED=false` if that switch has been
-added by then.
+**The app is multi-tenant.** Accounts live in MongoDB; every route that touches documents
+requires a signed-in user; every document belongs to exactly one account and is invisible
+to every other. Uploads land in `data/users/<user_id>/`, and every stored chunk carries a
+`user_id` in its metadata. Read the isolation rules in Conventions before touching
+retrieval, ingestion or any endpoint — a missed filter there is a data breach, not a bug.
 
 Pipeline:
 
@@ -51,8 +49,11 @@ src/
   api/                 HTTP layer - thin handlers, one module per endpoint group
     __init__.py        aggregates the routers into `api_router`
     chat.py            /chat, /chat/stream (SSE)
-    documents.py       /ingest, /ingest/status, /stats, /reset, /upload, DELETE /documents/{name}
-    system.py          /health, /info
+    documents.py       /ingest, /ingest/status, /stats, /api/documents, /reset, /upload,
+                       DELETE /documents/{name}   (all require a signed-in user)
+    system.py          /health, /info, /api/health/auth (is MongoDB reachable?)
+  api/deps.py          get_current_user - the single auth gate every document route uses
+  api/auth.py          /api/signup, /api/login, /api/me
   core/                cross-cutting: imported by everything else
     config.py          every setting; paths resolve against PROJECT_ROOT, not the CWD
     logging.py         logging config + `timed()` context manager
@@ -63,6 +64,9 @@ src/
     reranker.py        lazy cross-encoder singleton, degrades gracefully if unavailable
     llm.py             grounded prompt, Groq call (sync + streaming), follow-up rewriting
   services/            pipeline logic
+    database.py        Motor client + the users collection (accounts only live here)
+    security.py        Argon2id hashing (pwdlib) + JWT encode/decode
+    ownership.py       one-off adoption of pre-auth documents; the "owner of record"
     ingestion.py       single entry point for documents + background job state machine
     uploads.py         validates + writes browser uploads into DATA_DIR; deletes documents
     manifest.py        JSON sidecar: what's ingested, with content hashes
@@ -79,12 +83,48 @@ eval/
   golden_questions.json  golden set (currently fixture questions - replace with real ones)
   run_eval.py            hit-rate@k, MRR, refusal rate, optional LLM-as-judge
 tests/
-  test_pipeline_offline.py   126 checks, offline, no Groq key needed
-data/                  real PDFs the user drops here - the live ingestion source, gitignored
+  test_pipeline_offline.py   175 checks, offline; no Groq key and no MongoDB needed
+data/                  the live ingestion source, gitignored
+  users/<user_id>/     one folder per account: everything uploaded through the web UI
+  <anything else>      hand-copied PDFs; owned by the "owner of record" (first account)
 storage/chroma_db/     generated index state, gitignored
 requirements.txt / requirements-dev.txt / .env.example / .env   (project root)
 refrence/              third-party reference project kept for study; gitignored
 ```
+
+## Isolation (read this before touching retrieval or any endpoint)
+
+A user must never see, search, or delete another user's document. Four rules make that
+true, and all four are load-bearing:
+
+1. **Every stored chunk carries `user_id` in its Chroma metadata**, written by
+   `vectorstore.add_chunks`. A chunk without one is owned by nobody and matches no filter.
+2. **Three separate stages can reach stored text, and each filters independently:**
+   - `vectorstore.query_chunks` — Chroma `where` clause (isolation point 1)
+   - `bm25.search` — the BM25 index is built over the WHOLE corpus for cost reasons, so it
+     filters the ranking in memory, *before* applying the limit (isolation point 2)
+   - `vectorstore.get_neighbors_bulk` — fetches by `chunk_index`, bypassing search
+     entirely, so it needs its own owner clause (isolation point 3)
+   Filtering only the first is the classic mistake: the answer still leaks through BM25 or
+   through the neighbour of a legitimate hit.
+3. **`retrieval.retrieve()` re-checks ownership on the way out** and logs an error if
+   anything slipped through. That assertion is a smoke alarm, not the fix.
+4. **Ownership is derived from the document's path** (`ingestion.owner_from_path`), not
+   from a field a request can set. Uploads go to `data/users/<user_id>/`, and the API
+   attaches the *authenticated* caller's id, never anything from the request body.
+
+Endpoint rules that follow from it:
+
+- **Every document route depends on `get_current_user`.** There is deliberately no
+  "optional user" dependency: a route that can run without one is a route that can leak.
+- **Someone else's document is a 404, never a 403.** A 403 confirms it exists.
+- **`/stats`, `/api/documents` and `/ingest/status` are all filtered.** The job is global -
+  one thread indexes everybody's uploads - so `job_status(user_id)` redacts `current_file`
+  and `results`; another user's file in progress shows as busy with no name.
+- **`/reset` rebuilds only the caller's documents.** It used to wipe the whole store, which
+  with several accounts would throw away everyone else's work.
+- **Deduplication is per owner.** Globally, the second person to upload a given book got a
+  `skipped` document they could never see, because the only stored copy was someone else's.
 
 ## Conventions
 
@@ -160,7 +200,22 @@ refrence/              third-party reference project kept for study; gitignored
 - **HTML is served `no-cache`; CSS and JS are cache-busted with `?v=N` in `index.html`.**
   Chrome served a cached `index.html` against a freshly updated `style.css` once and the new
   markup rendered completely unstyled. Bump the `?v=` number whenever you change either
-  static asset.
+  static asset (currently `?v=12`).
+- **Auth code: `pwdlib` with Argon2id, never `passlib`.** passlib is unmaintained and
+  breaks against recent bcrypt releases. `PasswordHash.recommended()` also gives hash
+  migration for free.
+- **`JWT_SECRET` is generated once and persisted to `.env`.** A key regenerated per restart
+  signs everyone out on every reload; a hard-coded default lets anyone mint a token. The
+  decode call pins the algorithm - accepting the token header's `alg` is the classic JWT
+  forgery.
+- **Login failures are indistinguishable.** "No such user" and "wrong password" return the
+  same 401 with the same message, and a missing user still pays for a hash so the timing
+  matches. Anything else enumerates accounts.
+- **Username uniqueness is enforced by a unique Mongo index**, created at startup. The
+  pre-check in the handler is a courtesy; two simultaneous signups both pass it.
+- **Only accounts live in MongoDB.** Documents, vectors and the manifest stay in Chroma and
+  on disk. Splitting one document's identity across two databases means a delete can
+  half-succeed.
 - `data/` and `tests/fixtures/` are strictly separate: `data/` is real user documents;
   `tests/fixtures/` is synthetic PDFs from `make_test_pdf.py`. Never point the fixture
   generator's default output at `data/`.
@@ -189,6 +244,20 @@ Three files, no build step, no framework. Conventions that matter:
   900-page book is not a bar frozen at 0% for five minutes.
 - **`MAX_UPLOAD_MB` comes from `/stats`,** not a hard-coded copy — the client-side size
   check must not drift from the server's real limit.
+- **Every request goes through `authFetch()`**, which attaches the bearer token and treats
+  any 401 as "the session is over". The one exception is the XHR upload (fetch has no
+  upload-progress events), which sets the header by hand and handles 401 itself — if you
+  add a request, use `authFetch`.
+- **The SSE stream carries the token** only because it is read with `fetch()`; `EventSource`
+  cannot set headers. Don't "simplify" it to `EventSource`.
+- **`resetAppState()` runs on every sign-in and sign-out.** Without it the previous
+  account's chat transcript and document rows sit on screen until the first refresh lands,
+  which looks exactly like a leak even though the server sent none of it.
+- **The app is `hidden` until `/api/me` confirms the stored token.** A token in
+  localStorage is not proof of a session - it may be expired or signed with a rotated key.
+  The consequence to remember: while it is hidden, nothing inside it can be measured (see
+  the `autoGrow()` gotcha), so anything that sizes itself from layout must run, or re-run,
+  in `startSession()`.
 
 ## Running it
 
@@ -217,13 +286,22 @@ download).
 Two different questions, two different tools — don't confuse them:
 
 ```bash
-python tests/test_pipeline_offline.py    # does the plumbing work?  (126 checks, offline)
+python tests/test_pipeline_offline.py    # does the plumbing work?  (175 checks, offline)
 python eval/run_eval.py                  # are the answers any good? (needs an index)
 ```
 
 `tests/` stubs `sentence_transformers` (both `SentenceTransformer` and `CrossEncoder`) via
-`sys.modules`, points `DATA_DIR`/`CHROMA_DIR` at temp folders, and drives real HTTP
-endpoints through `TestClient`. It does **not** prove the real models download or that a
+`sys.modules`, substitutes an in-memory fake for the Mongo users collection
+(`database.set_users_collection`), points `DATA_DIR`/`CHROMA_DIR` at temp folders, and
+drives real HTTP endpoints through `TestClient`. Hashing, JWTs, the auth dependency and
+every isolation filter are the real code.
+
+**The isolation checks are the ones that matter.** They sign up two accounts, upload a
+byte-identical document to each, and assert that neither can reach the other's chunks
+through vector search, through BM25, or through neighbour expansion - each verified
+separately, because a single end-to-end check passes even when two of the three filters
+are missing. Sabotaging any one of them makes a specific check fail; if you change
+retrieval, confirm that is still true. It does **not** prove the real models download or that a
 live Groq call succeeds — do a manual smoke test with a real `GROQ_API_KEY` before
 considering a change done.
 
@@ -291,9 +369,27 @@ in `data/` is the single highest-value thing left to do.
   the browser default, a single-line box showed a scrollbar gutter because `scrollHeight`
   rounds past `clientHeight` at fractional line heights. `autoGrow()` switches it to `auto`
   only once the content really exceeds `max-height` (4 lines).
+- **Never measure a hidden element and write the result back.** `autoGrow()` runs at
+  startup, and once the app began starting out `hidden` behind the sign-in screen, its
+  `scrollHeight` was 0 - so it wrote `height: 0px` and the composer stayed collapsed to its
+  padding after login. It now bails out when the element has no layout, refuses to write a
+  zero height, and runs again from `startSession()`; CSS carries a `min-height` floor as
+  the backstop. The same trap applies to any layout measurement taken before sign-in.
 - **The boot overlay starts `hidden` and is revealed only when the app is unusable** —
   server not answering, model still loading, or an ingest running. It must never block on an
   empty index: that would hide the Add documents button that fixes exactly that.
+- **A database outage is a 503 with instructions, not a 500 with a traceback.**
+  `database._guard()` converts pymongo's `ServerSelectionTimeoutError`/`ConnectionFailure`
+  into `DatabaseUnavailable`, and an exception handler in `main.py` renders it as a 503
+  whose message says how to start MongoDB; the sign-in screen shows that text verbatim.
+  Only connection-level failures are converted - `DuplicateKeyError` must keep propagating,
+  or a taken username stops returning 409. Every new Mongo call goes through `_guard`.
+- **A document's owner comes from its path, never from the request.** An upload's owner is
+  the authenticated caller; `owner_from_path()` reads it back off `users/<id>/...`. Trusting
+  a `user_id` field in a request body would let anyone claim anyone's documents.
+- **Deletes by document name are deliberately NOT owner-scoped** (after the ownership check
+  passes). The name is the path, so it can only ever match one user's file - and scoping it
+  would strand chunks written before the document had an owner.
 - **PyMuPDF is AGPL-3.0**, unlike every other dependency here. Fine for personal/local use;
   comply with AGPL or buy a commercial license before shipping this closed-source.
 
@@ -305,8 +401,15 @@ in `data/` is the single highest-value thing left to do.
   scanned PDFs are reported `"status": "skipped"`.
 - **Conversation history is client-side.** The backend is stateless: the frontend sends the
   recent turns with each question. Nothing is persisted across browser reloads.
-- **No auth on `/ingest`, `/reset`, `/upload` or `DELETE /documents/{name}`** — fine
-  locally, unacceptable publicly: two of those write to and delete from the server's disk.
+- **A JWT cannot be revoked before it expires** (12h by default). Signing out clears the
+  browser, not the token. Deleting the account is what actually invalidates it, because
+  `get_current_user` re-reads the user on every request.
+- **The API is plain HTTP.** A token on a shared network is sniffable. Localhost only,
+  unless you put TLS in front of it.
+- **Signup is open.** Anyone who can reach the page can create an account and upload.
+- **MongoDB is a hard dependency.** Without it nobody can sign in. The app still starts,
+  logs how to fix it, and answers auth requests with a 503 that says the same - it does not
+  pretend to work. `GET /api/health/auth` reports whether it is reachable.
 - **The BM25 index is per-process and in memory.** Multiple workers each build their own;
   it rebuilds on restart (one O(corpus) read).
 - **Uploads are unauthenticated and unthrottled.** Size is capped per file, but nothing

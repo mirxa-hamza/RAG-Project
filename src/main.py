@@ -8,9 +8,10 @@ Run from the project root:
 Then open http://localhost:8000 - the web UI is served by this same process from
 src/static/, so there is no separate file to open and no CORS hop in normal use.
 
-Documents come ONLY from the backend's data folder (see src/core/config.py) - there is no
-upload endpoint, so a user on the frontend can ask questions but can never add or change
-what's in the vector store.
+Every route that touches documents requires a signed-in user (see src/api/deps.py), and
+every document is owned by the account that uploaded it. Documents are still only ever
+indexed from the data folder - /upload writes the file there first, under
+data/users/<user_id>/, and the ordinary ingestion job picks it up.
 
 Ingestion runs as a background job, so the server answers requests immediately even while
 a 900-page book is still being embedded.
@@ -18,8 +19,9 @@ a 900-page book is still being embedded.
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 # Starlette's own HTTPException - StaticFiles raises that one, not FastAPI's subclass.
@@ -29,7 +31,7 @@ from src.api import api_router
 from src.core.config import STATIC_DIR
 from src.core.logging import get_logger, quiet_access_log
 from src.ml import embeddings
-from src.services import ingestion
+from src.services import database, ingestion
 
 log = get_logger(__name__)
 
@@ -78,6 +80,19 @@ async def lifespan(app: FastAPI):
     # The UI polls /ingest/status and /stats while indexing runs; keep those out of the
     # access log so real progress stays readable.
     quiet_access_log()
+
+    # Fail loudly and early if Mongo is down: without it nobody can sign in, and a server
+    # that accepts connections but rejects every login looks broken in a much more
+    # confusing way than one that says what is wrong at startup.
+    try:
+        await database.ping()
+        await database.ensure_indexes()
+        log.info("MongoDB is reachable and the users index is in place.")
+    except database.DatabaseUnavailable as exc:
+        log.error("%s", exc)
+        log.error("The app will start, but signing in will fail until MongoDB is running.")
+    except Exception:
+        log.exception("Could not prepare MongoDB indexes; sign-in may be unreliable.")
     # Load the embedding model off the critical path. Doing it at import time kept the
     # port closed for ~18s, so opening the link too early gave ERR_CONNECTION_REFUSED
     # rather than the loading screen.
@@ -86,6 +101,7 @@ async def lifespan(app: FastAPI):
     # or deleted PDFs are reconciled while it serves requests.
     ingestion.start_job()
     yield
+    database.close()
 
 
 app = FastAPI(
@@ -94,6 +110,17 @@ app = FastAPI(
     version="3.1",
     lifespan=lifespan,
 )
+
+@app.exception_handler(database.DatabaseUnavailable)
+async def database_unavailable(request: Request, exc: database.DatabaseUnavailable):
+    """
+    503 with an actionable sentence, not a 500 with a stack trace.
+
+    A database that is simply not running is an operational state, not a bug in the
+    request - and the person reading the message is usually the one who can fix it.
+    """
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
 
 # The UI is same-origin now, so CORS is only needed if you point another origin (a dev
 # server, a separate front end) at this API. Tighten this before deploying publicly.

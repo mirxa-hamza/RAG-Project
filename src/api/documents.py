@@ -14,8 +14,9 @@ and delete them from disk. There is no authentication here.
 """
 from typing import List
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
+from src.api.deps import get_current_user, user_id_of
 from src.core.config import MAX_UPLOAD_BYTES
 from src.core.logging import get_logger
 from src.ml import embeddings
@@ -27,24 +28,40 @@ router = APIRouter(tags=["documents"])
 
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
-def start_ingest():
+def start_ingest(user: dict = Depends(get_current_user)):
     """
     Starts a background scan of the data folder, ingesting anything new or changed and
     pruning anything deleted. Poll GET /ingest/status for progress.
+
+    The scan itself is global - it is the filesystem being reconciled, not one user's
+    documents - but each file is stored under the owner its path names, and the status this
+    returns is filtered to the caller.
     """
-    return ingestion.start_job()
+    ingestion.start_job()
+    return ingestion.job_status(user_id_of(user))
 
 
 @router.get("/ingest/status")
-def ingest_status():
-    return ingestion.job_status()
+def ingest_status(user: dict = Depends(get_current_user)):
+    """Progress, redacted to the caller's own files (see ingestion.job_status)."""
+    return ingestion.job_status(user_id_of(user))
+
+
+@router.get("/api/documents")
+def list_documents(user: dict = Depends(get_current_user)):
+    """The caller's documents. Never anyone else's, and never the ownerless ones."""
+    return {"documents": manifest.summary(user_id_of(user))["documents"]}
 
 
 @router.get("/stats")
-def stats():
-    """Reads the manifest, not every chunk's metadata."""
+def stats(user: dict = Depends(get_current_user)):
+    """Reads the manifest, not every chunk's metadata. Scoped to the caller."""
+    uid = user_id_of(user)
+    mine = manifest.summary(uid)
     return {
-        "total_chunks": vectorstore.count(),
+        # The caller's passage count, not the store's - the total would leak how much
+        # other people have uploaded.
+        "total_chunks": sum(d.get("chunks", 0) for d in mine["documents"]),
         "ingesting": ingestion.is_running(),
         # The model loads in the background after the port opens; the UI holds its loading
         # screen until this is true, so the first question is never the thing that waits.
@@ -52,12 +69,13 @@ def stats():
         # The UI checks file sizes before uploading, so it needs the server's real limit
         # rather than a hard-coded copy that can drift out of sync with .env.
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
-        **manifest.summary(),
+        "username": user["username"],
+        **mine,
     }
 
 
 @router.post("/upload", status_code=status.HTTP_202_ACCEPTED)
-async def upload(files: List[UploadFile] = File(...)):
+async def upload(files: List[UploadFile] = File(...), user: dict = Depends(get_current_user)):
     """
     Accepts one or more PDFs, writes them into the data folder, and starts indexing.
 
@@ -69,12 +87,14 @@ async def upload(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files were sent.")
 
+    uid = user_id_of(user)
     accepted, rejected = [], []
     for item in files:
         try:
             # item.file is a SpooledTemporaryFile - a real file object, so the upload is
-            # streamed to disk in 1MB blocks instead of being held in memory.
-            accepted.append(uploads.save_pdf(item.file, item.filename or ""))
+            # streamed to disk in 1MB blocks instead of being held in memory. The owner is
+            # the authenticated caller, never anything the request body claims.
+            accepted.append(uploads.save_pdf(item.file, item.filename or "", user_id=uid))
         except uploads.UploadError as exc:
             rejected.append({"filename": item.filename, "error": str(exc)})
         except OSError as exc:
@@ -94,13 +114,14 @@ async def upload(files: List[UploadFile] = File(...)):
             detail=rejected[0]["error"] if rejected else "No files were accepted.",
         )
 
-    job = ingestion.start_job()
-    return {"accepted": accepted, "rejected": rejected, "job": job,
+    ingestion.start_job()
+    return {"accepted": accepted, "rejected": rejected,
+            "job": ingestion.job_status(uid),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
 
 
 @router.delete("/documents/{filename:path}")
-def delete_document(filename: str):
+def delete_document(filename: str, user: dict = Depends(get_current_user)):
     """
     Removes a document completely: its vectors, its manifest entry, and the PDF itself.
 
@@ -114,17 +135,26 @@ def delete_document(filename: str):
             detail="Indexing is running. Wait for it to finish before removing a document.",
         )
 
+    uid = user_id_of(user)
+    record = manifest.get(filename)
+
+    # Someone else's document is reported as missing, not as forbidden: a 403 would
+    # confirm that a document by that name exists and who might own it.
+    if ingestion.owner_from_path(filename) != uid or (record and record.get("user_id") != uid):
+        raise HTTPException(status_code=404, detail=f"'{filename}' is not in your library.")
+
     try:
-        existed_on_disk = uploads.delete_document(filename)
-    except uploads.UploadError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        existed_on_disk = uploads.delete_document(filename, user_id=uid)
+    except uploads.UploadError:
+        raise HTTPException(status_code=404, detail=f"'{filename}' is not in your library.")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not delete the file: {exc}")
 
-    known = manifest.get(filename) is not None
-    if not existed_on_disk and not known:
-        raise HTTPException(status_code=404, detail=f"'{filename}' is not in the library.")
+    if not existed_on_disk and record is None:
+        raise HTTPException(status_code=404, detail=f"'{filename}' is not in your library.")
 
+    # Ownership was verified above; the delete itself is unscoped so that any chunk of
+    # this document is removed, including ones stored before it had an owner.
     vectorstore.delete_source(filename)
     manifest.remove(filename)
     log.info("Removed '%s' from the library.", filename)
@@ -132,15 +162,24 @@ def delete_document(filename: str):
 
 
 @router.post("/reset", status_code=status.HTTP_202_ACCEPTED)
-def reset():
+def reset(user: dict = Depends(get_current_user)):
     """
-    Wipes the vector store, then re-ingests the data folder from scratch in the
-    background - a clean rebuild, not a way to make documents disappear (they only leave
-    the store if you also remove them from the data folder).
+    Rebuilds the caller's documents from their files on disk.
+
+    Deliberately NOT the global wipe it used to be: with several accounts, one person
+    pressing "Rebuild index" must not throw away everyone else's vectors. Each of the
+    caller's documents is dropped from the store and re-embedded from the PDF that is
+    still in their folder.
     """
     if ingestion.is_running():
         raise HTTPException(status_code=409, detail="An ingestion job is already running.")
 
-    vectorstore.reset_collection()
-    manifest.clear()
-    return ingestion.start_job(force=True)
+    uid = user_id_of(user)
+    mine = manifest.sources(uid)
+    for name in mine:
+        vectorstore.delete_source(name)
+        manifest.remove(name)
+    log.info("Rebuilding %d document(s) for user %s", len(mine), uid)
+
+    ingestion.start_job()
+    return ingestion.job_status(uid)

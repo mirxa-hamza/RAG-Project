@@ -70,7 +70,8 @@ def get(filename: str) -> Optional[Dict]:
         return _load().get(filename)
 
 
-def put(filename: str, *, sha256: str, mtime: float, size: int, pages: int, chunks: int) -> None:
+def put(filename: str, *, sha256: str, mtime: float, size: int, pages: int, chunks: int,
+        user_id: Optional[str] = None) -> None:
     with _lock:
         entries = _load()
         entries[filename] = {
@@ -79,9 +80,31 @@ def put(filename: str, *, sha256: str, mtime: float, size: int, pages: int, chun
             "size": size,
             "pages": pages,
             "chunks": chunks,
+            # The owner, mirrored from the chunk metadata so /stats and the document list
+            # can answer "whose is this?" without querying Chroma. Absent for documents
+            # ingested before accounts existed, and for the CLI.
+            **({"user_id": user_id} if user_id else {}),
             "ingested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         _save(entries)
+
+
+def set_owner(filename: str, user_id: str) -> bool:
+    """Stamps an owner onto an existing entry. Returns False if there is no such entry."""
+    with _lock:
+        entries = _load()
+        record = entries.get(filename)
+        if record is None:
+            return False
+        record["user_id"] = user_id
+        _save(entries)
+        return True
+
+
+def owner_of(filename: str) -> Optional[str]:
+    with _lock:
+        record = _load().get(filename)
+    return record.get("user_id") if record else None
 
 
 def remove(filename: str) -> None:
@@ -91,14 +114,31 @@ def remove(filename: str) -> None:
             _save(entries)
 
 
-def sources() -> List[str]:
-    with _lock:
-        return sorted(_load().keys())
-
-
-def summary() -> Dict:
+def sources(user_id: Optional[str] = None) -> List[str]:
+    """Every ingested document, or only `user_id`'s when one is given."""
     with _lock:
         entries = _load()
+    if user_id is None:
+        return sorted(entries.keys())
+    return sorted(name for name, rec in entries.items() if rec.get("user_id") == user_id)
+
+
+def unowned() -> List[str]:
+    """Documents with no owner - i.e. ingested before accounts existed, or by the CLI."""
+    with _lock:
+        entries = _load()
+    return sorted(name for name, rec in entries.items() if not rec.get("user_id"))
+
+
+def summary(user_id: Optional[str] = None) -> Dict:
+    """
+    What /stats reports. With a user_id, only that user's documents are described - the
+    counts and filenames of anyone else's must never reach a response.
+    """
+    with _lock:
+        entries = _load()
+    if user_id is not None:
+        entries = {n: r for n, r in entries.items() if r.get("user_id") == user_id}
     return {
         "sources": sorted(entries.keys()),
         "documents": [

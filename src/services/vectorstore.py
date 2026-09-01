@@ -33,12 +33,17 @@ def _get_collection():
 _collection = _get_collection()
 
 
-def add_chunks(source_name: str, chunks: List[Dict], on_progress=None) -> int:
+def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
+               user_id: Optional[str] = None) -> int:
     """
     Embeds and stores chunks from one document, in batches.
 
     Batching matters twice over: `encode()` on thousands of texts at once spikes memory,
     and Chroma enforces a maximum batch size per add() call that a large book would hit.
+
+    user_id: the owner stamped onto every chunk's metadata. This is the single source of
+    truth for isolation - a chunk stored without it is visible to nobody except the
+    unfiltered internal callers (the CLI, the eval harness).
 
     chunks: [{"text": "...", "page_start": 3, "page_end": 4}, ...]
     on_progress: optional callable(stored, total), called after each batch. This is what
@@ -72,6 +77,9 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None) -> int:
                     "page_start": c["page_start"],
                     "page_end": c["page_end"],
                     "chunk_index": offset + i,
+                    # Chroma rejects a None metadata value, so an ownerless chunk simply
+                    # has no user_id key - which is exactly what owner_filter never matches.
+                    **({"user_id": user_id} if user_id else {}),
                 }
                 for i, c in enumerate(batch)
             ],
@@ -88,9 +96,9 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None) -> int:
     return stored
 
 
-def delete_source(source_name: str) -> None:
+def delete_source(source_name: str, user_id: Optional[str] = None) -> None:
     """Removes every chunk belonging to one document (used when a PDF changed on disk)."""
-    _collection.delete(where={"source": source_name})
+    _collection.delete(where=_and({"source": source_name}, owner_filter(user_id)))
     _invalidate_keyword_index()
     log.info("Deleted existing chunks for '%s'", source_name)
 
@@ -109,6 +117,9 @@ def _row(text: str, meta: Dict, distance: Optional[float] = None) -> Dict:
         "page_start": meta.get("page_start"),
         "page_end": meta.get("page_end"),
         "chunk_index": meta.get("chunk_index"),
+        # Carried through so BM25 (which ranks in memory, without Chroma's where-clause)
+        # and the post-retrieval ownership assertion can both see it.
+        "user_id": meta.get("user_id"),
     }
     if distance is not None:
         row["distance"] = distance
@@ -118,7 +129,27 @@ def _row(text: str, meta: Dict, distance: Optional[float] = None) -> Dict:
     return row
 
 
-def query_chunks(question: str, top_k: int = 4, source: Optional[str] = None) -> List[Dict]:
+def owner_filter(user_id: Optional[str]) -> Optional[Dict]:
+    """
+    The Chroma `where` clause that limits a query to one user's documents.
+
+    ISOLATION POINT 1 of 3 (the others are bm25.search and get_neighbors_bulk). None means
+    "no filter" and is only correct for internal callers - never pass None on a request
+    path, or one user's chunks answer another user's question.
+    """
+    return {"user_id": user_id} if user_id else None
+
+
+def _and(*clauses) -> Optional[Dict]:
+    """Combines Chroma where-clauses; Chroma needs an explicit $and for more than one."""
+    present = [c for c in clauses if c]
+    if not present:
+        return None
+    return present[0] if len(present) == 1 else {"$and": present}
+
+
+def query_chunks(question: str, top_k: int = 4, source: Optional[str] = None,
+                 user_id: Optional[str] = None) -> List[Dict]:
     """Vector search. Returns the top_k chunks most similar to the question."""
     total = _collection.count()
     if total == 0:
@@ -127,7 +158,7 @@ def query_chunks(question: str, top_k: int = 4, source: Optional[str] = None) ->
     with timed(log, "embed query"):
         query_embedding = embed_query(question)
 
-    where = {"source": source} if source else None
+    where = _and({"source": source} if source else None, owner_filter(user_id))
     with timed(log, f"vector search (n={top_k}{', source-scoped' if source else ''})"):
         results = _collection.query(
             query_embeddings=[query_embedding],
@@ -143,7 +174,8 @@ def query_chunks(question: str, top_k: int = 4, source: Optional[str] = None) ->
     ]
 
 
-def get_neighbors_bulk(wanted: Dict[str, Set[int]]) -> Dict[Tuple[str, int], Dict]:
+def get_neighbors_bulk(wanted: Dict[str, Set[int]],
+                       user_id: Optional[str] = None) -> Dict[Tuple[str, int], Dict]:
     """
     Fetches many neighbour chunks in ONE query per source, keyed by (source, chunk_index).
 
@@ -157,8 +189,16 @@ def get_neighbors_bulk(wanted: Dict[str, Set[int]]) -> Dict[Tuple[str, int], Dic
         indices = sorted(i for i in indices if i is not None and i >= 0)
         if not indices:
             continue
+        # ISOLATION POINT 3 of 3. Neighbours are fetched by chunk_index, not by search, so
+        # they bypass every filter applied during ranking. Without the owner clause here, a
+        # hit on your own document would happily pull in the adjacent chunk of someone
+        # else's document that happens to share a filename.
         got = _collection.get(
-            where={"$and": [{"source": source}, {"chunk_index": {"$in": indices}}]},
+            where=_and(
+                {"source": source},
+                {"chunk_index": {"$in": indices}},
+                owner_filter(user_id),
+            ),
             include=["documents", "metadatas"],
         )
         for text, meta in zip(got["documents"], got["metadatas"]):
@@ -168,15 +208,41 @@ def get_neighbors_bulk(wanted: Dict[str, Set[int]]) -> Dict[Tuple[str, int], Dic
     return found
 
 
-def get_neighbors(source: str, chunk_index: int, radius: int = 1) -> List[Dict]:
+def get_neighbors(source: str, chunk_index: int, radius: int = 1,
+                  user_id: Optional[str] = None) -> List[Dict]:
     """Single-hit convenience wrapper around get_neighbors_bulk()."""
     if chunk_index is None or radius < 1:
         return []
 
     wanted = {i for i in range(chunk_index - radius, chunk_index + radius + 1)
               if i >= 0 and i != chunk_index}
-    found = get_neighbors_bulk({source: wanted})
+    found = get_neighbors_bulk({source: wanted}, user_id=user_id)
     return list(found.values())
+
+
+def set_owner(source_name: str, user_id: str) -> int:
+    """
+    Stamps `user_id` onto every stored chunk of one document, in place.
+
+    Used once, when the first account adopts the documents that were indexed before
+    accounts existed. Chroma has no "update where" - metadata is rewritten by id - so the
+    ids and existing metadata are read first and updated in batches.
+    """
+    got = _collection.get(where={"source": source_name}, include=["metadatas"])
+    ids = got.get("ids") or []
+    if not ids:
+        return 0
+
+    metadatas = [dict(meta or {}, user_id=user_id) for meta in got.get("metadatas") or []]
+    for offset in range(0, len(ids), CHROMA_ADD_BATCH):
+        _collection.update(
+            ids=ids[offset:offset + CHROMA_ADD_BATCH],
+            metadatas=metadatas[offset:offset + CHROMA_ADD_BATCH],
+        )
+
+    _invalidate_keyword_index()   # the cached rows still carry the old metadata
+    log.info("Stamped %d chunk(s) of '%s' with user_id=%s", len(ids), source_name, user_id)
+    return len(ids)
 
 
 def all_chunks() -> List[Dict]:

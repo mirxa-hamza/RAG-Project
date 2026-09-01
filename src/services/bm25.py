@@ -62,8 +62,17 @@ def _build() -> None:
     log.info("BM25 index built over %d chunks.", len(_rows))
 
 
-def search(question: str, limit: int, source: Optional[str] = None) -> List[Tuple[Dict, float]]:
-    """Returns [(chunk, score), ...] best first. Empty list if the store is empty."""
+def search(question: str, limit: int, source: Optional[str] = None,
+           user_id: Optional[str] = None) -> List[Tuple[Dict, float]]:
+    """
+    Returns [(chunk, score), ...] best first. Empty list if the store is empty.
+
+    ISOLATION POINT 2 of 3. The index itself is built over EVERY chunk in the store -
+    rebuilding it per user would mean an O(corpus) read per request - so ownership is
+    enforced when filtering the ranking, before the limit is applied. Filtering after the
+    slice would silently return fewer results than asked for whenever another user's
+    chunks rank highly, so the order here matters.
+    """
     with _lock:
         if _index is None:
             _build()
@@ -79,6 +88,8 @@ def search(question: str, limit: int, source: Optional[str] = None) -> List[Tupl
     scores = index.get_scores(tokens)
     ranked = sorted(zip(rows, scores), key=lambda pair: pair[1], reverse=True)
 
+    if user_id:
+        ranked = [pair for pair in ranked if pair[0].get("user_id") == user_id]
     if source:
         ranked = [pair for pair in ranked if pair[0].get("source") == source]
 

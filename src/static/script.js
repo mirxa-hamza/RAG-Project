@@ -9,6 +9,22 @@ const API_BASE = "";
 const $ = (id) => document.getElementById(id);
 
 const el = {
+  app: null,          // replaced below; declared first so the auth block can use el.*
+  auth: $("auth"),
+  authForm: $("authForm"),
+  authTitle: $("authTitle"),
+  authText: $("authText"),
+  authUser: $("authUser"),
+  authPass: $("authPass"),
+  authError: $("authError"),
+  authSubmit: $("authSubmit"),
+  authSubmitText: $("authSubmitText"),
+  authSwitch: $("authSwitch"),
+  authSwitchText: $("authSwitchText"),
+  who: $("who"),
+  whoName: $("whoName"),
+  whoAvatar: $("whoAvatar"),
+  logoutBtn: $("logoutBtn"),
   menuBtn: $("menuBtn"),
   sidebar: $("sidebar"),
   scrim: $("scrim"),
@@ -23,7 +39,7 @@ const el = {
   chunkCount: $("chunkCount"),
   railCount: $("railCount"),
   scopeSelect: $("scopeSelect"),
-  app: document.querySelector(".app"),
+  appEl: $("app"),
   addBtn: $("addBtn"),
   uploadModal: $("uploadModal"),
   uploadNote: $("uploadNote"),
@@ -40,7 +56,54 @@ const el = {
   apiBase: $("apiBase"),
 };
 
+el.app = el.appEl;
 el.apiBase.textContent = window.location.origin;
+
+/* ─────────────────────────── Session ─────────────────────────────────
+   The JWT lives in localStorage and rides on every request through authFetch(). A 401
+   from anywhere means the token is gone, expired, or was signed with a different key, so
+   the only sane response is to drop it and show the sign-in screen again.
+   ==================================================================== */
+
+const TOKEN_KEY = "docqa.token";
+let session = null;          // { username } once signed in
+
+function readToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    // Private mode, or storage blocked. The app still works for this tab; the user just
+    // signs in again next time.
+    return null;
+  }
+}
+
+function writeToken(token) {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch { /* not fatal - see readToken */ }
+}
+
+/**
+ * fetch() with the bearer token attached, and one rule: a 401 ends the session.
+ *
+ * Every call in this file goes through it, including the SSE stream - which works only
+ * because the stream is read with fetch() rather than EventSource, and EventSource cannot
+ * set headers.
+ */
+async function authFetch(path, options = {}) {
+  const token = readToken();
+  const headers = new Headers(options.headers || {});
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  if (response.status === 401) {
+    endSession("Your session expired. Sign in again.");
+    throw new Error("Signed out");
+  }
+  return response;
+}
 
 let polling = false;
 // Conversation history lives in the page and is sent with each question; the backend is
@@ -274,6 +337,10 @@ function sendFiles(files, cards) {
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${API_BASE}/upload`);
+    // XHR is used here (not fetch) for upload-progress events, so the token has to be
+    // attached by hand rather than by authFetch.
+    const token = readToken();
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
 
     xhr.upload.addEventListener("progress", (e) => {
       if (!e.lengthComputable) return;
@@ -285,8 +352,12 @@ function sendFiles(files, cards) {
     xhr.addEventListener("load", () => {
       let body = {};
       try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
-      else reject(new Error(body.detail || `Upload failed (${xhr.status})`));
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      if (xhr.status === 401) {
+        endSession("Your session expired. Sign in again.");
+        return reject(new Error("Signed out"));
+      }
+      reject(new Error(body.detail || `Upload failed (${xhr.status})`));
     });
     xhr.addEventListener("error", () => reject(new Error("Upload failed — the server is not reachable.")));
     xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
@@ -388,7 +459,7 @@ async function runJob(path, startMessage) {
   el.syncProgress.hidden = false;
   el.syncProgress.classList.add("progress--indeterminate");
   try {
-    const res = await fetch(`${API_BASE}${path}`, { method: "POST" });
+    const res = await authFetch(path, { method: "POST" });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Request failed");
     await pollUntilDone();
@@ -406,7 +477,7 @@ async function pollUntilDone() {
   while (polling) {
     let job;
     try {
-      job = await (await fetch(`${API_BASE}/ingest/status`)).json();
+      job = await (await authFetch("/ingest/status")).json();
     } catch {
       setStatus("Lost contact with the backend.", "error");
       setServerStatus("offline", "Offline", "The backend is not responding");
@@ -496,7 +567,7 @@ function setStatus(text, tone) {
 
 async function refreshSources() {
   try {
-    const res = await fetch(`${API_BASE}/stats`);
+    const res = await authFetch("/stats");
     const data = await res.json();
     const docs = data.documents || [];
 
@@ -562,7 +633,7 @@ el.sourceList.addEventListener("click", async (e) => {
 
   btn.disabled = true;
   try {
-    const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(filename)}`, {
+    const res = await authFetch(`/documents/${encodeURIComponent(filename)}`, {
       method: "DELETE",
     });
     const body = await res.json().catch(() => ({}));
@@ -602,9 +673,18 @@ el.questionInput.addEventListener("keydown", (e) => {
  */
 function autoGrow() {
   const ta = el.questionInput;
+
+  // A hidden element has no layout, so scrollHeight is 0 - and writing that back as an
+  // inline height left the box collapsed to its padding, with the placeholder sitting
+  // against the top edge, once the app was revealed after sign-in. Measuring is only
+  // meaningful while the element is actually rendered.
+  if (!ta.offsetParent && ta.offsetHeight === 0) return;
+
   ta.style.height = "auto";
   const max = parseFloat(getComputedStyle(ta).maxHeight) || Infinity;
   const needed = ta.scrollHeight;
+  if (!needed) return;                       // still not laid out; leave the CSS height
+
   ta.style.height = `${Math.min(needed, max)}px`;
   // 1px of slack absorbs sub-pixel rounding, so the bar appears only on a real overflow.
   ta.style.overflowY = needed > max + 1 ? "auto" : "hidden";
@@ -652,7 +732,7 @@ el.chatForm.addEventListener("submit", async (e) => {
   };
 
   try {
-    const res = await fetch(`${API_BASE}/chat/stream`, {
+    const res = await authFetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -845,6 +925,130 @@ function scrollToBottom() {
   el.messages.scrollTop = el.messages.scrollHeight;
 }
 
+/* ─────────────────────────── Sign in / sign up ───────────────────────
+   One form, two modes. The screen is shown until /api/me confirms a stored token, and
+   returned to on any 401.
+   ==================================================================== */
+
+let authMode = "login";      // "login" | "signup"
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const signingUp = mode === "signup";
+  el.authTitle.textContent = signingUp ? "Create an account" : "Sign in";
+  el.authText.textContent = signingUp
+    ? "Documents you upload are private to your account."
+    : "Your documents are private to your account.";
+  el.authSubmitText.textContent = signingUp ? "Create account" : "Sign in";
+  el.authSwitchText.textContent = signingUp ? "Already have an account?" : "New here?";
+  el.authSwitch.textContent = signingUp ? "Sign in" : "Create an account";
+  // Tells a password manager whether to offer a saved password or a generated one.
+  el.authPass.setAttribute("autocomplete", signingUp ? "new-password" : "current-password");
+  el.authError.textContent = "";
+}
+
+el.authSwitch.addEventListener("click", () => {
+  setAuthMode(authMode === "login" ? "signup" : "login");
+  el.authUser.focus();
+});
+
+function showAuthScreen(message) {
+  el.auth.hidden = false;
+  el.app.hidden = true;
+  el.authError.textContent = message || "";
+  el.authPass.value = "";
+  setTimeout(() => el.authUser.focus(), 50);
+}
+
+/**
+ * Everything belonging to the previous account, gone.
+ *
+ * Without this, signing in as someone else shows their empty library alongside the
+ * previous user's chat transcript and document rows until the first refresh lands - which
+ * looks exactly like a data leak even though the server never sent a byte of it.
+ */
+function resetAppState() {
+  history = [];
+  polling = false;
+  session = null;
+  el.messages.replaceChildren(el.welcome);
+  el.welcome.hidden = false;
+  el.sourceList.innerHTML = `<li class="doc-empty">Nothing ingested yet</li>`;
+  el.docCount.textContent = "0";
+  if (el.railCount) el.railCount.textContent = "0";
+  el.scopeSelect.innerHTML = `<option value="">All documents</option>`;
+  el.uploadList.replaceChildren();
+  uploadCards.clear();
+  setStatus("");
+  el.syncProgress.hidden = true;
+  el.questionInput.value = "";
+  autoGrow();
+  if (el.uploadModal.open) el.uploadModal.close();
+}
+
+function startSession(username) {
+  session = { username };
+  el.whoName.textContent = username;
+  el.whoAvatar.textContent = (username[0] || "?").toUpperCase();
+  el.auth.hidden = true;
+  el.app.hidden = false;
+  // The composer could not be measured while the app was hidden; now it can.
+  autoGrow();
+  refreshSources();
+  boot();
+}
+
+function endSession(message) {
+  writeToken(null);
+  resetAppState();
+  showAuthScreen(message);
+}
+
+el.logoutBtn.addEventListener("click", () => endSession("You're signed out."));
+
+el.authForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const username = el.authUser.value.trim();
+  const password = el.authPass.value;
+
+  el.authSubmit.disabled = true;
+  el.authError.textContent = "";
+  const original = el.authSubmitText.textContent;
+  el.authSubmitText.textContent = authMode === "signup" ? "Creating…" : "Signing in…";
+
+  try {
+    const res = await fetch(`${API_BASE}/api/${authMode === "signup" ? "signup" : "login"}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      // FastAPI validation errors arrive as a list of objects, not a string.
+      const detail = Array.isArray(body.detail)
+        ? (body.detail[0]?.msg || "Check the username and password.")
+        : body.detail;
+      // 503 means the account database is down, not that the credentials are wrong. Its
+      // message says how to start it, so show it verbatim rather than a generic failure.
+      throw new Error(detail || (res.status === 503
+        ? "The account database is unavailable."
+        : `That didn't work (${res.status}).`));
+    }
+
+    writeToken(body.access_token);
+    resetAppState();
+    startSession(body.username || username);
+  } catch (err) {
+    el.authError.textContent = err.message === "Failed to fetch"
+      ? "Can't reach the server. Is it running?"
+      : err.message;
+  } finally {
+    el.authSubmit.disabled = false;
+    el.authSubmitText.textContent = original;
+  }
+});
+
 /* ─────────────────────────── Boot ───────────────────────────── */
 
 /**
@@ -891,7 +1095,7 @@ async function boot() {
   while (!dismissed) {
     let stats = null;
     try {
-      stats = await (await fetch(`${API_BASE}/stats`)).json();
+      stats = await (await authFetch("/stats")).json();
     } catch {
       // Server not listening yet — normal for the first ~20s while the models load.
       reveal();
@@ -918,7 +1122,7 @@ async function boot() {
     if (stats.ingesting) {
       let job = {};
       try {
-        job = await (await fetch(`${API_BASE}/ingest/status`)).json();
+        job = await (await authFetch("/ingest/status")).json();
       } catch { /* transient; the next loop retries */ }
       const done = job.files_done ?? 0;
       const total = job.files_total ?? 0;
@@ -947,5 +1151,37 @@ async function boot() {
   close();
 }
 
-refreshSources();
-boot();
+/**
+ * Decide which screen to show before anything else happens.
+ *
+ * A token in localStorage is not proof of a session: it may be expired, or signed with a
+ * key that changed. /api/me is what actually settles it, so the app is never shown to
+ * someone whose next request would 401.
+ */
+async function startup() {
+  setAuthMode("login");
+
+  if (!readToken()) {
+    showAuthScreen();
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/api/me`, {
+      headers: { Authorization: `Bearer ${readToken()}` },
+    });
+    if (!res.ok) {
+      writeToken(null);
+      showAuthScreen(res.status === 401 ? "" : "Please sign in again.");
+      return;
+    }
+    const me = await res.json();
+    startSession(me.username);
+  } catch {
+    // The server is unreachable. Sign-in will fail too, so say that rather than showing
+    // an app that cannot load anything.
+    showAuthScreen("Can't reach the server. Is it running?");
+  }
+}
+
+startup();
