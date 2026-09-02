@@ -16,12 +16,18 @@
 # file with an exclusion list - Vercel's build reads this file directly, and a hidden
 # extra layer of indirection is exactly what this project's "no hidden abstractions" rule
 # argues against.
+#
+# ONE deliberate divergence from requirements-cloud.txt: chromadb is dropped here. It
+# pulls onnxruntime, a kubernetes client, grpcio and opentelemetry exporters as transitive
+# deps (~250MB), which pushed the Vercel function bundle over its 225MB cap. vectorstore.py
+# imports the chroma backend lazily (services/vector_chroma.py), only when VECTOR_STORE=
+# chroma - and cloud mode's default is VECTOR_STORE=pinecone, so it is never imported in a
+# default Vercel deployment. If you deploy to Vercel with VECTOR_STORE=chroma (Chroma
+# Cloud), add chromadb back here.
 
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pymupdf==1.28.2
-# chromadb 0.5.x hard-requires numpy<2.0; 1.x also dropped the posthog telemetry spam.
-chromadb==1.5.9
 # groq<0.13 passes a `proxies` kwarg to httpx.Client that httpx>=0.28 no longer accepts.
 groq==1.7.0
 python-dotenv==1.0.1
