@@ -4,9 +4,13 @@ Guidance for Claude (or any AI assistant) working in this repository.
 
 ## What this project is
 
-A from-scratch Retrieval-Augmented Generation (RAG) app: add PDFs (upload them in the UI or
-drop them in the backend's `data/` folder), ask questions about them, get answers grounded
-only in that content. Built
+**Marginalia** — a from-scratch Retrieval-Augmented Generation (RAG) app: add PDFs (upload
+them in the UI or drop them in the backend's `data/` folder), ask questions about them, get
+answers grounded only in that content. The name is the product's argument: an answer is a
+note in the margin of a page you own, and it points at the line it came from. The product
+name lives in exactly four places - `index.html` (title, wordmark, favicon, auth card),
+`main.py`'s FastAPI title, `README.md`, and `TOKEN_KEY` in `script.js` - so renaming again
+is a small, findable job. Built
 deliberately without LangChain/LlamaIndex so every pipeline step is plain, readable
 Python — this is a learning project first, a working app second.
 
@@ -438,7 +442,7 @@ shape; revisit them if cloud usage looks different from local.
 - **HTML is served `no-cache`; CSS and JS are cache-busted with `?v=N` in `index.html`.**
   Chrome served a cached `index.html` against a freshly updated `style.css` once and the new
   markup rendered completely unstyled. Bump the `?v=` number whenever you change either
-  static asset (currently `?v=12`).
+  static asset (currently `?v=21`).
 - **Auth code: `pwdlib` with Argon2id, never `passlib`.** passlib is unmaintained and
   breaks against recent bcrypt releases. `PasswordHash.recommended()` also gives hash
   migration for free.

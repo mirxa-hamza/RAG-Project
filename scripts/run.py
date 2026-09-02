@@ -45,7 +45,7 @@ def _open_when_ready(url: str, health_url: str, timeout: float = 300.0) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Document Q&A server.")
+    parser = argparse.ArgumentParser(description="Run the Marginalia server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--reload", action="store_true",

@@ -1,5 +1,5 @@
 /* ============================================================================
-   Document Q&A — design tokens
+   Marginalia — design tokens
    Brand palette derived from #dc3126. The brand colour is used sparingly: primary
    actions, focus rings, and small accents. Everything structural stays neutral.
    ========================================================================== */
@@ -691,6 +691,13 @@ svg {
   background: var(--primary); color: #fff;
 }
 .auth__mark svg { width: 24px; height: 24px; }
+
+/* The product name on the sign-in card. The card carries the mark but had nothing
+   naming it, so the first screen anyone sees never said what they were signing in to. */
+.auth__brand {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  letter-spacing: 0.01em; margin-bottom: 3px;
+}
 
 .auth__title { font-size: 20px; margin-bottom: 5px; }
 .auth__text { font-size: 13px; color: var(--text-muted); margin-bottom: 20px; }

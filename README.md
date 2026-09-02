@@ -1,4 +1,6 @@
-# Document Q&A — a from-scratch RAG system
+# Marginalia — a from-scratch RAG system
+
+*Answers from your own pages, with the citations to prove it.*
 
 PDF in → chunked & embedded locally → stored in ChromaDB → retrieved at question time →
 answered by an LLM on Groq, grounded only in what's in the PDF.

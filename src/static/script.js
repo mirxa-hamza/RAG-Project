@@ -1,5 +1,5 @@
 /* ============================================================================
-   Document Q&A — front end
+   Marginalia — front end
    The page is served by FastAPI itself (src/main.py mounts src/static at "/"), so every
    call is same-origin and no host needs hard-coding. Set an absolute URL here only if you
    deliberately serve this page from somewhere other than the API.
@@ -90,7 +90,9 @@ el.apiBase.textContent = window.location.origin;
    the only sane response is to drop it and show the sign-in screen again.
    ==================================================================== */
 
-const TOKEN_KEY = "docqa.token";
+// Renaming this key signs every existing browser out once, which is the correct
+// trade for not carrying the old product name around in local storage forever.
+const TOKEN_KEY = "marginalia.token";
 let session = null;          // { username } once signed in
 // Bumped on every sign-out. Background loops capture it and stop when it changes, so work
 // started under one session can never keep running (or keep 401ing) under the next.
