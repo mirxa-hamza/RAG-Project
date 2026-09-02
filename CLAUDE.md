@@ -712,6 +712,15 @@ warning when it sees them.
   padding after login. It now bails out when the element has no layout, refuses to write a
   zero height, and runs again from `startSession()`; CSS carries a `min-height` floor as
   the backstop. The same trap applies to any layout measurement taken before sign-in.
+- **A background loop MUST stop when the session ends.** `endSession()` bumps
+  `sessionEpoch`; every polling loop captures it and exits when it changes, and `authFetch`
+  tags its 401 error `signedOut` so a loop can tell "stop" from "retry". Without both,
+  `watchStartup()` kept polling `/stats` with a dead token during model warm-up: each 401
+  called `endSession()` again, which re-rendered the sign-in screen about once a second -
+  clearing the password field and yanking focus back to the username box, so the form was
+  literally impossible to type into. `showAuthScreen()` also forces the form back to "Sign
+  in", or an expiry lands on a "Create an account" form that then reports "Incorrect
+  username or password" for an account that exists.
 - **There is no loading screen.** The overlay that used to hold the app back during model
   warm-up and the first ingest is gone: sign in and you are in the chat. `watchStartup()`
   polls `/stats` in the background and reports those two states through the top bar's
