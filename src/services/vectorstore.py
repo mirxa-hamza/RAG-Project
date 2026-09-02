@@ -77,7 +77,7 @@ def reset_backend() -> None:
 
 
 def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
-               user_id: Optional[str] = None) -> int:
+               user_id: Optional[str] = None, index_offset: int = 0) -> int:
     """
     Embeds and stores the chunks of one document, in batches, and returns how many landed.
 
@@ -87,9 +87,16 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
 
     `on_progress(stored, total)` is called after each batch; it drives the per-document
     progress bar, without which a 1,900-chunk book is a five-minute silence.
+
+    `index_offset` is where this batch of chunks sits within the whole document. It exists
+    because cloud mode ingests a large PDF as several separate requests (see
+    ingestion.ingest_one's `start_chunk`): each call passes only its own slice, and without
+    the offset every slice would number its chunks from 0 again - colliding with the
+    previous slice's `chunk_index` and corrupting neighbour expansion, which addresses
+    chunks by that index.
     """
     return backend().add_chunks(source_name, chunks, on_progress=on_progress,
-                                user_id=user_id)
+                                user_id=user_id, index_offset=index_offset)
 
 
 def delete_source(source_name: str, user_id: Optional[str] = None) -> None:

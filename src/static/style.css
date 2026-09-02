@@ -692,11 +692,52 @@ svg {
 }
 .auth__mark svg { width: 24px; height: 24px; }
 
-/* The product name on the sign-in card. The card carries the mark but had nothing
-   naming it, so the first screen anyone sees never said what they were signing in to. */
-.auth__brand {
-  font-size: 13px; font-weight: 600; color: var(--text);
-  letter-spacing: 0.01em; margin-bottom: 3px;
+/* The signed-out landing state.
+   Two columns on a wide screen - what this is on the left, the form on the right - and one
+   stacked column below 880px. The pitch owns the mark and the product name so the card does
+   not repeat them; the body copy and the three points drop out on narrow screens, where the
+   lead sentence alone still answers "what am I signing in to?". */
+.auth__shell {
+  display: grid; align-items: center;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 56px; width: 100%; max-width: 900px;
+}
+
+.auth__pitch { max-width: 30rem; }
+.auth__pitch-name {
+  font-size: 27px; font-weight: 600; letter-spacing: -0.025em;
+  margin: 15px 0 8px;
+}
+.auth__pitch-lead {
+  font-size: 19px; line-height: 1.4; color: var(--text);
+  letter-spacing: -0.015em; margin-bottom: 12px;
+}
+.auth__pitch-body { font-size: 14.5px; line-height: 1.65; color: var(--text-muted); }
+
+.auth__points { list-style: none; display: grid; gap: 11px; margin-top: 22px; }
+.auth__points li {
+  display: flex; align-items: flex-start; gap: 10px;
+  font-size: 13.5px; line-height: 1.55; color: var(--text-muted);
+}
+.auth__points b { color: var(--text); font-weight: 600; }
+.auth__tick {
+  display: grid; place-items: center; flex: none;
+  width: 20px; height: 20px; margin-top: 1px;
+  color: var(--primary); background: var(--brand-50);
+  border-radius: 999px;
+}
+.auth__tick svg { width: 13px; height: 13px; stroke-width: 2.6; }
+
+@media (max-width: 880px) {
+  .auth__shell {
+    grid-template-columns: minmax(0, 380px);
+    justify-content: center; gap: 24px;
+  }
+  .auth__pitch { text-align: center; max-width: 380px; }
+  .auth__pitch .auth__mark { margin-left: auto; margin-right: auto; }
+  .auth__pitch-body, .auth__points { display: none; }
+  .auth__pitch-name { font-size: 23px; }
+  .auth__pitch-lead { font-size: 16px; margin-bottom: 0; }
 }
 
 .auth__title { font-size: 20px; margin-bottom: 5px; }

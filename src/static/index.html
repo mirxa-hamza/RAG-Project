@@ -17,7 +17,7 @@
      installed (Android, ChromeOS); DM Sans is loaded as the closest freely-licensed
      fallback so every other device gets a consistent, near-identical face. -->
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=21">
+<link rel="stylesheet" href="style.css?v=22">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23dc3126'/><g fill='none' stroke='%23fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M13.5 6.5v19'/><path d='M17.5 11.5h6M17.5 16h6M17.5 20.5h3.5'/><path d='M7 13.5 10 16l-3 2.5'/></g></svg>">
 </head>
 <body>
@@ -29,11 +29,32 @@
      inert. script.js decides which of the two is visible, and it only shows the app after
      /api/me confirms the stored token still works. -->
 <div class="auth" id="auth" hidden>
-  <div class="auth__card">
-    <span class="auth__mark" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="26" height="26"><path d="M10 3.5v17"/><path d="M13.5 8.5h6M13.5 12h6M13.5 15.5h3.5"/><path d="M4.5 10 7 12l-2.5 2"/></svg>
-    </span>
-    <p class="auth__brand">Marginalia</p>
+  <div class="auth__shell">
+
+    <!-- The pitch. Someone landing here has been asked for a password by a product they
+         have never heard of; this is the sentence that earns it. It owns the branding on
+         this screen, so the card beside it does not repeat the mark and the name. -->
+    <section class="auth__pitch">
+      <span class="auth__mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="26" height="26"><path d="M10 3.5v17"/><path d="M13.5 8.5h6M13.5 12h6M13.5 15.5h3.5"/><path d="M4.5 10 7 12l-2.5 2"/></svg>
+      </span>
+      <h2 class="auth__pitch-name">Marginalia</h2>
+      <p class="auth__pitch-lead">Ask your documents. Get answers you can check.</p>
+      <p class="auth__pitch-body">
+        Upload your PDFs and ask questions in plain language. Every answer is built only
+        from passages retrieved out of your own files, and cites the pages it came from.
+      </p>
+      <ul class="auth__points">
+        <li><span class="auth__tick" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15"><path d="M20 6 9 17l-5-5"/></svg></span>
+          <span><b>Grounded.</b> Nothing is answered from the model's own memory.</span></li>
+        <li><span class="auth__tick" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15"><path d="M20 6 9 17l-5-5"/></svg></span>
+          <span><b>Cited.</b> Every answer points at the pages it was drawn from.</span></li>
+        <li><span class="auth__tick" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15"><path d="M20 6 9 17l-5-5"/></svg></span>
+          <span><b>Honest.</b> If your documents don't cover it, it says so instead of guessing.</span></li>
+      </ul>
+    </section>
+
+    <div class="auth__card">
     <h1 class="auth__title" id="authTitle">Sign in</h1>
     <p class="auth__text" id="authText">Your documents are private to your account.</p>
 
@@ -62,6 +83,8 @@
       <span id="authSwitchText">New here?</span>
       <button type="button" class="linkish" id="authSwitch">Create an account</button>
     </p>
+    </div>
+
   </div>
 </div>
 
@@ -328,6 +351,6 @@
   </p>
 </dialog>
 
-<script src="script.js?v=21"></script>
+<script src="script.js?v=22"></script>
 </body>
 </html>

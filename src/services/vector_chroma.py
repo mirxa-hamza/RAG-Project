@@ -92,7 +92,7 @@ def _col():
 
 
 def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
-               user_id: Optional[str] = None) -> int:
+               user_id: Optional[str] = None, index_offset: int = 0) -> int:
     """
     Embeds and stores chunks from one document, in batches.
 
@@ -126,7 +126,7 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
             embeddings = embed_passages(batch_texts)
 
         _col().add(
-            ids=[f"{run_id}_{offset + i}" for i in range(len(batch))],
+            ids=[f"{run_id}_{index_offset + offset + i}" for i in range(len(batch))],
             embeddings=embeddings,
             documents=batch_texts,
             metadatas=[
@@ -134,7 +134,7 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
                     "source": source_name,
                     "page_start": c["page_start"],
                     "page_end": c["page_end"],
-                    "chunk_index": offset + i,
+                    "chunk_index": index_offset + offset + i,
                     # Chroma rejects a None metadata value, so an ownerless chunk simply
                     # has no user_id key - which is exactly what owner_filter never matches.
                     **({"user_id": user_id} if user_id else {}),

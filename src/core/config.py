@@ -185,6 +185,19 @@ CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "rag-documents")
 # is a few milliseconds either way - this app has never claimed to serve concurrent load.
 STATE_STORE = _mode_default("STATE_STORE", local="memory", cloud="mongo")
 
+# How many chunks ONE POST /ingest/continue may embed before returning (cloud mode only).
+#
+# A serverless function is killed at maxDuration - 60s in vercel.json - and a 636-page book
+# takes about two minutes to embed and store. "One whole file per request" therefore meant a
+# large upload was killed mid-file, lost its partial work (the manifest entry is written only
+# after the last chunk), and was retried from scratch on the next poll: an infinite loop that
+# burned a function invocation and real embedding tokens on every turn. Bounding the slice is
+# what makes a document of any size ingestable within a fixed request budget.
+#
+# Raise it if maxDuration is raised. Each request re-extracts the PDF (a few seconds) before
+# doing its slice, so very small values spend most of the budget on that fixed overhead.
+INGEST_CHUNKS_PER_REQUEST = int(os.getenv("INGEST_CHUNKS_PER_REQUEST", "400"))
+
 # ---------------------------------------------------------------- Auth (MongoDB + JWT)
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "rag_app")

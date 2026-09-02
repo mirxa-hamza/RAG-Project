@@ -1834,6 +1834,61 @@ finally:
     ownership_mod._OWNER_OF_RECORD_PATH = _real_owner_path
     ownership_mod._MONGO = _real_owner_mongo
 
+print("\n--- a large PDF ingests across several requests instead of timing out ---")
+# A serverless function is killed at maxDuration. Doing a whole file per invocation meant a
+# big document timed out, lost its partial work (the manifest entry lands only at the end),
+# and was retried from scratch forever. ingest_one() now takes a chunk window and reports
+# "partial", so the same document finishes across however many calls it needs.
+from src.services import ingestion as ing_resume
+
+make_pdf(str(TEST_DATA_DIR / "sliced.pdf"))
+manifest.remove("sliced.pdf")
+vectorstore.delete_source("sliced.pdf")
+
+whole = ing_resume.ingest_one("sliced.pdf", reason="new")
+full_total = whole["chunks_stored"]
+check("the fixture has enough chunks to slice", full_total >= 3)
+
+manifest.remove("sliced.pdf")
+vectorstore.delete_source("sliced.pdf")
+
+# Now the same document one chunk at a time, the way cloud mode would drive it.
+calls, offset, guard = 0, 0, 0
+while True:
+    guard += 1
+    assert guard < 50, "resumption did not terminate"
+    r = ing_resume.ingest_one("sliced.pdf", reason="new", start_chunk=offset, max_chunks=1)
+    calls += 1
+    if r["status"] != "partial":
+        break
+    check_silent = r["next_chunk"] == offset + 1
+    assert check_silent, (r, offset)
+    assert manifest.get("sliced.pdf") is None, "a partial slice must not finish the document"
+    offset = r["next_chunk"]
+
+check("slicing took one call per chunk and then finished", calls == full_total)
+check("the final call reports the document ingested", r["status"] == "ingested")
+check("a partial slice never writes the manifest entry (it is not done yet)",
+      manifest.get("sliced.pdf") is not None)
+
+sliced_rows = [c for c in vectorstore.all_chunks() if c["source"] == "sliced.pdf"]
+check("every chunk landed exactly once across the slices", len(sliced_rows) == full_total)
+check("and the text is not duplicated between slices",
+      len({c["text"] for c in sliced_rows}) == full_total)
+
+# The bug this most protects against: add_chunks numbers chunks from 0 on every call, so
+# without index_offset each slice would overwrite the previous slice's chunk_index range
+# and neighbour expansion (which addresses chunks BY that index) would fetch the wrong text.
+indices = sorted(c["chunk_index"] for c in sliced_rows)
+check("chunk_index stays contiguous across slice boundaries",
+      indices == list(range(full_total)))
+
+check("a resumed slice does not wipe the slices before it",
+      len(sliced_rows) == full_total and full_total > 1)
+
+vectorstore.delete_source("sliced.pdf")
+manifest.remove("sliced.pdf")
+
 print("\n--- a hosted Chroma truncates an unbounded get(): all_chunks() must page ---")
 # A local disk store returns every matching record from one get(), so an unpaginated read
 # looks correct here forever. A HOSTED Chroma caps records per request (300 on the free

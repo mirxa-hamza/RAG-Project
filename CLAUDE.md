@@ -242,8 +242,22 @@ process memory. The reasoning and step-by-step build log live in
   request**:
   - `POST /ingest` (or `/upload/complete`, for the single-file case) computes the queue of
     work and writes a job document to the `ingestion_jobs` Mongo collection, one per user.
-  - `POST /ingest/continue` processes exactly one pending file and returns the updated
-    status, including whether more work remains (`done`). The frontend's polling loop
+  - `POST /ingest/continue` embeds at most `INGEST_CHUNKS_PER_REQUEST` chunks (default 400)
+    of the file at the head of the queue and returns the updated status, including whether
+    more work remains (`done`). It is a bounded SLICE, not a whole file: a serverless
+    function is killed at `maxDuration`, and a 636-page book takes about two minutes, so
+    "one file per request" meant a large upload timed out, lost its partial work, and was
+    retried from scratch forever - one doomed invocation and one wasted batch of embedding
+    tokens per poll. `ingest_one()` takes `start_chunk`/`max_chunks` and returns status
+    `"partial"` with `next_chunk`; the job document keeps that offset on the queued item so
+    the next call resumes where this one stopped. Two invariants make it safe:
+    `delete_source()` runs only on the first slice (`start_chunk == 0`), or a resumed call
+    would wipe everything before it; and `add_chunks(..., index_offset=start_chunk)` keeps
+    `chunk_index` contiguous across slices, without which each slice would renumber from 0
+    and neighbour expansion - which addresses chunks BY that index - would fetch the wrong
+    passages. Both have dedicated tests that fail if either is removed. Re-extracting the
+    PDF on every slice is deliberate: chunking is deterministic, so slice N sees exactly the
+    list slice N-1 saw, and a few seconds of extraction is cheap next to embedding. The frontend's polling loop
     (`pollUntilDone()` in `script.js`) calls this in a loop instead of `GET /ingest/status`
     when `document_store === "cloudinary"` (surfaced by `/stats`).
   - `main.py`'s `lifespan` skips the startup background scan and the embedding warm-up
@@ -442,7 +456,7 @@ shape; revisit them if cloud usage looks different from local.
 - **HTML is served `no-cache`; CSS and JS are cache-busted with `?v=N` in `index.html`.**
   Chrome served a cached `index.html` against a freshly updated `style.css` once and the new
   markup rendered completely unstyled. Bump the `?v=` number whenever you change either
-  static asset (currently `?v=21`).
+  static asset (currently `?v=22`).
 - **Auth code: `pwdlib` with Argon2id, never `passlib`.** passlib is unmaintained and
   breaks against recent bcrypt releases. `PasswordHash.recommended()` also gives hash
   migration for free.
@@ -800,6 +814,20 @@ warning when it sees them.
   nothing has been run against real Cloudinary/Pinecone/Chroma Cloud/Atlas credentials from
   this code yet. Treat a first real deployment as needing its own smoke test, not as
   "already proven."
+- **Cloudinary delivery is PUBLIC, and that is a deliberate, known gap.** Cloudinary
+  restricts `raw`/PDF delivery by default; that restriction was lifted in the dashboard so
+  `cloudinary_store.fetch_bytes()` - a plain unauthenticated GET on the `secure_url` - could
+  read an upload back at `/upload/complete`. The consequence is that **every uploaded PDF is
+  readable by anyone holding its URL**, with no session and no ownership check. The URL
+  contains a ~20-character random segment so it is not guessable, but this is capability-URL
+  security, and the URL is stored in Mongo, appears in logs, and is handled by the browser.
+  That sits awkwardly beside the four isolation rules above, which the rest of the app
+  enforces carefully. It is acceptable for a portfolio deployment and NOT acceptable for real
+  user documents. The fix is to re-restrict delivery in the Cloudinary dashboard and have
+  `fetch_bytes()` authenticate - either a signed delivery URL or an upload with
+  `type=authenticated` - and `scripts/diagnose_cloudinary.py` exists to find out which of
+  those a given account actually accepts, since a wrong signature is rejected with a generic
+  error that no amount of reading the docs will predict.
 - **`scripts/backup.py` does not cover cloud-mode state.** It backs up `data/` and MongoDB
   (which, in cloud mode, includes the `cloud_documents` registry and Mongo-backed state
   collections) but has no Cloudinary-specific backup/restore path - the PDFs themselves

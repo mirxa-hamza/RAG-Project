@@ -156,7 +156,7 @@ def _and(*clauses) -> Optional[Dict]:
 
 
 def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
-               user_id: Optional[str] = None) -> int:
+               user_id: Optional[str] = None, index_offset: int = 0) -> int:
     """Embeds and upserts the chunks of one document. Returns how many were stored."""
     if not chunks:
         return 0
@@ -181,7 +181,7 @@ def add_chunks(source_name: str, chunks: List[Dict], on_progress=None,
                     "source": source_name,
                     "page_start": chunk["page_start"],
                     "page_end": chunk["page_end"],
-                    "chunk_index": offset + i,
+                    "chunk_index": index_offset + offset + i,
                     # An ownerless chunk simply has no user_id key, which is exactly what
                     # owner_filter never matches.
                     **({"user_id": user_id} if user_id else {}),

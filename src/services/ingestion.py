@@ -36,7 +36,8 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from src.services import answer_cache, manifest
-from src.core.config import CHUNK_OVERLAP_WORDS, CHUNK_SIZE_WORDS, DATA_DIR, DOCUMENT_STORE
+from src.core.config import (CHUNK_OVERLAP_WORDS, CHUNK_SIZE_WORDS, DATA_DIR, DOCUMENT_STORE,
+                             INGEST_CHUNKS_PER_REQUEST)
 from src.core.logging import get_logger, timed
 from src.ml.embeddings import split_to_token_limit
 from src.services.pdf import chunk_document, extract_pages
@@ -208,12 +209,25 @@ def _needs_ingest(filename: str, fingerprint: Dict) -> Optional[str]:
 # --------------------------------------------------------------------- ingestion
 
 def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict] = None,
-               on_stage=None) -> Dict:
+               on_stage=None, start_chunk: int = 0,
+               max_chunks: Optional[int] = None) -> Dict:
     """
     Extracts, chunks, embeds, and stores a single PDF, wherever its bytes live.
 
     on_stage: optional callable(stage, done, total) where stage is "extracting" or
     "embedding". The UI turns this into a per-document progress bar.
+
+    start_chunk / max_chunks make this RESUMABLE, which is what lets a document of any size
+    be ingested inside a fixed request budget. Local mode leaves both alone and does the
+    whole file in one call, as it always has. Cloud mode passes a window, because a
+    serverless function is killed at maxDuration: doing a whole 636-page book in one
+    invocation timed out, threw away the partial work, and retried forever.
+
+    A partial call returns status "partial" with `next_chunk`. It deliberately does NOT
+    write the manifest entry or bump the answer cache - those mark a document as finished,
+    and it isn't. Re-extraction on each call is intentional and cheap next to embedding:
+    chunking is deterministic, so slice N sees exactly the chunk list slice N-1 saw, which
+    is what makes resuming by index safe without persisting the chunks anywhere.
     """
     fingerprint = fingerprint or _fingerprint_any(filename)
     owner = owner_of(filename)
@@ -238,7 +252,13 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     # The chunker counts words; the model counts tokens. Anything still over the window is
     # split here rather than being silently truncated at embedding time.
     chunks = split_to_token_limit(chunks)
-    _event(f"Split {len(pages)} pages into {len(chunks)} passages", filename, owner)
+    total_chunks = len(chunks)
+    window = chunks[start_chunk:] if max_chunks is None else chunks[start_chunk:start_chunk + max_chunks]
+    next_chunk = start_chunk + len(window)
+    is_final = next_chunk >= total_chunks
+
+    if start_chunk == 0:
+        _event(f"Split {len(pages)} pages into {total_chunks} passages", filename, owner)
     log.info(
         "'%s': %d pages -> %d chunks. Embedding - a large document takes "
         "several minutes, this is not a hang.",
@@ -254,22 +274,40 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     # next run therefore treats the file as "new" and re-embeds it from scratch, so without
     # this delete the abandoned chunks would pile up as duplicates on every interrupted
     # attempt. Unscoped by owner ON PURPOSE - see the note this had before the cloud split.
-    delete_source(filename)
+    #
+    # ONLY on the first slice: a resumed call must not wipe the slices before it.
+    if start_chunk == 0:
+        delete_source(filename)
 
     if on_stage:
-        on_stage("embedding", 0, len(chunks))
-    _event(f"Embedding and storing {len(chunks)} passages", filename, owner)
+        on_stage("embedding", start_chunk, total_chunks)
+    if start_chunk == 0:
+        _event(f"Embedding and storing {total_chunks} passages", filename, owner)
 
-    with timed(log, f"embed + store '{filename}'"):
-        stored = add_chunks(
-            filename, chunks,
-            on_progress=(lambda done, total: on_stage("embedding", done, total)) if on_stage else None,
+    with timed(log, f"embed + store '{filename}' [{start_chunk}:{next_chunk}]"):
+        add_chunks(
+            filename, window,
+            on_progress=(lambda done, total: on_stage("embedding", start_chunk + done, total_chunks))
+            if on_stage else None,
             user_id=owner,
+            index_offset=start_chunk,
         )
+
+    if not is_final:
+        log.info("'%s': stored %d/%d passages, more to do next call.",
+                 filename, next_chunk, total_chunks)
+        return {
+            "filename": filename,
+            "user_id": owner,
+            "status": "partial",
+            "reason": reason,
+            "next_chunk": next_chunk,
+            "chunks_total": total_chunks,
+        }
 
     # Answers built from the previous version of this document are now wrong.
     answer_cache.bump(owner)
-    _event(f"Ready - {stored} passages searchable", filename, owner, kind="done")
+    _event(f"Ready - {total_chunks} passages searchable", filename, owner, kind="done")
 
     manifest.put(
         filename,
@@ -277,7 +315,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
         mtime=fingerprint["mtime"],
         size=fingerprint["size"],
         pages=len(pages),
-        chunks=stored,
+        chunks=total_chunks,
         user_id=owner,
     )
 
@@ -287,7 +325,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
         "status": "ingested",
         "reason": reason,
         "pages": len(pages),
-        "chunks_stored": stored,
+        "chunks_stored": total_chunks,
     }
 
 
@@ -669,11 +707,18 @@ def continue_job(user_id: str) -> Dict:
         return _job_status_cloud(user_id)
 
     pending = list(job["pending"])
-    item = pending.pop(0)
+
+    # A file already part-way through stays at the head of the queue with the offset it
+    # reached, so this call picks up exactly where the last one stopped. Without that,
+    # each call restarted the same document and a book too big for one invocation could
+    # never finish - it just burned a function call and re-embedded the same chunks.
+    item = pending[0]
     filename = item["filename"]
+    start_chunk = int(item.get("next_chunk") or 0)
 
     jobs.update_one({"_id": user_id}, {"$set": {
-        "current_file": filename, "stage": None, "chunks_done": 0, "chunks_total": 0,
+        "current_file": filename, "stage": None,
+        "chunks_done": start_chunk, "chunks_total": int(item.get("chunks_total") or 0),
     }})
 
     def stage(name: str, done: int, total: int) -> None:
@@ -682,13 +727,30 @@ def continue_job(user_id: str) -> Dict:
 
     try:
         result = ingest_one(filename, reason=item["reason"], fingerprint=item.get("fingerprint"),
-                            on_stage=stage)
+                            on_stage=stage, start_chunk=start_chunk,
+                            max_chunks=INGEST_CHUNKS_PER_REQUEST)
     except Exception as exc:
         log.exception("Failed to ingest '%s'", filename)
         _cloud_event(f"Failed: {type(exc).__name__}", filename, user_id, "error")
         result = {"filename": filename, "user_id": user_id, "status": "failed",
                   "error": f"{type(exc).__name__}: {exc}"}
 
+    # Still mid-document: keep it at the head of the queue, remember how far we got, and
+    # report progress. No result is recorded and files_done does not move - the file is
+    # not done, and counting it would make the progress bar lie.
+    if result.get("status") == "partial":
+        item = dict(item, next_chunk=result["next_chunk"], chunks_total=result["chunks_total"])
+        pending[0] = item
+        jobs.update_one({"_id": user_id}, {"$set": {
+            "pending": pending,
+            "current_file": filename,
+            "stage": "embedding",
+            "chunks_done": result["next_chunk"],
+            "chunks_total": result["chunks_total"],
+        }})
+        return _job_status_cloud(user_id)
+
+    pending.pop(0)
     files_done = job.get("files_done", 0) + 1
     update = {
         "pending": pending,
