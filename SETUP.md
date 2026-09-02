@@ -82,11 +82,11 @@ appended to `.env`; changing or deleting it signs everyone out.
 The repo deliberately ships **no PDFs** — they're large, often copyrighted, and change
 independently of the code.
 
-Two ways to add them. The easy one, once the server is running: press **Add documents** in
-the sidebar and drag PDFs into the window that opens (or click to browse). Each file shows
-its own progress — uploading, then reading pages, then indexing — and only joins *Your
-documents* once it is fully indexed and queryable. You can close that window while it
-works; the sidebar keeps reporting. Up to 100MB per file (`MAX_UPLOAD_MB` in `.env`).
+Two ways to add them. The easy one, once the server is running: press **Documents** in the
+top right and drag PDFs into the panel that slides out (or click to browse). Each file
+shows its own progress — uploading, then reading pages, then indexing — and only joins the
+document list once it is fully indexed and queryable. You can close the panel while it
+works; processing carries on. Up to 100MB per file (`MAX_UPLOAD_MB` in `.env`).
 
 The other way, and the one to use for a big batch, is to put the files into `data/`
 yourself:
@@ -148,10 +148,11 @@ optional; doing it up front just means the app is queryable the moment it boots.
 | Index new or changed PDFs | `python scripts/ingest.py` |
 | See what's currently indexed | `python scripts/ingest.py --status` |
 | Wipe and rebuild everything | `python scripts/ingest.py --force` |
-| Same, without leaving the browser | the **Sync documents** button in the sidebar |
-| Add a PDF from the browser | **Add documents** in the sidebar, then drop or browse |
-| See what the server is doing with it | **Processing status** in the sidebar |
+| Same, without leaving the browser | **Refresh** in the Documents panel |
+| Add a PDF from the browser | **Documents** (top right), then drop or browse |
+| See what the server is doing with it | **Processing status**, in the Documents panel |
 | Remove a document | the bin icon on its card — deletes its passages **and** the PDF |
+| Search only some documents | tick them in the Documents panel; the chip by the send button shows what is searched |
 
 Files are fingerprinted by SHA-256, so re-running is always safe and cheap:
 
@@ -176,8 +177,10 @@ A cold start on a machine with two big textbooks in `data/` looks like this:
 | Extract and chunk the PDFs | ~20s | only for new/changed files |
 | Embed ~3,200 chunks on CPU | 8–9 min | only for new/changed files |
 
-The server is answering requests during the whole embedding phase — it runs in a
-background thread, and the loading screen shows its progress. The second start of the same
+The server answers requests during the whole embedding phase — it runs in a background
+thread, and the top bar's status dot reports "Warming up" / "Indexing" while it happens.
+You can sign in, browse and ask questions throughout; a question asked during warm-up waits
+for the model instead of failing. The second start of the same
 corpus takes seconds, because every file is fingerprinted with SHA-256 and skipped when
 unchanged.
 
@@ -256,7 +259,7 @@ immediately, including on other machines.
 | `ModuleNotFoundError: rank_bm25` etc. | `pip install -r requirements.txt` again — the venv is stale. |
 | Answer says `GROQ_API_KEY is not set` | `.env` is missing or the key line is empty; restart the server after editing it. |
 | `model not found` from Groq | Groq retires models; check <https://console.groq.com/docs/models> and update `GROQ_MODEL` in `.env`. |
-| Sidebar shows no documents | No PDFs in `data/`, or ingestion hasn't run — click **Sync documents**. Remember documents are per-account: another account's uploads are invisible by design. |
+| The Documents panel is empty | No PDFs in `data/`, or ingestion hasn't run — click **Refresh** in that panel. Remember documents are per-account: another account's uploads are invisible by design. |
 | Sign-in says the server can't be reached | MongoDB is down. Start it, then check <http://localhost:8000/api/health/auth>. |
 | Everyone was signed out after a restart | `JWT_SECRET` changed or was cleared in `.env`. |
 | A document you uploaded vanished | You are signed in as a different account than the one that uploaded it. |

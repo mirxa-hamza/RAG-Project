@@ -1,5 +1,5 @@
 """
-Cross-encoder re-ranking - the precision stage of retrieval.
+Re-ranking - the precision stage of retrieval.
 
 A bi-encoder (the embedding model) compresses a chunk into one vector *before* it has ever
 seen the question, so ranking by vector distance is inherently coarse. A cross-encoder
@@ -7,14 +7,31 @@ reads the question and the chunk together and scores that specific pair, which i
 accurate and far too slow to run over a whole corpus. Hence the standard shape: retrieve a
 wide candidate set cheaply, then re-rank it properly and keep the best few.
 
-The model (~80MB) is loaded lazily on first use so that startup, ingestion, and the test
-suite never pay for it when no question has been asked.
+Two backends, chosen by RERANKER_PROVIDER (which defaults from RAG_MODE):
+
+* **local** - a cross-encoder here, loaded lazily on first use (~80MB) so that startup,
+  ingestion and the test suite never pay for it when no question has been asked.
+* **pinecone / cohere** - a hosted re-ranker over HTTP, for cloud mode.
+
+The scales are NOT the same. The local model emits unbounded logits (irrelevant pairs sit
+well below zero); Cohere emits 0..1 relevance. Callers must therefore compare against
+score_floor() rather than a hard-coded constant - using the logit floor on a 0..1 score
+keeps every candidate and quietly disables the "not in these documents" answer.
+
+Both backends fail OPEN: if the model cannot load or the API is rate-limited, rerank()
+returns None and the caller keeps its fused order. Worse ranking beats a failed question -
+but it is invisible, which is why is_available() is on /info.
 """
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from src.core.config import RERANK_MODEL
+from src.core.config import (
+    MIN_RERANK_SCORE,
+    MIN_RERANK_SCORE_API,
+    RERANK_MODEL,
+    RERANKER_PROVIDER,
+)
 from src.core.logging import get_logger, timed
 
 log = get_logger(__name__)
@@ -27,6 +44,30 @@ _RETRY_AFTER_SECONDS = 300
 _lock = threading.Lock()
 _model = None
 _next_retry_at = 0.0
+
+_remote = None
+_remote_lock = threading.Lock()
+
+
+def _get_remote():
+    """The HTTP re-ranker, built once."""
+    global _remote
+    if _remote is not None:
+        return _remote
+    with _remote_lock:
+        if _remote is None:
+            if RERANKER_PROVIDER == "pinecone":
+                from src.ml.providers import PineconeReranker
+                _remote = PineconeReranker()
+            elif RERANKER_PROVIDER == "cohere":
+                from src.ml.providers import CohereReranker
+                _remote = CohereReranker()
+            else:
+                raise ValueError(
+                    f"RERANKER_PROVIDER must be local, pinecone or cohere - got "
+                    f"{RERANKER_PROVIDER!r}"
+                )
+    return _remote
 
 
 def _get_model():
@@ -55,31 +96,65 @@ def _get_model():
     return _model
 
 
+def provider_name() -> str:
+    return RERANKER_PROVIDER
+
+
+def score_floor() -> float:
+    """
+    The minimum score a chunk must reach to be kept, on whichever scale is in use.
+
+    Retrieval calls this instead of reading MIN_RERANK_SCORE directly, because the two
+    backends' scores are not comparable.
+    """
+    return MIN_RERANK_SCORE if RERANKER_PROVIDER == "local" else MIN_RERANK_SCORE_API
+
+
 def available() -> bool:
-    return _get_model() is not None
+    if RERANKER_PROVIDER == "local":
+        return _get_model() is not None
+    return _get_remote().available()
 
 
 def is_available() -> bool:
     """
-    Whether the cross-encoder is loaded and working.
+    Whether re-ranking is working right now.
 
-    Exposed on /info because this stage fails OPEN: if the model cannot load, retrieval
-    quietly falls back to a cosine floor and answers get worse with no error anywhere. That
-    is the right runtime behaviour and the wrong thing to leave invisible.
+    Exposed on /info because this stage fails OPEN: if it cannot run, retrieval quietly
+    falls back to a similarity floor and answers get worse with no error anywhere. That is
+    the right runtime behaviour and the wrong thing to leave invisible.
     """
-    return _model is not None
+    if RERANKER_PROVIDER == "local":
+        return _model is not None
+    return _get_remote().available()
+
+
+def reset_provider() -> None:
+    """Drop cached backends. Only for tests that flip the configuration."""
+    global _model, _remote, _next_retry_at
+    with _lock:
+        _model = None
+        _next_retry_at = 0.0
+    with _remote_lock:
+        _remote = None
 
 
 def rerank(question: str, chunks: List[Dict]) -> Optional[List[Tuple[Dict, float]]]:
     """
-    Returns [(chunk, score), ...] sorted best first, or None if the re-ranker isn't
-    available (caller then keeps its existing order).
+    Returns [(chunk, score), ...] sorted best first, or None if re-ranking isn't available
+    (caller then keeps its existing order).
 
-    Scores are raw cross-encoder logits: unbounded, with clearly-irrelevant pairs well
-    below zero. Compare against config.MIN_RERANK_SCORE, don't read them as probabilities.
+    Compare the scores against score_floor(), not against a literal - see the module
+    docstring on the two scales.
     """
+    if not chunks:
+        return None
+
+    if RERANKER_PROVIDER != "local":
+        return _get_remote().rerank(question, chunks)
+
     model = _get_model()
-    if model is None or not chunks:
+    if model is None:
         return None
 
     pairs = [(question, c["text"]) for c in chunks]

@@ -14,28 +14,12 @@
      installed (Android, ChromeOS); DM Sans is loaded as the closest freely-licensed
      fallback so every other device gets a consistent, near-identical face. -->
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=15">
+<link rel="stylesheet" href="style.css?v=19">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
 </head>
 <body>
 
 <a class="skip-link" href="#questionInput">Skip to the question box</a>
-
-<!-- Boot overlay. Starts HIDDEN and is revealed by script.js only when the app is not yet
-     usable - the server is still starting, the model is still loading, or documents are
-     still being indexed. On a warm start it never appears, so the app is the first and
-     only thing you see. -->
-<div class="boot" id="boot" role="status" aria-live="polite" hidden>
-  <div class="boot__card">
-    <span class="boot__mark" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="26" height="26"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
-    </span>
-    <h1 class="boot__title" id="bootTitle">Starting up…</h1>
-    <p class="boot__text" id="bootText">Waiting for the server.</p>
-    <div class="boot__bar"><div class="boot__bar-fill" id="bootBar"></div></div>
-    <button type="button" class="btn btn--ghost boot__skip" id="bootSkip" hidden>Use it anyway</button>
-  </div>
-</div>
 
 <!-- ───────────────────────── Auth screen ─────────────────────────
      Shown until a valid token is in hand; the app markup below stays in the DOM but
@@ -97,6 +81,23 @@
     </div>
 
     <div class="topbar__right">
+      <button type="button" class="btn btn--ghost topbar__docs" id="docsBtn"
+              title="Your documents" aria-expanded="false" aria-controls="docsPanel">
+        <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6a2 2 0 0 1 2-2h3l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></svg>
+        <span>Documents</span>
+        <span class="pill pill--muted" id="railCount" title="Documents in your library">0</span>
+      </button>
+      <button type="button" class="icon-btn topbar__tool" id="activityBtn"
+              title="Processing status — what the server is doing with your PDFs"
+              aria-label="Processing status">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+        <span class="btn__dot" id="activityDot" hidden aria-hidden="true"></span>
+      </button>
+      <button type="button" class="icon-btn topbar__tool" id="resetBtn"
+              title="Rebuild index — wipe the index and rebuild it from the data folder"
+              aria-label="Rebuild index">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+      </button>
       <span class="status-dot" id="serverStatus" data-state="checking" title="Checking the backend…">
         <span class="status-dot__light" aria-hidden="true"></span>
         <span class="status-dot__label">Checking</span>
@@ -114,56 +115,66 @@
   <!-- ───────────────────────── Sidebar ───────────────────────── -->
   <div class="scrim" id="scrim" hidden></div>
 
-  <aside class="sidebar" id="sidebar" aria-label="Document library">
+  <aside class="sidebar" id="sidebar" aria-label="Conversation">
     <div class="sidebar__inner">
 
       <section class="panel">
         <div class="btn-row">
-          <button id="addBtn" class="btn btn--primary btn--block" title="Add documents">
+          <button id="newChatBtn" class="btn btn--primary btn--block" title="Start a new conversation">
             <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-            <span>Add documents</span>
-          </button>
-          <button id="syncBtn" class="btn btn--ghost btn--block" title="Re-read the server's data folder and index anything new or changed">
-            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
-            <span>Sync documents</span>
-          </button>
-          <button id="resetBtn" class="btn btn--ghost btn--block" title="Wipe the index and rebuild it from the data folder">
-            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
-            <span>Rebuild index</span>
-          </button>
-          <button id="activityBtn" class="btn btn--ghost btn--block" title="What the server is doing with your PDFs">
-            <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
-            <span>Processing status</span>
-            <span class="btn__dot" id="activityDot" hidden aria-hidden="true"></span>
+            <span>New chat</span>
           </button>
         </div>
-
-        <span class="rail-count" id="railCount" title="Documents in your library">0</span>
-
-        <p id="syncStatus" class="status" role="status" aria-live="polite"></p>
-        <div class="progress" id="syncProgress" hidden><div class="progress__bar" id="syncProgressBar"></div></div>
+        <p class="panel__hint">
+          Documents live in the <strong>Documents</strong> panel, top right. Answers are
+          built only from the passages retrieved out of them.
+        </p>
       </section>
 
-      <section class="panel panel--grow">
-        <div class="panel__head">
-          <h2 class="panel__title">Your documents</h2>
-          <span class="pill pill--muted" id="docCount">0</span>
+    </div>
+  </aside>
+
+  <!-- ───────────────────────── Documents panel ─────────────────────────
+       A slide-over rather than a <dialog>: the chat has to stay visible and readable
+       behind it. That means the focus trapping, Esc handling and inertness a dialog gives
+       for free are done by hand in script.js - see openDocs()/closeDocs(). -->
+  <div class="docs-scrim" id="docsScrim" hidden></div>
+
+  <aside class="docs" id="docsPanel" aria-labelledby="docsTitle" aria-hidden="true">
+    <header class="docs__head">
+      <h2 class="docs__title" id="docsTitle">Documents</h2>
+      <button type="button" class="linkish docs__close" id="docsClose">Close</button>
+    </header>
+
+    <div class="docs__body">
+      <label class="dropzone" id="dropzone" for="fileInput">
+        <input type="file" id="fileInput" accept="application/pdf,.pdf" multiple hidden>
+        <svg class="dropzone__icon" viewBox="0 0 24 24" aria-hidden="true" width="26" height="26">
+          <path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+        </svg>
+        <span class="dropzone__title">Drop files or click to upload</span>
+        <span class="dropzone__hint">PDF · up to <span id="maxUploadMb">100</span> MB each</span>
+      </label>
+
+      <ul class="uploads" id="uploadList"></ul>
+
+      <p id="syncStatus" class="status" role="status" aria-live="polite"></p>
+      <div class="progress" id="syncProgress" hidden><div class="progress__bar" id="syncProgressBar"></div></div>
+
+      <div class="docs__listhead">
+        <h3 class="docs__subtitle"><span id="docCount">0</span> documents</h3>
+        <div class="docs__listactions">
+          <button type="button" class="linkish" id="selectAllBtn"
+                  title="Search every document">Select all</button>
+          <button type="button" class="linkish" id="syncBtn"
+                  title="Re-read the server's data folder and index anything new or changed">Refresh</button>
         </div>
-        <ul id="sourceList" class="doc-list">
-          <li class="doc-empty">Nothing ingested yet</li>
-        </ul>
-      </section>
+      </div>
+      <p class="docs__hint">Tick documents to search only those. Nothing ticked searches all of them.</p>
 
-      <section class="panel">
-        <label class="field__label" for="scopeSelect">Search scope</label>
-        <div class="select-wrap">
-          <select id="scopeSelect" class="select">
-            <option value="">All documents</option>
-          </select>
-          <svg class="select-wrap__chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-        </div>
-        <p class="field__help">Limit answers to a single document.</p>
-      </section>
+      <ul id="sourceList" class="doc-list">
+        <li class="doc-empty">Nothing ingested yet</li>
+      </ul>
 
     </div>
   </aside>
@@ -195,65 +206,40 @@
         <div class="composer__field">
           <label class="sr-only" for="questionInput">Your question</label>
           <textarea id="questionInput" class="composer__input" rows="1"
-                    placeholder="Ask a question…"
+                    placeholder="Ask about your documents…"
                     autocomplete="off" enterkeyhint="send"></textarea>
-          <button type="button" id="clearBtn" class="icon-btn composer__clear"
-                  title="Clear the conversation" aria-label="Clear the conversation">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
-          </button>
+
+          <div class="composer__tools">
+            <button type="button" id="attachBtn" class="chip-btn" title="Add a document">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.4 12.7 20.7a5 5 0 0 1-7-7l8.3-8.4a3.3 3.3 0 0 1 4.7 4.7l-8.3 8.3a1.7 1.7 0 0 1-2.4-2.4l7.7-7.7"/></svg>
+              <span>Attach file</span>
+            </button>
+            <button type="button" id="clearBtn" class="chip-btn" title="Clear the conversation">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+              <span>New chat</span>
+            </button>
+            <button type="button" id="scopeBtn" class="chip-btn composer__scope"
+                    title="Which documents are searched" aria-expanded="false"
+                    aria-controls="docsPanel">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6a2 2 0 0 1 2-2h3l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></svg>
+              <span id="scopeLabel">All documents</span>
+            </button>
+            <button type="submit" id="sendBtn" class="composer__send" aria-label="Send">
+              <span class="composer__send-text">Ask</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg>
+            </button>
+          </div>
         </div>
-        <button type="submit" id="sendBtn" class="btn btn--primary composer__send">
-          <span class="composer__send-text">Ask</span>
-          <svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-        </button>
       </form>
       <p class="composer__meta">
         <span id="apiBase" class="composer__origin"></span>
         <span class="composer__hint">Enter to send · Shift + Enter for a new line</span>
       </p>
     </div>
+
   </main>
 
 </div>
-
-<!-- ───────────────────────── Upload dialog ─────────────────────────
-     A <dialog> rather than a hand-rolled overlay: the browser gives focus trapping,
-     Esc-to-close, inertness of the page behind it and the top-layer stacking for free. -->
-<dialog class="modal" id="uploadModal" aria-labelledby="uploadModalTitle">
-  <form method="dialog" class="modal__close-form">
-    <button class="icon-btn modal__close" id="uploadClose" aria-label="Close">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
-    </button>
-  </form>
-
-  <h2 class="modal__title" id="uploadModalTitle">Add documents</h2>
-  <p class="modal__text">
-    PDFs are uploaded to the server's <code>data/</code> folder and indexed there. A
-    document joins your library once it has finished processing.
-  </p>
-
-  <label class="dropzone" id="dropzone" for="fileInput">
-    <input type="file" id="fileInput" accept="application/pdf,.pdf" multiple hidden>
-    <svg class="dropzone__icon" viewBox="0 0 24 24" aria-hidden="true" width="26" height="26">
-      <path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
-    </svg>
-    <span class="dropzone__title">Drag &amp; drop PDFs here</span>
-    <span class="dropzone__hint">or click to browse · up to <span id="maxUploadMb">100</span> MB each</span>
-  </label>
-
-  <ul class="uploads" id="uploadList"></ul>
-
-  <p class="modal__note" id="uploadNote">
-    Large books take a few minutes to index. You can close this window — processing carries
-    on and the progress stays visible in the sidebar.
-  </p>
-  <p class="modal__note modal__note--privacy">
-    <strong>Where your documents go.</strong> PDFs are stored on this server and indexed
-    locally — extraction, embedding and search never leave the machine. When you ask a
-    question, the passages that match it (up to ~24,000 characters) are sent to Groq to
-    write the answer. Don't upload anything you can't share with that service.
-  </p>
-</dialog>
 
 <!-- ───────────────────────── Account dialog ───────────────────────── -->
 <dialog class="modal" id="accountModal" aria-labelledby="accountTitle">
@@ -338,6 +324,6 @@
   </p>
 </dialog>
 
-<script src="script.js?v=15"></script>
+<script src="script.js?v=19"></script>
 </body>
 </html>

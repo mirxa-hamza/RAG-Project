@@ -142,7 +142,7 @@ relative path.
 Files are fingerprinted by content hash, so re-running is always safe: unchanged files are
 skipped, and an edited PDF is re-ingested (its old chunks are deleted first, not
 duplicated). You can also trigger the same scan at runtime with `POST /ingest`, or the
-"Sync documents" button in the frontend — both run in the background.
+"Refresh" button in the Documents panel — both run in the background.
 
 The first run downloads the embedding model (~130MB) and then caches it. Embedding a large
 book is real CPU work and can take several minutes.

@@ -18,7 +18,6 @@ from src.ml import reranker
 from src.services import bm25, vectorstore
 from src.core.config import (
     HYBRID_ENABLED,
-    MIN_RERANK_SCORE,
     MIN_SIMILARITY,
     NEIGHBOR_EXPANSION,
     RERANK_ENABLED,
@@ -112,7 +111,7 @@ def _expand_neighbors(chunks: List[Dict], radius: int,
 def retrieve(
     question: str,
     top_k: int = 4,
-    source: Optional[str] = None,
+    source=None,
     *,
     user_id: Optional[str] = None,
     use_rerank: Optional[bool] = None,
@@ -122,6 +121,9 @@ def retrieve(
     """
     Returns the chunks to answer `question` from, best first, or [] when nothing clears
     the relevance floor (the caller should then say so instead of calling the LLM).
+
+    `source` narrows the search to one document name or a list of them; None searches the
+    whole library.
 
     `user_id` scopes retrieval to one person's documents and MUST be passed on every
     request path. It is threaded into all three stages that can reach stored text - the
@@ -161,13 +163,17 @@ def retrieve(
         if use_rerank:
             ranked = reranker.rerank(question, candidates)
             if ranked is not None:
+                # The floor comes from the re-ranker, not from config directly: a local
+                # cross-encoder scores in unbounded logits and Cohere Rerank scores 0..1,
+                # so one hard-coded constant would be wrong for one of them.
+                floor = reranker.score_floor()
                 kept = [dict(chunk, rerank_score=round(score, 3))
-                        for chunk, score in ranked if score >= MIN_RERANK_SCORE]
+                        for chunk, score in ranked if score >= floor]
                 if not kept:
                     log.info(
-                        "No candidate cleared MIN_RERANK_SCORE=%s (best was %.2f) - "
-                        "treating the question as unanswerable from these documents.",
-                        MIN_RERANK_SCORE, ranked[0][1],
+                        "No candidate cleared the %s re-ranker's floor of %s (best was "
+                        "%.2f) - treating the question as unanswerable from these documents.",
+                        reranker.provider_name(), floor, ranked[0][1],
                     )
                     return []
                 candidates = kept

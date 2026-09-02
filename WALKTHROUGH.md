@@ -209,7 +209,7 @@ the answer cache all live in the process, and ChromaDB's client is single-proces
 
 **Models load lazily.** Uvicorn imports the app *before* it opens the port, so loading a
 model at import time keeps the port shut for ~18 seconds and the browser says "connection
-refused". They load in a warm-up thread instead, behind the loading screen.
+refused". They load in a warm-up thread instead, while the app is already usable.
 
 ---
 

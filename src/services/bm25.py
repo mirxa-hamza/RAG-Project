@@ -110,7 +110,7 @@ def _get(user_id: str) -> Tuple[Optional[BM25Okapi], List[Dict]]:
     return built
 
 
-def search(question: str, limit: int, source: Optional[str] = None,
+def search(question: str, limit: int, source=None,
            user_id: Optional[str] = None) -> List[Tuple[Dict, float]]:
     """
     Returns [(chunk, score), ...] best first. Empty list if the store is empty.
@@ -135,7 +135,10 @@ def search(question: str, limit: int, source: Optional[str] = None,
     if user_id:
         ranked = [pair for pair in ranked if pair[0].get("user_id") == user_id]
     if source:
-        ranked = [pair for pair in ranked if pair[0].get("source") == source]
+        # One document or several - the UI lets a person tick a subset.
+        wanted = {source} if isinstance(source, str) else {s for s in source if s}
+        if wanted:
+            ranked = [pair for pair in ranked if pair[0].get("source") in wanted]
 
     # A zero score means no query term appears in the chunk - not a weak match, no match.
     return [pair for pair in ranked[:limit] if pair[1] > 0]

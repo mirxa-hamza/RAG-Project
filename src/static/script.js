@@ -49,9 +49,16 @@ const el = {
   docCount: $("docCount"),
   chunkCount: $("chunkCount"),
   railCount: $("railCount"),
-  scopeSelect: $("scopeSelect"),
+  scopeBtn: $("scopeBtn"),
+  scopeLabel: $("scopeLabel"),
+  selectAllBtn: $("selectAllBtn"),
   appEl: $("app"),
-  addBtn: $("addBtn"),
+  docsBtn: $("docsBtn"),
+  docsPanel: $("docsPanel"),
+  docsScrim: $("docsScrim"),
+  docsClose: $("docsClose"),
+  newChatBtn: $("newChatBtn"),
+  attachBtn: $("attachBtn"),
   activityBtn: $("activityBtn"),
   activityDot: $("activityDot"),
   activityModal: $("activityModal"),
@@ -61,8 +68,6 @@ const el = {
   activityBar: $("activityBar"),
   activityFile: $("activityFile"),
   activityLog: $("activityLog"),
-  uploadModal: $("uploadModal"),
-  uploadNote: $("uploadNote"),
   dropzone: $("dropzone"),
   fileInput: $("fileInput"),
   uploadList: $("uploadList"),
@@ -252,8 +257,12 @@ el.menuBtn.addEventListener("click", () => {
 
 el.scrim.addEventListener("click", () => setDrawer(false));
 document.addEventListener("keydown", (e) => {
-  // The dialog handles its own Escape; closing the drawer as well would do two things at once.
-  if (e.key === "Escape" && !el.uploadModal.open) setDrawer(false);
+  if (e.key !== "Escape") return;
+  // One Escape closes one thing, topmost first: an open dialog handles its own, then the
+  // documents panel, then the mobile drawer.
+  if (el.accountModal.open || el.activityModal.open) return;
+  if (docsOpen()) { closeDocs(); return; }
+  setDrawer(false);
 });
 
 // Crossing the breakpoint leaves the other mode's state behind: a drawer left open becomes
@@ -265,25 +274,117 @@ window.matchMedia("(max-width: 860px)").addEventListener("change", () => {
 });
 syncMenuButton();
 
-/* ─────────────────────────── Add-documents dialog ───────────────────── */
+/* ─────────────────────────── Search scope ───────────────────────────
+   Which documents a question is answered from. A Set of filenames rather than one value,
+   because a person can tick several - and an EMPTY set deliberately means "all of them",
+   not "none". "Search nothing" is not a state worth being able to reach by accident: it
+   would answer "not in these documents" to everything, and look like a broken index.
+   ==================================================================== */
 
-function openUploadModal() {
-  clearFinishedUploads();
-  if (!el.uploadModal.open) el.uploadModal.showModal();
-  setDrawer(false);        // on a phone the drawer would sit over the dialog's backdrop
+const scope = new Set();
+
+function scopeList() {
+  return [...scope];
 }
 
-el.addBtn.addEventListener("click", openUploadModal);
+function renderScope(available) {
+  // Documents deleted since the last render must not stay in the selection - the filter
+  // would keep narrowing the search to a document the server no longer has.
+  if (available) {
+    for (const name of [...scope]) if (!available.includes(name)) scope.delete(name);
+  }
 
-// Clicking the backdrop closes it. The dialog element itself covers the whole viewport, so
-// "outside" means the click landed on the dialog box but not on its content.
-el.uploadModal.addEventListener("click", (e) => {
-  if (e.target !== el.uploadModal) return;
-  const box = el.uploadModal.getBoundingClientRect();
-  const outside =
-    e.clientX < box.left || e.clientX > box.right ||
-    e.clientY < box.top || e.clientY > box.bottom;
-  if (outside) el.uploadModal.close();
+  const total = available ? available.length : null;
+  el.scopeLabel.textContent =
+    scope.size === 0 ? "All documents"
+      : scope.size === 1 ? shortDocName(scopeList()[0])
+        : `${scope.size} document${scope.size === 1 ? "" : "s"}`;
+  el.scopeBtn.title = scope.size === 0
+    ? "Searching every document. Tick documents in the panel to narrow it."
+    : `Searching ${scope.size} of ${total ?? "?"} documents.`;
+  el.scopeBtn.classList.toggle("is-active", scope.size > 0);
+
+  if (el.selectAllBtn) {
+    el.selectAllBtn.textContent = scope.size === 0 ? "Select all" : "Clear selection";
+  }
+  document.querySelectorAll(".doc-pick").forEach((box) => {
+    box.checked = scope.has(box.dataset.doc);
+  });
+}
+
+// The scope chip is a shortcut into the panel, where the ticking happens.
+if (el.scopeBtn) el.scopeBtn.addEventListener("click", () => openDocs());
+
+if (el.selectAllBtn) el.selectAllBtn.addEventListener("click", () => {
+  // "Select all" and "no selection" mean the same search, so the button clears rather than
+  // ticking every box - fewer boxes to untick afterwards, same result.
+  scope.clear();
+  renderScope();
+});
+
+/* ─────────────────────────── Documents slide-over ────────────────────
+   The panel is a plain aside, not a <dialog>, because the chat has to stay visible behind
+   it. Everything a dialog would have given for free is therefore explicit here: focus goes
+   into the panel on open and back to the button on close, Escape closes it, and the panel
+   is made non-interactive (visibility: hidden in CSS) rather than merely slid away, so its
+   buttons are not still reachable by Tab.
+   ==================================================================== */
+
+let docsOpener = null;
+
+function docsOpen() {
+  return el.docsPanel.classList.contains("is-open");
+}
+
+function openDocs() {
+  if (docsOpen()) return;
+  docsOpener = document.activeElement;
+  clearFinishedUploads();
+
+  el.docsScrim.hidden = false;
+  // One frame between "displayed" and "is-open" so the opacity transition has two states
+  // to move between; without it the scrim appears fully opaque immediately.
+  requestAnimationFrame(() => el.docsScrim.classList.add("is-open"));
+
+  el.docsPanel.classList.add("is-open");
+  el.docsPanel.setAttribute("aria-hidden", "false");
+  el.docsBtn.setAttribute("aria-expanded", "true");
+  setDrawer(false);          // on a phone the drawer would sit under the panel's scrim
+
+  el.docsClose.focus({ preventScroll: true });
+  refreshSources();          // the list is real backend data, so re-read it on every open
+}
+
+function closeDocs() {
+  if (!docsOpen()) return;
+  el.docsPanel.classList.remove("is-open");
+  el.docsPanel.setAttribute("aria-hidden", "true");
+  el.docsBtn.setAttribute("aria-expanded", "false");
+  el.docsScrim.classList.remove("is-open");
+  // Hide it only once the fade has finished, and only if it was not reopened meanwhile.
+  window.setTimeout(() => { if (!docsOpen()) el.docsScrim.hidden = true; }, 200);
+
+  if (docsOpener && document.contains(docsOpener)) docsOpener.focus({ preventScroll: true });
+  docsOpener = null;
+}
+
+el.docsBtn.addEventListener("click", () => (docsOpen() ? closeDocs() : openDocs()));
+el.docsClose.addEventListener("click", closeDocs);
+el.docsScrim.addEventListener("click", closeDocs);
+if (el.attachBtn) el.attachBtn.addEventListener("click", openDocs);
+
+// Keep Tab inside the panel while it is open. Without this, tabbing past the last control
+// lands in the chat behind a scrim that is meant to be blocking it.
+el.docsPanel.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab" || !docsOpen()) return;
+  const focusable = el.docsPanel.querySelectorAll(
+    'a[href], button:not(:disabled), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  );
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
 /* ─────────────────────────── Server status ──────────────────────────── */
@@ -619,9 +720,14 @@ async function refreshSources() {
       ? `<li class="doc-empty">Nothing ingested yet</li>`
       : docs.map((d) => `
         <li title="${escapeHtml(d.filename)}">
+          <label class="doc-pick-wrap" title="Search this document">
+            <input type="checkbox" class="doc-pick" data-doc="${escapeHtml(d.filename)}">
+            <span class="sr-only">Search ${escapeHtml(shortDocName(d.filename))}</span>
+          </label>
           <div class="doc-text">
             <span class="doc-name">${escapeHtml(shortDocName(d.filename))}</span>
-            <span class="doc-meta">${d.pages ?? "?"} pages · ${(d.chunks ?? 0).toLocaleString()} chunks</span>
+            <span class="doc-meta">${d.size ? `${humanSize(d.size)} · ` : ""}${d.pages ?? "?"} pages · ${(d.chunks ?? 0).toLocaleString()} chunks</span>
+            <span class="doc-state">ready</span>
           </div>
           <button type="button" class="icon-btn doc-remove" data-doc="${escapeHtml(d.filename)}"
                   title="Remove this document" aria-label="Remove ${escapeHtml(shortDocName(d.filename))}">
@@ -629,11 +735,8 @@ async function refreshSources() {
           </button>
         </li>`).join("");
 
-    // Keep the scope dropdown in sync with what is actually stored.
-    const previous = el.scopeSelect.value;
-    el.scopeSelect.innerHTML = `<option value="">All documents</option>` +
-      docs.map((d) => `<option value="${escapeHtml(d.filename)}">${escapeHtml(shortDocName(d.filename))}</option>`).join("");
-    if (docs.some((d) => d.filename === previous)) el.scopeSelect.value = previous;
+    // Re-tick whatever is still selected, and drop anything that has been deleted.
+    renderScope(docs.map((d) => d.filename));
 
     setActivityRunning(Boolean(data.ingesting));
     // A job may already be running when the page loads (e.g. the server just started).
@@ -644,6 +747,14 @@ async function refreshSources() {
 }
 
 /* ─────────────────────────── Remove a document ───────────────────────── */
+
+el.sourceList.addEventListener("change", (e) => {
+  const box = e.target.closest(".doc-pick");
+  if (!box) return;
+  if (box.checked) scope.add(box.dataset.doc);
+  else scope.delete(box.dataset.doc);
+  renderScope();
+});
 
 el.sourceList.addEventListener("click", async (e) => {
   const btn = e.target.closest(".doc-remove");
@@ -673,11 +784,19 @@ el.sourceList.addEventListener("click", async (e) => {
 
 /* ─────────────────────────── Chat ───────────────────────────── */
 
-el.clearBtn.addEventListener("click", () => {
+/** Start over: drop the conversation and its history, keep the documents. */
+function newChat() {
   history = [];
   el.messages.replaceChildren(el.welcome);
   el.welcome.hidden = false;
   el.questionInput.focus();
+}
+
+// Two entry points, one behaviour: the sidebar button and the one inside the composer.
+el.clearBtn.addEventListener("click", newChat);
+if (el.newChatBtn) el.newChatBtn.addEventListener("click", () => {
+  newChat();
+  if (isNarrow()) setDrawer(false);   // on a phone the drawer covers what you just cleared
 });
 
 // Enter sends, Shift+Enter makes a new line.
@@ -762,7 +881,9 @@ el.chatForm.addEventListener("submit", async (e) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         question,
-        source: el.scopeSelect.value || null,
+        // A list, so a question can be scoped to several documents at once. Empty means
+        // "search everything", which is what the server treats null as.
+        sources: scopeList(),
         history,
       }),
     });
@@ -1001,7 +1122,8 @@ function resetAppState() {
   el.sourceList.innerHTML = `<li class="doc-empty">Nothing ingested yet</li>`;
   el.docCount.textContent = "0";
   if (el.railCount) el.railCount.textContent = "0";
-  el.scopeSelect.innerHTML = `<option value="">All documents</option>`;
+  scope.clear();
+  renderScope([]);
   el.uploadList.replaceChildren();
   uploadCards.clear();
   if (el.accountModal.open) el.accountModal.close();
@@ -1014,7 +1136,7 @@ function resetAppState() {
   el.syncProgress.hidden = true;
   el.questionInput.value = "";
   autoGrow();
-  if (el.uploadModal.open) el.uploadModal.close();
+  closeDocs();
 }
 
 function startSession(username) {
@@ -1026,7 +1148,9 @@ function startSession(username) {
   // The composer could not be measured while the app was hidden; now it can.
   autoGrow();
   refreshSources();
-  boot();
+  // Not awaited: the chat is usable immediately and this only updates the status dot.
+  watchStartup();
+  el.questionInput.focus();
 }
 
 function endSession(message) {
@@ -1093,7 +1217,9 @@ const STAGE_LABELS = {
 
 function jobPercent(job) {
   const files = job.files_total || 0;
-  if (!files) return job.state === "running" ? null : 100;
+  // Idle with nothing ever run is 0%, not 100%: a full red bar under the word "Idle" reads
+  // as "something finished just now" when in fact nothing has happened at all.
+  if (!files) return job.state === "running" ? null : (job.results || []).length ? 100 : 0;
   let percent = (job.files_done / files) * 100;
   if (job.chunks_total) percent += (job.chunks_done / job.chunks_total) * (100 / files);
   return Math.min(100, Math.round(percent));
@@ -1271,73 +1397,37 @@ el.deleteAccountBtn.addEventListener("click", async () => {
   }
 });
 
-/* ─────────────────────────── Boot ───────────────────────────── */
+/* ─────────────────────────── Startup watch ─────────────────────────
+   There is no loading screen any more. The app is shown as soon as the session is settled,
+   and the two slow things a cold start does - loading the embedding model (~15s) and
+   indexing whatever is in the data folder - are reported in the top bar's status dot while
+   they happen in the background.
 
-/**
- * Hold a loading screen up until the app is actually usable.
- *
- * Two things used to look like breakage on a cold start: opening the page while uvicorn
- * was still importing torch (the browser shows a connection error, so the overlay retries
- * instead of giving up), and opening it during the first ingest (the index is empty, so
- * every question would answer "not in these documents"). The overlay reports which of the
- * two is happening and lets you in anyway.
- */
-async function boot() {
-  const box = $("boot");
-  const title = $("bootTitle");
-  const text = $("bootText");
-  const bar = $("bootBar");
-  const skip = $("bootSkip");
+   Blocking the UI on them was the wrong trade: you can read the page, open the Documents
+   panel, and type a question during the wait, and a question asked early simply waits for
+   the model rather than failing. The one thing that IS worth saying out loud is when the
+   index is still being built, because an answer then may be missing passages - the dot's
+   label and tooltip say so.
+   ==================================================================== */
 
-  let dismissed = false;
-  const close = () => {
-    if (dismissed) return;
-    dismissed = true;
-    if (!box.hidden) {
-      box.classList.add("boot--closing");
-      setTimeout(() => { box.hidden = true; }, 300);
-    }
-    el.questionInput.focus();
-  };
-  skip.addEventListener("click", close);
-
-  // The overlay starts hidden and is only revealed if the app is NOT immediately usable.
-  // On a warm start /stats answers in a few milliseconds, so nothing flashes over the UI
-  // at all; the loading screen exists for the cold start, not for every page load.
-  const reveal = () => {
-    if (!dismissed) box.hidden = false;
-  };
-
-  const indeterminate = (on) =>
-    bar.classList.toggle("boot__bar-fill--indeterminate", on);
-  indeterminate(true);
-
-  const startedAt = Date.now();
-
-  while (!dismissed) {
+async function watchStartup() {
+  while (true) {
     let stats = null;
     try {
       stats = await (await authFetch("/stats")).json();
     } catch {
-      // Server not listening yet — normal for the first ~20s while the models load.
-      reveal();
-      const secs = Math.round((Date.now() - startedAt) / 1000);
-      title.textContent = "Starting up…";
-      text.textContent = secs > 5
-        ? `Waiting for the server (${secs}s). It loads the embedding model on startup.`
-        : "Waiting for the server.";
-      await sleep(1000);
+      // Server not listening yet, or a transient failure. Normal for the first seconds of
+      // a cold start; keep checking rather than declaring it offline.
+      setServerStatus("checking", "Starting", "Waiting for the server to answer…");
+      await sleep(1500);
       continue;
     }
 
     if (stats.embedding_model_ready === false && !stats.ingesting) {
-      // Port is open but the embedding model is still loading in its warm-up thread.
-      reveal();
-      title.textContent = "Loading the search model…";
-      text.textContent = "About 15 seconds. It only happens once per server start.";
-      indeterminate(true);
-      skip.hidden = false;
-      await sleep(1000);
+      setServerStatus("busy", "Warming up",
+        "Loading the search model (about 15 seconds, once per server start). " +
+        "You can type a question now - it will answer as soon as the model is ready.");
+      await sleep(1500);
       continue;
     }
 
@@ -1348,29 +1438,19 @@ async function boot() {
       } catch { /* transient; the next loop retries */ }
       const done = job.files_done ?? 0;
       const total = job.files_total ?? 0;
-      reveal();
-      title.textContent = "Indexing your documents…";
       const current = job.current_file ? ` — ${shortDocName(job.current_file)}` : "";
-      text.textContent = total
-        ? `Document ${Math.min(done + 1, total)} of ${total}${current}. Only happens once per file; later starts reuse the index.`
-        : "Reading the data folder…";
-      if (total) {
-        indeterminate(false);
-        bar.style.width = `${Math.round((done / total) * 100) || 4}%`;
-      }
-      // Nothing to answer from yet, but a partially built index is already queryable.
-      skip.hidden = (stats.total_chunks || 0) === 0;
+      setServerStatus("busy", "Indexing",
+        total
+          ? `Indexing document ${Math.min(done + 1, total)} of ${total}${current}. ` +
+            "Answers may be missing passages until it finishes."
+          : "Reading the data folder…");
       await sleep(1500);
       continue;
     }
 
-    // An empty index is not a reason to hold the app back any more - "Add documents" is
-    // right there in the sidebar, and blocking the UI would hide the very button that
-    // fixes it.
-    break;
+    setServerStatus("online", "Online", `Connected to ${window.location.origin}`);
+    return;
   }
-
-  close();
 }
 
 /**

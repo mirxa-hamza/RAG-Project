@@ -142,7 +142,8 @@ def summary(user_id: Optional[str] = None) -> Dict:
     return {
         "sources": sorted(entries.keys()),
         "documents": [
-            {"filename": name, **{k: rec[k] for k in ("pages", "chunks", "ingested_at") if k in rec}}
+            {"filename": name,
+             **{k: rec[k] for k in ("pages", "chunks", "size", "ingested_at") if k in rec}}
             for name, rec in sorted(entries.items())
         ],
     }

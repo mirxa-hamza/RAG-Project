@@ -398,6 +398,15 @@ svg {
 
 /* Room for the remove button beside the text. */
 .doc-list li { display: flex; align-items: flex-start; gap: 8px; }
+
+/* The tick box that decides whether a document is searched. Its own label element, so the
+   hit area is the box plus its padding rather than 13 square pixels. */
+.doc-pick-wrap { display: flex; align-items: center; padding: 2px 0 0; cursor: pointer; }
+.doc-pick {
+  width: 16px; height: 16px; margin: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
 .doc-text { flex: 1; min-width: 0; }
 
 .doc-remove {
@@ -493,6 +502,15 @@ svg {
 
 .doc-name { display: block; font-size: 12.5px; font-weight: 500; line-height: 1.45; overflow-wrap: anywhere; }
 .doc-meta { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-subtle); }
+/* "ready" is the honest label here: the list is built from the manifest, and an entry is
+   written only after the last chunk of that file is stored. Anything still processing is
+   in the upload cards above, not in this list. */
+.doc-state {
+  display: inline-block; margin-top: 6px;
+  padding: 2px 9px; border-radius: var(--r-full);
+  font-size: 11px; font-weight: 500;
+  color: var(--success); background: #e9f6ef; border: 1px solid #c9e9d8;
+}
 
 .doc-empty {
   font-size: 12.5px; color: var(--text-subtle);
@@ -530,7 +548,14 @@ svg {
   grid-area: chat;
   display: flex; flex-direction: column;
   min-width: 0; min-height: 0;
-  background: var(--bg);
+  /* A soft glow off the existing brand tokens rather than a flat grey. Two very low-alpha
+     radial washes over --bg: enough to give the messages something to sit on, not enough
+     to change the palette or hurt text contrast. */
+  background:
+    radial-gradient(90% 55% at 8% -6%, var(--brand-100) 0%, transparent 62%),
+    radial-gradient(70% 50% at 102% 4%, var(--n-200) 0%, transparent 60%),
+    radial-gradient(80% 45% at 50% 108%, var(--brand-50) 0%, transparent 65%),
+    var(--bg);
 }
 
 .messages {
@@ -707,6 +732,7 @@ svg {
   cursor: pointer; border-radius: 5px;
 }
 .linkish:hover { text-decoration: underline; }
+.linkish:disabled { opacity: .5; cursor: progress; text-decoration: none; }
 
 /* ── Signed-in identity in the top bar ─────────────────────────── */
 .who {
@@ -780,6 +806,10 @@ svg {
 .activity__log li[data-kind="error"] .activity__mark { color: var(--danger); }
 .activity__doc { display: block; font-size: 11px; color: var(--text-subtle); }
 .activity__time { font-size: 11px; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+/* The rows of this log are a 3-column grid (mark, text, time). The empty-state row has
+   none of that structure, so as a grid item it landed in the 14px mark column and wrapped
+   one word per line. It is a sentence, not a row. */
+.activity__log li.activity__empty { display: block; padding: 10px 2px; }
 .activity__empty { color: var(--text-subtle); font-style: italic; }
 
 /* ── Account dialog ────────────────────────────────────────────── */
@@ -914,53 +944,113 @@ svg {
 
 .rewritten { margin-top: 8px; font-size: 11.5px; color: var(--text-subtle); font-style: italic; }
 
-/* ── Composer ──────────────────────────────────────────────── */
+/* ── Composer ──────────────────────────────────────────────────
+   One rounded container holding the textarea and, below it, the tools row and the send
+   button - rather than a field with a button beside it. The whole box is the click
+   target, which is what makes it feel like the reference designs. */
 .composer-wrap {
-  padding: 12px 24px 16px;
-  background: var(--bg);
-  border-top: 1px solid var(--border);
+  padding: 12px 24px 18px;
+  background: transparent;      /* the chat's gradient shows through */
 }
 
 .composer {
   width: 100%; max-width: var(--measure);
   margin-inline: auto;
-  display: flex; gap: 10px; align-items: flex-end;
 }
 
 .composer__field {
-  position: relative;
-  flex: 1; min-width: 0;
-  display: flex; align-items: flex-end;
+  display: flex; flex-direction: column;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow-xs);
+  border-radius: 22px;
+  padding: 6px 8px 8px;
+  box-shadow: var(--shadow-sm);
   transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
 .composer__field:focus-within { border-color: var(--primary); box-shadow: var(--ring); }
 
 .composer__input {
-  flex: 1;
-  padding: 13px 6px 13px 15px;
-  /* 4 lines (4 x 14.5px x 1.55) plus the 26px of vertical padding. The box grows a line
-     at a time up to here; script.js only turns overflow back on once it is full, so a
-     one-line question never shows a scrollbar. */
+  width: 100%;
+  padding: 12px 12px 6px;
+  /* 4 lines (4 x 15px x 1.55) plus the vertical padding. The box grows a line at a time up
+     to here; script.js only turns overflow back on once it is full, so a one-line question
+     never shows a scrollbar. */
   max-height: 116px;
-  /* One line plus the vertical padding. A floor as well as a ceiling, so the box can never
-     collapse - JS writes an inline height, and a measurement taken while the app was
-     hidden used to write 0. */
-  min-height: 48px;
+  /* A floor as well as a ceiling, so the box can never collapse - JS writes an inline
+     height, and a measurement taken while the app was hidden used to write 0. */
+  min-height: 46px;
   border: 0; background: none; resize: none;
   overflow-y: hidden;
-  font-size: 14.5px; line-height: 1.55;
+  color: var(--text);
+  font: inherit; font-size: 15px; line-height: 1.55;
 }
 .composer__input:focus { outline: none; }
 .composer__input::placeholder { color: var(--text-subtle); }
 
-.composer__clear { margin: 0 6px 6px 0; width: 32px; height: 32px; }
+.composer__tools {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 4px 0 6px;
+}
 
-.composer__send { height: 46px; padding-inline: 20px; }
-.composer__send .btn__icon { width: 17px; height: 17px; }
+/* Pill-shaped secondary actions that live inside the field. */
+.chip-btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 34px; padding-inline: 13px;
+  font: inherit; font-size: 13px; font-weight: 500;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast),
+              color var(--t-fast), transform var(--t-base) var(--ease-out);
+}
+.chip-btn svg {
+  width: 15px; height: 15px; flex: none;
+  fill: none; stroke: currentColor; stroke-width: 1.9;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.chip-btn:hover { color: var(--text); border-color: var(--n-300); background: var(--n-50); }
+.chip-btn:active { transform: scale(.97); }
+.chip-btn:focus-visible { outline: none; box-shadow: var(--ring); border-color: var(--primary); }
+
+/* The scope chip sits at the bottom right of the composer, opposite the send button, and
+   only stands out when the search is actually narrowed - an always-highlighted control
+   would say "something is filtered" when nothing is. */
+.composer__scope {
+  margin-left: auto;
+  max-width: 45%;
+}
+.composer__scope span {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.composer__scope.is-active {
+  color: var(--primary); border-color: var(--brand-200); background: var(--brand-50);
+}
+/* With the scope chip taking the auto margin, the send button just follows it. */
+.composer__tools .composer__send { margin-left: 8px; }
+
+/* The send button is the only round one: it is the primary action and sits hard right. */
+.composer__send {
+  margin-left: auto;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  height: 40px; min-width: 40px; padding-inline: 14px;
+  color: #fff; background: var(--primary);
+  border: 0; border-radius: var(--r-full);
+  font: inherit; font-size: 13.5px; font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow-xs);
+  transition: background var(--t-fast), transform var(--t-base) var(--ease-out);
+}
+.composer__send svg {
+  width: 17px; height: 17px; flex: none;
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.composer__send:hover:not(:disabled) { background: var(--primary-hover); transform: translateY(-1px); }
+.composer__send:active:not(:disabled) { background: var(--primary-active); transform: translateY(0) scale(.97); }
+.composer__send:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+.composer__send:focus-visible { outline: none; box-shadow: var(--ring); }
 
 .composer__meta {
   width: 100%; max-width: var(--measure);
@@ -970,64 +1060,94 @@ svg {
 }
 .composer__origin { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* ── Boot overlay ──────────────────────────────────────────────
-   Covers the app until the backend is reachable and has an index. */
-.boot {
-  position: fixed; inset: 0; z-index: 60;
-  display: grid; place-items: center;
-  padding: 24px;
-  background: var(--bg);
-}
-.boot[hidden] { display: none; }
-.boot--closing { animation: boot-out .28s ease forwards; }
-@keyframes boot-out { to { opacity: 0; visibility: hidden; } }
 
-.boot__card {
-  width: 100%; max-width: 380px;
-  text-align: center;
+/* ── Documents slide-over ──────────────────────────────────────
+   Deliberately NOT a <dialog>: the chat has to stay visible behind it, and a modal dialog
+   renders in the top layer over an inert page. The trade is that focus handling and Esc
+   are done in script.js. */
+.docs-scrim {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(24, 24, 29, .28);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  opacity: 0;
+  transition: opacity var(--t-base);
 }
-.boot__mark {
-  display: grid; place-items: center;
-  width: 52px; height: 52px; margin: 0 auto 18px;
-  border-radius: var(--r-lg);
-  background: var(--primary); color: #fff;
-}
-.boot__mark svg {
-  width: 26px; height: 26px;
-  fill: none; stroke: currentColor; stroke-width: 1.8;
-  stroke-linecap: round; stroke-linejoin: round;
-}
-.boot__title { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
-.boot__text { font-size: 13.5px; color: var(--text-muted); min-height: 2.6em; }
+.docs-scrim[hidden] { display: none; }
+.docs-scrim.is-open { opacity: 1; }
 
-.boot__bar {
-  height: 4px; margin-top: 16px;
-  border-radius: 999px; overflow: hidden;
-  background: var(--border);
+.docs {
+  position: fixed; z-index: 41;
+  inset-block: 0; inset-inline-end: 0;
+  width: min(430px, 92vw);
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border-inline-start: 1px solid var(--border);
+  box-shadow: -18px 0 46px rgba(24, 24, 29, .13);
+  /* Off-screen AND non-interactive when closed: a panel merely translated away still takes
+     tab stops and is read out by a screen reader. */
+  transform: translateX(101%);
+  visibility: hidden;
+  transition: transform var(--t-base) var(--ease-out), visibility var(--t-base);
 }
-.boot__bar-fill {
-  height: 100%; width: 30%;
-  border-radius: 999px;
-  background: var(--primary);
-  transition: width var(--t-base);
-}
-/* No measured progress yet: sweep instead of sitting still. */
-.boot__bar-fill--indeterminate {
-  width: 32%;
-  animation: boot-sweep 1.2s ease-in-out infinite;
-}
-@keyframes boot-sweep {
-  0%   { transform: translateX(-110%); }
-  100% { transform: translateX(320%); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .boot__bar-fill--indeterminate { animation: none; width: 100%; opacity: .35; }
-  .boot--closing { animation: none; }
-}
+.docs.is-open { transform: none; visibility: visible; }
 
-/* .btn sets display, which beats the [hidden] attribute on its own. */
-.boot__skip { margin-top: 18px; }
-.boot__skip[hidden] { display: none; }
+.docs__head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.docs__title { font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
+.docs__close { font-size: 14px; }
+
+.docs__body {
+  flex: 1; min-height: 0;
+  overflow-y: auto;
+  padding: 18px 20px 24px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.docs__body .dropzone { padding: 26px 18px; border-radius: var(--r-lg); }
+
+.docs__listhead {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  margin-top: 4px;
+}
+.docs__listactions { display: flex; align-items: baseline; gap: 14px; }
+.docs__hint { font-size: 11.5px; line-height: 1.5; color: var(--text-subtle); margin-top: -6px; }
+.docs__subtitle {
+  font-size: 11.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-subtle);
+}
+/* Inside the panel the list scrolls with the panel, not on its own - a scroll area inside
+   a scroll area is how a short list ends up with two scrollbars.
+   flex: none is not cosmetic: .docs__body is a flex column, so by default every child may
+   SHRINK below its content once the column overflows. The list did exactly that - it kept
+   its rows at full height while its own box was squeezed to a few pixels, and the rows
+   drew straight over the search-scope and button block underneath. Nothing in this panel
+   may shrink; the panel itself is what scrolls. */
+.docs__body > * { flex: none; }
+.docs .doc-list { overflow: visible; }
+
+.docs__tools {
+  display: flex; flex-direction: column; gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+.docs__tools .btn { justify-content: flex-start; }
+
+.docs .modal__note--privacy { margin-top: auto; }
+
+/* The topbar entry points. */
+.topbar__docs { height: 38px; padding-inline: 13px; }
+/* Processing status and Rebuild index live up here now, as icons: they are occasional
+   maintenance actions, and inside the panel they competed with the document list for
+   attention (and, when the list grew, for space). */
+.topbar__tool { position: relative; }
+.topbar__tool .btn__dot { position: absolute; top: 6px; right: 6px; margin: 0; }
+.topbar__docs .pill { margin-left: 2px; }
+.topbar__docs[aria-expanded="true"] {
+  color: var(--text); border-color: var(--n-300); background: var(--n-50);
+}
 
 /* Scrim behind the mobile drawer */
 .scrim {
@@ -1090,7 +1210,11 @@ svg {
   .app.is-collapsed .rail-count { display: none; }
 
   .messages { padding: 20px 16px 4px; gap: 18px; }
-  .composer-wrap { padding: 10px 16px 14px; }
+  .composer-wrap { padding: 10px 12px 14px; }
+  .topbar__docs span:not(.pill) { position: absolute; width: 1px; height: 1px;
+    margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .topbar__docs { padding-inline: 10px; }
+  .docs { width: min(460px, 96vw); }
   .welcome__title { font-size: 22px; }
   .welcome__steps { flex-direction: column; align-items: stretch; }
   .welcome__steps li { justify-content: flex-start; }
@@ -1098,10 +1222,15 @@ svg {
 
 @media (max-width: 560px) {
   body { font-size: 14.5px; }
+  /* Full width on a phone: 430px of panel on a 390px screen is a panel with a useless
+     sliver of chat beside it. */
+  .docs { width: 100vw; border-inline-start: 0; }
+  .chip-btn span { display: none; }
+  .chip-btn { padding-inline: 10px; }
   .msg { gap: 9px; }
   .msg__avatar { width: 26px; height: 26px; padding: 6px; }
   .msg__bubble { padding: 12px 13px; }
-  .composer__send { padding-inline: 14px; }
+  .composer__send { padding-inline: 0; width: 40px; }
   .composer__send-text { display: none; }
   .composer__hint { display: none; }
   .chip__doc { max-width: 14ch; }
@@ -1117,4 +1246,6 @@ svg {
   .btn:hover, .btn__icon, .icon-btn:hover svg, .doc-list li:hover, .dropzone:hover .dropzone__icon {
     transform: none !important;
   }
+  /* The panel still has to move - it is the whole interaction - but it arrives at once. */
+  .docs { transition-duration: .01ms !important; }
 }

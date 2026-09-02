@@ -1,85 +1,194 @@
 """
 Step 2 of the pipeline: turn text into vectors.
 
-Loading a sentence-transformers model takes a few seconds, so it's loaded once
-(module-level singleton) rather than per request - but LAZILY, on first use.
+There are two ways to do that, chosen by EMBEDDINGS_PROVIDER (which defaults from
+RAG_MODE):
 
-Why lazy matters: uvicorn imports the app before it binds the socket, so anything done at
-import time happens while the port is still closed and the browser answers
-ERR_CONNECTION_REFUSED. Importing torch and loading the model at import cost ~18s of that.
-Now the port opens in a couple of seconds and the model loads in a warm-up thread behind
-the loading screen (see warm_up(), called from the lifespan in src/main.py).
+* **local** - sentence-transformers on this CPU. Free, private, and what development runs
+  on. Loading the model takes a few seconds, so it is a module-level singleton, loaded
+  LAZILY on first use. Why lazy matters: uvicorn imports the app before it binds the
+  socket, so anything done at import time happens while the port is still closed and the
+  browser answers ERR_CONNECTION_REFUSED. Importing torch and loading the model at import
+  cost ~18s of that. Now the port opens in a couple of seconds and the model loads in a
+  warm-up thread behind the loading screen (see warm_up(), called from src/main.py).
+* **pinecone / cohere / jina** - an HTTP call (src/ml/providers.py). Used in cloud mode,
+  where torch does not fit in the bundle and a per-cold-start model load would be paid on
+  every request. Pinecone is the production default because the vectors live there too, so
+  it is one vendor and one key rather than three.
 
-Two details that matter for retrieval quality:
+The rest of the codebase calls embed_passages/embed_query and never learns which one is
+in use.
+
+Two details that matter for retrieval quality either way:
 
 * **Truncation.** Every embedding model has a hard token window and silently truncates
   anything longer - no error, no warning, the tail of the chunk simply never influences
-  whether that chunk gets retrieved. `warn_if_truncated()` makes that visible instead.
-* **Query prefix.** bge/e5-family models are trained with an instruction prefix on the
-  query side only. Embedding queries bare throws away most of the model's advantage over
-  a plain MiniLM. Configured via EMBEDDING_QUERY_PREFIX (set it to "" for MiniLM).
+  whether that chunk gets retrieved. split_to_token_limit() prevents that; with an API
+  provider the token count is an estimate (see providers.estimate_tokens).
+* **Query/passage asymmetry.** bge-family models want an instruction prefix on the QUERY
+  side only (EMBEDDING_QUERY_PREFIX). The API providers express the same idea with an
+  input_type/task field instead, so the prefix is NOT applied to them - doing both would
+  put a bge instruction into a Cohere query for no reason.
 """
 import threading
 from typing import List, Optional
 
-from src.core.config import EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL, EMBEDDING_QUERY_PREFIX
+from src.core.config import (
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_MODEL,
+    EMBEDDING_QUERY_PREFIX,
+    EMBEDDINGS_PROVIDER,
+)
 from src.core.logging import get_logger, timed
 
 log = get_logger(__name__)
 
-_model = None
-_lock = threading.Lock()
+
+class LocalEmbeddings:
+    """sentence-transformers, in this process."""
+
+    name = "local"
+
+    def __init__(self) -> None:
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _get_model(self):
+        """
+        The model singleton. Double-checked locking, because the ingestion thread, the
+        warm-up thread and a request handler can all reach for it at once and the loader is
+        not something to run twice.
+        """
+        if self._model is not None:
+            return self._model
+        with self._lock:
+            if self._model is None:
+                # Imported here, not at module level: `import sentence_transformers` pulls
+                # in torch, which is most of the delay before uvicorn can accept
+                # connections.
+                from sentence_transformers import SentenceTransformer
+
+                log.info(
+                    "Loading embedding model '%s' (first run downloads it, then it's cached)...",
+                    EMBEDDING_MODEL,
+                )
+                with timed(log, "load embedding model"):
+                    self._model = SentenceTransformer(EMBEDDING_MODEL)
+        return self._model
+
+    def warm_up(self) -> None:
+        self._get_model()
+
+    def is_ready(self) -> bool:
+        return self._model is not None
+
+    def max_input_tokens(self) -> int:
+        return int(getattr(self._get_model(), "max_seq_length", 0) or 0)
+
+    def count_tokens(self, text: str) -> int:
+        tokenizer = getattr(self._get_model(), "tokenizer", None)
+        if tokenizer is None:  # e.g. the stub model used by the offline test suite
+            return len(text.split())
+        return len(tokenizer(text)["input_ids"])
+
+    def embed_passages(self, texts: List[str]) -> List[List[float]]:
+        embeddings = self._get_model().encode(
+            texts,
+            batch_size=EMBEDDING_BATCH_SIZE,
+            show_progress_bar=len(texts) > 200,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        embedding = self._get_model().encode(
+            [EMBEDDING_QUERY_PREFIX + text],
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return embedding[0].tolist()
 
 
-def _get_model():
-    """
-    The model singleton. Double-checked locking, because the ingestion thread, the warm-up
-    thread and a request handler can all reach for it at once and the loader is not
-    something to run twice.
-    """
-    global _model
-    if _model is not None:
-        return _model
-    with _lock:
-        if _model is None:
-            # Imported here, not at module level: `import sentence_transformers` pulls in
-            # torch, which is most of the delay before uvicorn can accept connections.
-            from sentence_transformers import SentenceTransformer
+_provider_instance = None
+_provider_lock = threading.Lock()
 
-            log.info(
-                "Loading embedding model '%s' (first run downloads it, then it's cached)...",
-                EMBEDDING_MODEL,
-            )
-            with timed(log, "load embedding model"):
-                _model = SentenceTransformer(EMBEDDING_MODEL)
-    return _model
+
+def _provider():
+    """The configured provider, built once."""
+    global _provider_instance
+    if _provider_instance is not None:
+        return _provider_instance
+    with _provider_lock:
+        if _provider_instance is None:
+            if EMBEDDINGS_PROVIDER == "local":
+                _provider_instance = LocalEmbeddings()
+            elif EMBEDDINGS_PROVIDER == "pinecone":
+                from src.ml.providers import PineconeEmbeddings
+                _provider_instance = PineconeEmbeddings()
+            elif EMBEDDINGS_PROVIDER == "cohere":
+                from src.ml.providers import CohereEmbeddings
+                _provider_instance = CohereEmbeddings()
+            elif EMBEDDINGS_PROVIDER == "jina":
+                from src.ml.providers import JinaEmbeddings
+                _provider_instance = JinaEmbeddings()
+            else:
+                raise ValueError(
+                    f"EMBEDDINGS_PROVIDER must be local, pinecone, cohere or jina - got "
+                    f"{EMBEDDINGS_PROVIDER!r}"
+                )
+            log.info("Embeddings provider: %s", _provider_instance.name)
+    return _provider_instance
+
+
+def provider_name() -> str:
+    """Which backend is in use. Reported on /info; also what the tests assert on."""
+    return _provider().name
+
+
+def reset_provider() -> None:
+    """Drop the cached provider. Only for tests that flip the configuration."""
+    global _provider_instance
+    with _provider_lock:
+        _provider_instance = None
 
 
 def warm_up() -> None:
     """Load the model ahead of the first request. Safe to call from a background thread."""
     try:
-        _get_model()
+        _provider().warm_up()
     except Exception:
         # A failed warm-up must not kill the server; the next real call retries and
         # surfaces the error to whoever asked.
-        log.exception("Embedding model warm-up failed; it will be retried on first use.")
+        log.exception("Embedding warm-up failed; it will be retried on first use.")
 
 
 def is_ready() -> bool:
-    """True once the model is loaded - the app can serve pages before this is true."""
-    return _model is not None
+    """True once embeddings can be produced - the app serves pages before this is true."""
+    try:
+        return _provider().is_ready()
+    except Exception:
+        return False
 
 
 def max_input_tokens() -> int:
     """The model's hard token window. Text longer than this is silently truncated."""
-    return int(getattr(_get_model(), "max_seq_length", 0) or 0)
+    return _provider().max_input_tokens()
 
 
 def count_tokens(text: str) -> int:
-    tokenizer = getattr(_get_model(), "tokenizer", None)
-    if tokenizer is None:  # e.g. the stub model used by the offline test suite
-        return len(text.split())
-    return len(tokenizer(text)["input_ids"])
+    return _provider().count_tokens(text)
+
+
+def embed_passages(texts: List[str]) -> List[List[float]]:
+    """Embed document chunks (ingestion side). Batched, so a big book doesn't spike memory."""
+    return _provider().embed_passages(texts)
+
+
+def embed_query(text: str) -> List[float]:
+    """Embed a user question (retrieval side), with whatever query marking the model wants."""
+    return _provider().embed_query(text)
 
 
 def warn_if_truncated(texts: List[str], sample: int = 25) -> int:
@@ -155,26 +264,3 @@ def split_to_token_limit(chunks: List[dict], limit: Optional[int] = None) -> Lis
         log.info("Split %d oversized chunk(s) to fit the model's %d-token window.",
                  split_count, limit)
     return out
-
-
-def embed_passages(texts: List[str]) -> List[List[float]]:
-    """Embed document chunks (ingestion side). Batched, so a big book doesn't spike memory."""
-    embeddings = _get_model().encode(
-        texts,
-        batch_size=EMBEDDING_BATCH_SIZE,
-        show_progress_bar=len(texts) > 200,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-    return embeddings.tolist()
-
-
-def embed_query(text: str) -> List[float]:
-    """Embed a user question (retrieval side), with the model's query prefix applied."""
-    embedding = _get_model().encode(
-        [EMBEDDING_QUERY_PREFIX + text],
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-    return embedding[0].tolist()

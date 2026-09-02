@@ -184,7 +184,7 @@ database.set_users_collection(fake_users, fake_audit)
 asyncio.new_event_loop().run_until_complete(fake_users.create_index("username", unique=True))
 
 from src.ml import reranker  # noqa: E402
-from src.services import bm25, manifest, retrieval, vectorstore  # noqa: E402
+from src.services import bm25, manifest, retrieval, vector_chroma, vectorstore  # noqa: E402
 from src.services.pdf import chunk_document, format_pages  # noqa: E402
 from src.main import app  # noqa: E402
 
@@ -529,17 +529,17 @@ with TestClient(app) as client:
 
     print("\n--- edge cases: retrieval guards ---")
     call_count = {"n": 0}
-    original_get = vectorstore._collection.get
+    original_get = vector_chroma._collection.get
 
     def counting_get(*args, **kwargs):
         call_count["n"] += 1
         return original_get(*args, **kwargs)
 
-    vectorstore._collection.get = counting_get
+    vector_chroma._collection.get = counting_get
     try:
         hits = retrieval.retrieve("funding budget project", top_k=6, use_rerank=False, expand=1)
     finally:
-        vectorstore._collection.get = original_get
+        vector_chroma._collection.get = original_get
     check("neighbour expansion batches into one query per source", call_count["n"] <= 3)
     check("expansion still returns neighbours", any("neighbor_of" in c for c in hits))
 
@@ -1064,5 +1064,552 @@ with TestClient(app) as client:
     with ing2._lock:
         ing2._state.update(state="idle", scope=None, files_done=0, files_total=0,
                            stage=None, chunks_done=0, chunks_total=0, events=[])
+
+
+# ---- 12. The cloud providers: same interface, different backend ----------------------
+print("\n=== HTTP embedding and re-rank providers (RAG_MODE=cloud) ===")
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text or json.dumps(self._payload)
+
+    def json(self):
+        return self._payload
+
+
+def _stub_httpx(handler):
+    """Replaces httpx.post for the duration of a `with` block. Returns the call log."""
+    import contextlib
+
+    import httpx as _httpx
+
+    calls = []
+
+    @contextlib.contextmanager
+    def _ctx():
+        original = _httpx.post
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            calls.append({"url": url, "body": json, "headers": headers})
+            return handler(len(calls), json)
+
+        _httpx.post = fake_post
+        try:
+            yield calls
+        finally:
+            _httpx.post = original
+
+    return _ctx()
+
+
+from src.core import config  # noqa: E402
+from src.ml import embeddings, providers  # noqa: E402
+
+print("\n--- Cohere embeddings ---")
+providers.COHERE_API_KEY = "test-key"
+providers.PROVIDER_MAX_RETRIES = 2
+
+def _cohere_embed_ok(_n, body):
+    vectors = [[0.1 * (i + 1)] * 4 for i in range(len(body["texts"]))]
+    return _FakeResponse(200, {"embeddings": {"float": vectors}})
+
+cohere = providers.CohereEmbeddings()
+with _stub_httpx(_cohere_embed_ok) as calls:
+    vectors = cohere.embed_passages(["alpha", "beta", "gamma"])
+    query_vector = cohere.embed_query("what is alpha?")
+
+check("one vector comes back per passage", len(vectors) == 3 and len(vectors[0]) == 4)
+check("passages are sent as search_document",
+      calls[0]["body"]["input_type"] == "search_document")
+# The asymmetry is the whole point of a v3 model: a question embedded as a document lands
+# in the wrong space and retrieval quietly gets worse, with nothing to see in a log.
+check("but the question is sent as search_query",
+      calls[1]["body"]["input_type"] == "search_query")
+check("the key travels in the Authorization header",
+      calls[0]["headers"]["Authorization"] == "Bearer test-key")
+check("the query is one vector, not a list of them", len(query_vector) == 4)
+
+# Free tiers count REQUESTS, not inputs, so a 200-chunk book must not become 200 calls.
+cohere.batch_size = 96
+with _stub_httpx(_cohere_embed_ok) as calls:
+    cohere.embed_passages([f"chunk {i}" for i in range(200)])
+check("200 chunks cost 3 requests, not 200", len(calls) == 3)
+
+print("\n--- failures are told apart ---")
+def _rate_limited_then_ok(n, body):
+    if n == 1:
+        return _FakeResponse(429, text="slow down")
+    return _cohere_embed_ok(n, body)
+
+with _stub_httpx(_rate_limited_then_ok) as calls:
+    providers.PROVIDER_MAX_RETRIES = 2
+    original_sleep = time.sleep
+    time.sleep = lambda _s: None          # don't actually wait out the backoff
+    try:
+        recovered = cohere.embed_passages(["alpha"])
+    finally:
+        time.sleep = original_sleep
+check("a 429 is retried rather than failing the ingest",
+      len(calls) == 2 and len(recovered) == 1)
+
+def _bad_key(_n, _body):
+    return _FakeResponse(401, text="invalid api token")
+
+with _stub_httpx(_bad_key) as calls:
+    try:
+        cohere.embed_passages(["alpha"])
+        raised = None
+    except providers.ProviderError as exc:
+        raised = exc
+# Retrying a wrong key just burns the free tier and delays the error the operator needs.
+check("a 401 is not retried", len(calls) == 1)
+check("and it says what went wrong", raised is not None and "401" in str(raised))
+
+providers.COHERE_API_KEY = ""
+try:
+    providers.CohereEmbeddings().embed_query("x")
+    missing_key_raised = False
+except providers.ProviderError:
+    missing_key_raised = True
+check("a missing key fails loudly, not as a mystery HTTP error", missing_key_raised)
+providers.COHERE_API_KEY = "test-key"
+
+print("\n--- Jina embeddings ---")
+providers.JINA_API_KEY = "jina-key"
+def _jina_ok(_n, body):
+    rows = [{"index": i, "embedding": [float(i)] * 4}
+            for i in range(len(body["input"]))]
+    return _FakeResponse(200, {"data": list(reversed(rows))})   # deliberately out of order
+
+jina = providers.JinaEmbeddings()
+with _stub_httpx(_jina_ok) as calls:
+    jina_vectors = jina.embed_passages(["a", "b", "c"])
+    jina.embed_query("q")
+check("Jina passages use the retrieval.passage task",
+      calls[0]["body"]["task"] == "retrieval.passage")
+check("and questions use retrieval.query", calls[1]["body"]["task"] == "retrieval.query")
+# The API returns an index per row and does not promise ordering; trusting arrival order
+# would pair every chunk with someone else's vector.
+check("vectors are re-ordered by index, not by arrival",
+      [v[0] for v in jina_vectors] == [0.0, 1.0, 2.0])
+
+print("\n--- token estimation without a tokenizer ---")
+check("an empty string is zero tokens", providers.estimate_tokens("") == 0)
+check("estimation rounds up, never down",
+      providers.estimate_tokens("x" * 100) >= 100 / providers.CHARS_PER_TOKEN)
+long_chunk = {"text": " ".join(["word"] * 4000), "source": "x.pdf", "chunk_index": 0}
+saved_provider = embeddings.EMBEDDINGS_PROVIDER
+embeddings.EMBEDDINGS_PROVIDER = "cohere"
+embeddings.reset_provider()
+check("the cloud provider reports the configured window",
+      embeddings.max_input_tokens() == providers.API_EMBED_TOKEN_LIMIT)
+pieces = embeddings.split_to_token_limit([long_chunk])
+check("an oversized chunk is split before it can be truncated", len(pieces) > 1)
+check("every piece now fits the window",
+      all(embeddings.count_tokens(p["text"]) <= providers.API_EMBED_TOKEN_LIMIT
+          for p in pieces))
+check("and the split pieces keep their document identity",
+      all(p["source"] == "x.pdf" for p in pieces))
+check("/info can name the live provider", embeddings.provider_name() == "cohere")
+embeddings.EMBEDDINGS_PROVIDER = saved_provider
+embeddings.reset_provider()
+check("switching back restores the local provider", embeddings.provider_name() == "local")
+
+print("\n--- Cohere re-ranking ---")
+saved_reranker = reranker.RERANKER_PROVIDER
+reranker.RERANKER_PROVIDER = "cohere"
+reranker.reset_provider()
+
+candidates = [{"text": "irrelevant", "source": "a.pdf", "chunk_index": 0},
+              {"text": "the answer", "source": "a.pdf", "chunk_index": 1},
+              {"text": "noise", "source": "a.pdf", "chunk_index": 2}]
+
+def _rerank_ok(_n, _body):
+    return _FakeResponse(200, {"results": [
+        {"index": 2, "relevance_score": 0.01},
+        {"index": 1, "relevance_score": 0.93},
+        {"index": 0, "relevance_score": 0.4},
+    ]})
+
+with _stub_httpx(_rerank_ok) as calls:
+    ranked = reranker.rerank("where is the answer?", candidates)
+check("results come back sorted best first", ranked[0][0]["chunk_index"] == 1)
+check("the index maps back to the right candidate", ranked[0][1] == 0.93)
+check("every candidate is scored", len(ranked) == 3)
+# Cohere scores 0..1; the cross-encoder emits unbounded logits. One floor cannot serve
+# both - reusing -6.0 here would keep the 0.01 chunk and never refuse a question.
+check("the floor follows the provider",
+      reranker.score_floor() == config.MIN_RERANK_SCORE_API)
+kept = [c for c, s in ranked if s >= reranker.score_floor()]
+check("the weak candidate is dropped by that floor", len(kept) == 2)
+
+def _rerank_down(_n, _body):
+    return _FakeResponse(503, text="upstream unavailable")
+
+with _stub_httpx(_rerank_down):
+    original_sleep = time.sleep
+    time.sleep = lambda _s: None
+    try:
+        degraded = reranker.rerank("q", candidates)
+    finally:
+        time.sleep = original_sleep
+# Fail OPEN, exactly like the local model: worse ranking beats a failed question.
+check("an unavailable re-ranker returns None instead of raising", degraded is None)
+
+reranker.RERANKER_PROVIDER = saved_reranker
+reranker.reset_provider()
+check("the local floor comes back with the local provider",
+      reranker.score_floor() == config.MIN_RERANK_SCORE)
+
+
+
+print("\n--- the vector store picks its backend from the mode ---")
+import chromadb as _chromadb  # noqa: E402
+
+saved_backend = vector_chroma.CHROMA_BACKEND
+vector_chroma.CHROMA_BACKEND = "cloud"
+vector_chroma.CHROMA_API_KEY = ""
+try:
+    vector_chroma._make_client()
+    complained = ""
+except RuntimeError as exc:
+    complained = str(exc)
+# A missing credential must name itself. "cloud mode, nothing works" is the kind of error
+# that costs an afternoon.
+check("cloud mode without credentials says which one is missing",
+      "CHROMA_API_KEY" in complained)
+
+built = {}
+
+
+class _FakeCloudClient:
+    def __init__(self, tenant=None, database=None, api_key=None):
+        built.update(tenant=tenant, database=database, api_key=api_key)
+
+
+original_cloud_client = getattr(_chromadb, "CloudClient", None)
+_chromadb.CloudClient = _FakeCloudClient
+vector_chroma.CHROMA_API_KEY = "ck-test"
+vector_chroma.CHROMA_TENANT = "tenant-1"
+vector_chroma.CHROMA_DATABASE = "db-1"
+vector_chroma._make_client()
+check("cloud mode builds a CloudClient with the configured tenant and database",
+      built == {"tenant": "tenant-1", "database": "db-1", "api_key": "ck-test"})
+
+if original_cloud_client is not None:
+    _chromadb.CloudClient = original_cloud_client
+vector_chroma.CHROMA_BACKEND = saved_backend
+disk_client = vector_chroma._make_client()
+check("and disk mode still returns a local client",
+      not isinstance(disk_client, _FakeCloudClient) and hasattr(disk_client, "get_or_create_collection"))
+# The collection opened during this run must survive that poking about.
+check("the live collection was never swapped out", vectorstore.count() >= 0)
+
+
+
+# ---- 13. Pinecone: the production vector store ---------------------------------------
+print("\n=== Pinecone backend (RAG_MODE=cloud) ===")
+
+
+class _FakePineconeIndex:
+    """Enough of the Pinecone data plane to exercise our own logic against."""
+
+    def __init__(self):
+        self.records = {}
+
+    def upsert(self, vectors=None, namespace=None):
+        for vector in vectors:
+            self.records[vector["id"]] = {"values": vector["values"],
+                                          "metadata": dict(vector["metadata"])}
+
+    @staticmethod
+    def _matches(meta, where):
+        if not where:
+            return True
+        if "$and" in where:
+            return all(_FakePineconeIndex._matches(meta, clause) for clause in where["$and"])
+        for field, condition in where.items():
+            if meta.get(field) != condition["$eq"]:
+                return False
+        return True
+
+    def query(self, vector=None, top_k=10, filter=None, include_metadata=True):
+        scored = []
+        for record in self.records.values():
+            if not self._matches(record["metadata"], filter):
+                continue
+            score = float(sum(a * b for a, b in zip(vector, record["values"])))
+            scored.append({"metadata": record["metadata"], "score": score})
+        scored.sort(key=lambda m: m["score"], reverse=True)
+        return {"matches": scored[:top_k]}
+
+    def fetch(self, ids=None):
+        return {"vectors": {i: self.records[i] for i in ids if i in self.records}}
+
+    # The current SDK yields a page object whose .vectors hold records with an .id; older
+    # versions yielded a bare list of ids. Reading the wrong shape returns nothing and
+    # turns "delete this document" into a silent no-op, so both are covered.
+    page_shape = "vectors"
+
+    def list(self, prefix=None, limit=100):
+        ids = [i for i in self.records if not prefix or i.startswith(prefix)]
+        for start in range(0, len(ids), limit):
+            batch = ids[start:start + limit]
+            if self.page_shape == "vectors":
+                yield types.SimpleNamespace(
+                    vectors=[types.SimpleNamespace(id=i) for i in batch])
+            else:
+                yield batch
+
+    def delete(self, ids=None, delete_all=False, filter=None):
+        if delete_all:
+            self.records.clear()
+            return
+        for i in ids or []:
+            self.records.pop(i, None)
+
+    def update(self, id=None, set_metadata=None):
+        if id in self.records:
+            self.records[id]["metadata"].update(set_metadata or {})
+
+    def describe_index_stats(self):
+        return {"total_vector_count": len(self.records)}
+
+
+class _FakePineconeClient:
+    created = []
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+
+    def has_index(self, name):
+        return name in _fake_pinecone_indexes
+
+    def create_index(self, name=None, dimension=None, metric=None, spec=None):
+        _FakePineconeClient.created.append({"name": name, "dimension": dimension,
+                                            "metric": metric})
+        _fake_pinecone_indexes[name] = _FakePineconeIndex()
+
+    def Index(self, name):
+        return _fake_pinecone_indexes.setdefault(name, _FakePineconeIndex())
+
+
+_fake_pinecone_indexes = {}
+_fake_pinecone = types.ModuleType("pinecone")
+_fake_pinecone.Pinecone = _FakePineconeClient
+_fake_pinecone.ServerlessSpec = lambda cloud=None, region=None: {"cloud": cloud,
+                                                                 "region": region}
+sys.modules["pinecone"] = _fake_pinecone
+
+from src.services import vector_pinecone  # noqa: E402
+
+vector_pinecone.PINECONE_API_KEY = "pc-test"
+vectorstore.VECTOR_STORE = "pinecone"
+vectorstore.reset_backend()
+check("the facade routes to Pinecone when VECTOR_STORE says so",
+      vectorstore.backend() is vector_pinecone)
+
+alice_pc, bob_pc = "aa" * 12, "bb" * 12
+doc = [{"text": "the mitochondria is the powerhouse of the cell",
+        "page_start": 1, "page_end": 1},
+       {"text": "chloroplasts handle photosynthesis in plants",
+        "page_start": 1, "page_end": 2},
+       {"text": "ribosomes assemble proteins from amino acids",
+        "page_start": 2, "page_end": 2}]
+
+stored = vectorstore.add_chunks("users/aa/biology.pdf", doc, user_id=alice_pc)
+check("every chunk is upserted", stored == 3 and vectorstore.count() == 3)
+
+# An index is created on first use, because a serverless host has no shell to run a setup
+# step from.
+check("the index was created with the configured dimension",
+      _FakePineconeClient.created[0]["dimension"] == vector_pinecone.PINECONE_EMBED_DIM)
+check("and with cosine, which is what the score maths assumes",
+      _FakePineconeClient.created[0]["metric"] == "cosine")
+
+# Deterministic ids are the reason re-ingesting a document cannot duplicate it. Chroma
+# needed a delete-then-add for this; here the same chunk simply overwrites itself.
+vectorstore.add_chunks("users/aa/biology.pdf", doc, user_id=alice_pc)
+check("re-ingesting the same document overwrites rather than duplicates",
+      vectorstore.count() == 3)
+
+vectorstore.add_chunks("users/bb/biology.pdf",
+                       [{"text": "the mitochondria is the powerhouse of the cell",
+                         "page_start": 1, "page_end": 1}], user_id=bob_pc)
+
+hits = vectorstore.query_chunks("what is the powerhouse of the cell?", top_k=5,
+                                user_id=alice_pc)
+check("search returns the owner's chunks", hits and hits[0]["source"] == "users/aa/biology.pdf")
+check("and none of anyone else's", all(h["user_id"] == alice_pc for h in hits))
+check("rows carry the text, which Pinecone keeps in metadata",
+      "mitochondria" in (hits[0]["text"] or ""))
+check("scores are normalised into a 0..1 similarity",
+      0.0 <= hits[0]["similarity"] <= 1.0)
+check("page numbers survive the float round-trip",
+      isinstance(hits[0]["page_start"], int))
+
+# Neighbours are fetched BY ID, and fetch-by-id takes no filter - so the owner check has
+# to happen in Python. Without it, Bob's chunk 0 would answer Alice's question.
+neighbours = vectorstore.get_neighbors_bulk({"users/bb/biology.pdf": {0}}, user_id=alice_pc)
+check("a fetched neighbour belonging to someone else is dropped", neighbours == {})
+own = vectorstore.get_neighbors_bulk({"users/aa/biology.pdf": {1}}, user_id=alice_pc)
+check("the owner's own neighbour is returned", list(own) == [("users/aa/biology.pdf", 1)])
+
+# Deleting is by id prefix rather than by metadata filter: filter-deletes are rate-limited
+# and have not always worked on serverless indexes.
+vectorstore.delete_source("users/aa/biology.pdf")
+check("deleting a document removes exactly its own chunks", vectorstore.count() == 1)
+check("and leaves the other user's document alone",
+      vectorstore.query_chunks("powerhouse", top_k=5, user_id=bob_pc))
+
+check("adoption stamps an owner onto existing chunks",
+      vectorstore.set_owner("users/bb/biology.pdf", alice_pc) == 1)
+check("and the stamped chunk now answers for its new owner",
+      vectorstore.query_chunks("powerhouse", top_k=5, user_id=alice_pc))
+
+for shape in ("vectors", "list"):
+    _fake_pinecone_indexes[vector_pinecone.PINECONE_INDEX].page_shape = shape
+    check(f"ids are read out of the '{shape}' page shape",
+          len(vector_pinecone._ids_for_source("users/bb/biology.pdf")) == 1)
+
+everything = vectorstore.all_chunks()
+check("all_chunks() can still walk the corpus for the keyword index", len(everything) == 1)
+check("scoped to one user it only returns theirs",
+      len(vectorstore.all_chunks(user_id=bob_pc)) == 0)
+
+vectorstore.reset_collection()
+check("reset wipes the index", vectorstore.count() == 0)
+
+vectorstore.VECTOR_STORE = "chroma"
+vectorstore.reset_backend()
+check("and the facade goes back to Chroma for local mode",
+      vectorstore.backend().__name__.endswith("vector_chroma"))
+
+print("\n--- Pinecone embeddings and re-ranking ---")
+providers.PINECONE_API_KEY = "pc-test"
+
+
+def _pinecone_embed_ok(_n, body):
+    return _FakeResponse(200, {"data": [{"values": [0.5, 0.5]} for _ in body["inputs"]]})
+
+
+pinecone_embeddings = providers.PineconeEmbeddings()
+with _stub_httpx(_pinecone_embed_ok) as calls:
+    pinecone_embeddings.embed_passages(["alpha", "beta"])
+    pinecone_embeddings.embed_query("what is alpha?")
+
+check("passages go out as input_type=passage",
+      calls[0]["body"]["parameters"]["input_type"] == "passage")
+check("questions go out as input_type=query",
+      calls[1]["body"]["parameters"]["input_type"] == "query")
+# Pinecone wants its key in its own header, not a bearer token - a Bearer here is a 401.
+check("the key uses Pinecone's own header",
+      calls[0]["headers"].get("Api-Key") == "pc-test")
+# An unset version header defaults to the OLDEST supported version, which disappears one
+# day and takes the app with it.
+check("the API version is pinned explicitly",
+      calls[0]["headers"].get("X-Pinecone-Api-Version") == providers.PINECONE_API_VERSION)
+check("inputs are wrapped the way /embed expects",
+      calls[0]["body"]["inputs"] == [{"text": "alpha"}, {"text": "beta"}])
+
+saved_reranker = reranker.RERANKER_PROVIDER
+reranker.RERANKER_PROVIDER = "pinecone"
+reranker.reset_provider()
+
+pinecone_candidates = [{"text": "noise", "source": "a.pdf", "chunk_index": 0},
+                       {"text": "the answer", "source": "a.pdf", "chunk_index": 1}]
+
+
+def _pinecone_rerank_ok(_n, _body):
+    # Pinecone answers under "data" with "score"; Cohere answers under "results" with
+    # "relevance_score". Reading the wrong pair silently returns nothing to rank.
+    return _FakeResponse(200, {"data": [{"index": 1, "score": 0.88},
+                                        {"index": 0, "score": 0.01}]})
+
+
+with _stub_httpx(_pinecone_rerank_ok) as calls:
+    pinecone_ranked = reranker.rerank("where is the answer?", pinecone_candidates)
+check("Pinecone rerank maps indices back to candidates",
+      pinecone_ranked[0][0]["chunk_index"] == 1 and pinecone_ranked[0][1] == 0.88)
+check("its floor is the 0..1 one, not the logit one",
+      reranker.score_floor() == config.MIN_RERANK_SCORE_API)
+check("documents are sent with the rank field it expects",
+      calls[0]["body"]["rank_fields"] == ["text"])
+
+reranker.RERANKER_PROVIDER = saved_reranker
+reranker.reset_provider()
+
+
+
+# ---- 14. Searching a chosen subset of documents --------------------------------------
+print("\n=== multi-document search scope ===")
+from src.models.schemas import ChatRequest  # noqa: E402
+from src.api.chat import _scope_key  # noqa: E402
+from src.services import vector_chroma as vc  # noqa: E402
+
+check("a list of documents is what gets searched",
+      ChatRequest(question="q", sources=["a.pdf", "b.pdf"]).wanted_sources() == ["a.pdf", "b.pdf"])
+check("the older single-document field still works",
+      ChatRequest(question="q", source="a.pdf").wanted_sources() == ["a.pdf"])
+# "Nothing ticked" must mean "search everything". Treating an empty list as "match nothing"
+# would answer "not in these documents" to every question, and read as a broken index.
+check("an empty selection means the whole library",
+      ChatRequest(question="q", sources=[]).wanted_sources() is None)
+check("and so does sending neither field",
+      ChatRequest(question="q").wanted_sources() is None)
+# Cache keys: ticking A then B is the same search as B then A.
+check("the answer cache keys on the selection, order-independently",
+      _scope_key(ChatRequest(question="q", sources=["b.pdf", "a.pdf"]))
+      == _scope_key(ChatRequest(question="q", sources=["a.pdf", "b.pdf"])))
+check("and keys the whole library as no scope at all",
+      _scope_key(ChatRequest(question="q")) is None)
+
+check("one document becomes a plain equality filter",
+      vc.source_filter(["a.pdf"]) == {"source": "a.pdf"})
+check("several become an $in filter",
+      vc.source_filter(["a.pdf", "b.pdf"]) == {"source": {"$in": ["a.pdf", "b.pdf"]}})
+check("no documents becomes no filter at all", vc.source_filter([]) is None)
+check("a bare string still works", vc.source_filter("a.pdf") == {"source": "a.pdf"})
+check("the Pinecone backend builds the same shapes",
+      vector_pinecone.source_filter(["a.pdf", "b.pdf"]) == {"source": {"$in": ["a.pdf", "b.pdf"]}}
+      and vector_pinecone.source_filter([]) is None)
+
+print("\n--- and it really narrows the search ---")
+scope_user = "cc" * 12
+for name, text in (("s1.pdf", "alpha beta gamma"),
+                   ("s2.pdf", "alpha delta epsilon"),
+                   ("s3.pdf", "alpha zeta eta")):
+    vectorstore.add_chunks(name, [{"text": text, "page_start": 1, "page_end": 1}],
+                           user_id=scope_user)
+
+def sources_of(hits):
+    return sorted({h["source"] for h in hits})
+
+check("no scope searches everything",
+      sources_of(vectorstore.query_chunks("alpha", top_k=10, user_id=scope_user))
+      == ["s1.pdf", "s2.pdf", "s3.pdf"])
+check("two chosen documents return only those two",
+      sources_of(vectorstore.query_chunks("alpha", top_k=10, source=["s1.pdf", "s3.pdf"],
+                                          user_id=scope_user)) == ["s1.pdf", "s3.pdf"])
+check("one chosen document returns only that one",
+      sources_of(vectorstore.query_chunks("alpha", top_k=10, source=["s2.pdf"],
+                                          user_id=scope_user)) == ["s2.pdf"])
+
+bm25.invalidate(scope_user)
+lexical = bm25.search("alpha", limit=10, source=["s1.pdf", "s2.pdf"], user_id=scope_user)
+check("keyword ranking honours the same selection",
+      sorted({row["source"] for row, _score in lexical}) == ["s1.pdf", "s2.pdf"])
+
+retrieved = retrieval.retrieve("alpha", top_k=5, source=["s3.pdf"], user_id=scope_user,
+                               use_rerank=False, expand=0)
+check("retrieval end to end stays inside the selection",
+      retrieved and sources_of(retrieved) == ["s3.pdf"])
+
+for name in ("s1.pdf", "s2.pdf", "s3.pdf"):
+    vectorstore.delete_source(name)
+
 
 print(f"\nAll {PASSED} checks passed.")

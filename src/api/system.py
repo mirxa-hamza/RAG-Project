@@ -1,7 +1,15 @@
 """Liveness and diagnostics."""
 from fastapi import APIRouter, Response
 
-from src.core.config import EMBEDDING_MODEL, GROQ_MODEL, RERANK_MODEL
+from src.core.config import (
+    COHERE_EMBED_MODEL,
+    COHERE_RERANK_MODEL,
+    EMBEDDING_MODEL,
+    GROQ_MODEL,
+    JINA_EMBED_MODEL,
+    RAG_MODE,
+    RERANK_MODEL,
+)
 from src.ml import embeddings
 
 router = APIRouter(tags=["system"])
@@ -68,9 +76,20 @@ def info():
     from src.ml import reranker
     from src.services import answer_cache
 
+    embed_provider = embeddings.provider_name()
+    rerank_provider = reranker.provider_name()
+    embed_model = {"local": EMBEDDING_MODEL, "cohere": COHERE_EMBED_MODEL,
+                   "jina": JINA_EMBED_MODEL}.get(embed_provider, EMBEDDING_MODEL)
+
     return {
-        "embedding_model": EMBEDDING_MODEL,
-        "rerank_model": RERANK_MODEL,
+        # Which half of the config is live. A cloud-mode instance answering from local
+        # models (or the reverse) is the explanation for most "why are the answers
+        # different" questions, and it is otherwise invisible.
+        "mode": RAG_MODE,
+        "embeddings_provider": embed_provider,
+        "reranker_provider": rerank_provider,
+        "embedding_model": embed_model,
+        "rerank_model": RERANK_MODEL if rerank_provider == "local" else COHERE_RERANK_MODEL,
         "llm_model": GROQ_MODEL,
         # Re-ranking is the largest single quality stage, and it degrades SILENTLY to a
         # cosine floor if the model cannot load. Without this, the only evidence is one log

@@ -5,7 +5,7 @@ Both the buffered and the streamed route go through the same `_prepare()` step, 
 retrieval behaviour can never drift between them.
 """
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -40,6 +40,17 @@ def _to_sources(chunks: List[dict]) -> List[Source]:
     ]
 
 
+def _scope_key(req: ChatRequest) -> Optional[str]:
+    """
+    The document selection, as one stable string for the answer cache.
+
+    Sorted: ticking A then B and B then A are the same search and must hit the same entry.
+    Keying on the raw list order would quietly halve the hit rate.
+    """
+    wanted = req.wanted_sources()
+    return None if wanted is None else "|".join(sorted(wanted))
+
+
 def _prepare(req: ChatRequest, user_id: str) -> Tuple[List[Dict], str, List[Dict]]:
     """
     Rewrite the follow-up if there's history, then retrieve - scoped to `user_id`.
@@ -49,8 +60,8 @@ def _prepare(req: ChatRequest, user_id: str) -> Tuple[List[Dict], str, List[Dict
     """
     history = [turn.model_dump() for turn in req.history][-HISTORY_TURNS:]
     search_query = rewrite_question(req.question, history)
-    chunks = retrieval.retrieve(search_query, top_k=req.top_k, source=req.source,
-                                user_id=user_id)
+    chunks = retrieval.retrieve(search_query, top_k=req.top_k,
+                                source=req.wanted_sources(), user_id=user_id)
     return history, search_query, chunks
 
 
@@ -67,7 +78,7 @@ def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     # mean different things ("and the second one?"), so the key would be a lie.
     cacheable = ANSWER_CACHE_ENABLED and not req.history
     if cacheable:
-        cached = answer_cache.get(uid, req.question, req.source, req.top_k)
+        cached = answer_cache.get(uid, req.question, _scope_key(req), req.top_k)
         if cached is not None:
             log.info("Answer cache hit.")
             return ChatResponse(**cached)
@@ -83,7 +94,7 @@ def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     )
     # Never cache "the key is missing" or a transport failure as if it were an answer.
     if cacheable and chunks:
-        answer_cache.put(uid, req.question, req.source, req.top_k, response.model_dump())
+        answer_cache.put(uid, req.question, _scope_key(req), req.top_k, response.model_dump())
     return response
 
 

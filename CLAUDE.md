@@ -216,7 +216,7 @@ effectively N times larger.
   micro-optimisation: uvicorn imports the app *before* it binds the port, so loading the
   embedding model at import kept the port closed for ~18s and the browser answered
   `ERR_CONNECTION_REFUSED`. `main.py`'s lifespan starts `embeddings.warm_up()` on a thread
-  so the wait happens behind the loading screen instead. Never move a model load to import
+  so the wait happens in the background, with the status dot reporting it. Never move a model load to import
   time, and never into a per-request path either.
 - **Anything that changes stored chunks must call `_invalidate_keyword_index()`** (already
   wired into `add_chunks`, `delete_source`, `reset_collection`) — the BM25 index caches the
@@ -286,10 +286,27 @@ Three files, no build step, no framework. Conventions that matter:
   a 64px icon rail (`.app.is-collapsed`, labels visually hidden but kept in the
   accessibility tree). Under 860px it is an off-canvas drawer (`.sidebar.is-open` + scrim)
   that hides completely — the rail rules are explicitly reverted in that media query.
-  `syncMenuButton()` keeps the toggle's `aria-expanded`/`aria-label` honest for both.
-- **Upload lives in a native `<dialog>`**, so focus trapping, Escape and top-layer stacking
-  come from the browser. Closing it does not cancel anything: the transfer and indexing
-  carry on and the sidebar keeps reporting.
+  `syncMenuButton()` keeps the toggle's `aria-expanded`/`aria-label` honest for both. It
+  holds the conversation, not the library: one **New chat** button.
+- **Everything about documents lives in one slide-over** (`#docsPanel`, opened from the
+  Documents button in the top bar or the composer's Attach file): the dropzone, the upload
+  cards, and the library list with its delete buttons and its scope tick boxes. Processing
+  status and Rebuild index live in the top bar instead - occasional maintenance actions
+  that were competing with the document list for space. It is deliberately NOT a `<dialog>` — the chat has to stay readable behind
+  it — so `openDocs()`/`closeDocs()` do by hand what a dialog gives for free: move focus in
+  and back out, trap Tab inside the panel, close on Escape and on a backdrop click. The
+  panel is `visibility: hidden` when closed, not merely translated off-screen, or its
+  buttons would still be tab stops over the chat.
+- **The search scope is a multi-select, and an empty selection means EVERYTHING.** Ticking
+  documents in the panel narrows retrieval; the chip at the bottom right of the composer
+  says what is currently searched and opens the panel. `ChatRequest.sources` carries the
+  list (`source` still works for one), and both vector backends turn it into an `$in`
+  filter. "Nothing ticked = search nothing" would answer "not in these documents" to every
+  question and look exactly like a broken index, which is why it is not a reachable state.
+  A document deleted while selected is dropped from the selection by `renderScope()`,
+  otherwise the filter keeps narrowing to something the server no longer has.
+- **Closing the panel cancels nothing:** the transfer and the indexing carry on, and the
+  panel picks the state back up (it calls `refreshSources()` on every open).
 - **Two progress phases, from two sources.** The transfer has real byte counts (XHR
   `upload.progress` — `fetch()` has no equivalent, which is why it is XHR); indexing is
   polled from `/ingest/status`, which reports `stage`, `chunks_done` and `chunks_total` so a
@@ -438,9 +455,13 @@ warning when it sees them.
   padding after login. It now bails out when the element has no layout, refuses to write a
   zero height, and runs again from `startSession()`; CSS carries a `min-height` floor as
   the backstop. The same trap applies to any layout measurement taken before sign-in.
-- **The boot overlay starts `hidden` and is revealed only when the app is unusable** —
-  server not answering, model still loading, or an ingest running. It must never block on an
-  empty index: that would hide the Add documents button that fixes exactly that.
+- **There is no loading screen.** The overlay that used to hold the app back during model
+  warm-up and the first ingest is gone: sign in and you are in the chat. `watchStartup()`
+  polls `/stats` in the background and reports those two states through the top bar's
+  status dot instead ("Warming up", "Indexing", with the detail in the tooltip). A question
+  asked during warm-up simply waits for the model rather than failing, which is why
+  blocking the UI was never worth it. The one thing the dot must keep saying is that an
+  ingest is still running, because an answer given then may be missing passages.
 - **A database outage is a 503 with instructions, not a 500 with a traceback.**
   `database._guard()` converts pymongo's `ServerSelectionTimeoutError`/`ConnectionFailure`
   into `DatabaseUnavailable`, and an exception handler in `main.py` renders it as a 503

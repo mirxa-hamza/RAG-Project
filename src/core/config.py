@@ -29,6 +29,26 @@ def _path_setting(env_var: str, default: Path) -> Path:
     return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
 
 
+# ---------------------------------------------------------------- Mode
+# One switch that picks the whole backend set. "local" is the laptop setup: models run on
+# this CPU, vectors live on disk, PDFs live in data/. "cloud" is the deployable setup for
+# a serverless host (Vercel), where there is no persistent disk, no room for torch, and no
+# time to load a model per request: embedding and re-ranking become HTTP calls, vectors
+# live in Chroma Cloud, PDFs live in Cloudinary.
+#
+# Everything below can still be overridden one piece at a time, so a half-and-half setup
+# (cloud vectors, local models) is a matter of setting the individual variable.
+RAG_MODE = os.getenv("RAG_MODE", "local").strip().lower()
+if RAG_MODE not in ("local", "cloud"):
+    raise ValueError(f"RAG_MODE must be 'local' or 'cloud', got {RAG_MODE!r}")
+IS_CLOUD = RAG_MODE == "cloud"
+
+
+def _mode_default(env_var: str, local: str, cloud: str) -> str:
+    """A setting whose default follows RAG_MODE but can be pinned explicitly."""
+    return (os.getenv(env_var) or (cloud if IS_CLOUD else local)).strip().lower()
+
+
 # ---------------------------------------------------------------- LLM (Groq)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
@@ -52,11 +72,79 @@ _raw_prefix = os.getenv(
 EMBEDDING_QUERY_PREFIX = f"{_raw_prefix} " if _raw_prefix else ""
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
 
+# Who actually produces the vectors: "local" (sentence-transformers on this CPU), or
+# "pinecone" / "cohere" / "jina" (an HTTP call). The API providers exist because torch + a model does not fit in
+# a serverless bundle and would be re-loaded on every cold start if it did.
+EMBEDDINGS_PROVIDER = _mode_default("EMBEDDINGS_PROVIDER", local="local", cloud="pinecone")
+
+# Cohere's trial key is free and needs no card (1,000 calls/month at the time of writing),
+# which is why it is the cloud default. embed-english-v3.0 is 1024-dimensional.
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
+COHERE_EMBED_MODEL = os.getenv("COHERE_EMBED_MODEL", "embed-english-v3.0")
+# Cohere caps a single /v2/embed call at 96 inputs.
+COHERE_EMBED_BATCH = int(os.getenv("COHERE_EMBED_BATCH", "96"))
+
+# Jina is the alternative free tier: a key gives a block of free tokens, no card.
+JINA_API_KEY = os.getenv("JINA_API_KEY", "")
+JINA_EMBED_MODEL = os.getenv("JINA_EMBED_MODEL", "jina-embeddings-v3")
+JINA_EMBED_BATCH = int(os.getenv("JINA_EMBED_BATCH", "64"))
+
+# The token window used for chunk splitting when the provider is an API and there is no
+# local tokenizer to ask. Both Cohere v3 and Jina v3 truncate at 8192 tokens, but chunks
+# that big make re-ranking useless, so the effective limit stays near the local model's.
+API_EMBED_TOKEN_LIMIT = int(os.getenv("API_EMBED_TOKEN_LIMIT", "512"))
+# Characters per token, used only to estimate length without a tokenizer. ~4 is the usual
+# English figure; it is deliberately conservative because over-estimating only splits a
+# chunk earlier, while under-estimating silently truncates it.
+CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "3.6"))
+
+# Seconds to wait on any embedding/re-rank HTTP call before giving up.
+PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60"))
+# Retries for a 429 or a 5xx. Free tiers rate-limit per minute, so one retry with a pause
+# is the difference between an ingest finishing and an ingest failing halfway.
+PROVIDER_MAX_RETRIES = int(os.getenv("PROVIDER_MAX_RETRIES", "3"))
+
 # ---------------------------------------------------------------- Storage
 DATA_DIR = _path_setting("DATA_DIR", PROJECT_ROOT / "data")
 # Generated index state lives under storage/, kept out of the source tree and gitignored.
 CHROMA_DIR = _path_setting("CHROMA_DIR", PROJECT_ROOT / "storage" / "chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "rag_documents")
+
+# Which store holds the vectors: "chroma" (development - a folder on disk) or "pinecone"
+# (production). Serverless hosts have no persistent disk, so a folder-backed store there is
+# empty again on every cold start.
+#
+# The two are not interchangeable for the same data: vectors written by one are not
+# readable by the other, and the embedding models differ. Switching means re-indexing.
+VECTOR_STORE = _mode_default("VECTOR_STORE", local="chroma", cloud="pinecone")
+
+# Only for VECTOR_STORE=chroma: "disk" (a folder, single process, no network) or "cloud"
+# (Chroma Cloud over HTTP), for running the development stack against a hosted store.
+CHROMA_BACKEND = os.getenv("CHROMA_BACKEND", "disk").strip().lower()
+CHROMA_API_KEY = os.getenv("CHROMA_API_KEY", "")
+CHROMA_TENANT = os.getenv("CHROMA_TENANT", "")
+CHROMA_DATABASE = os.getenv("CHROMA_DATABASE", "")
+
+# ---------------------------------------------------------------- Pinecone (production)
+# One vendor for vectors, embeddings and re-ranking. The free Starter plan needs no card:
+# 2GB, 5M embedding tokens/month per model, 500 rerank requests/month.
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX", "rag-documents")
+# Where a new index is created, if it doesn't exist yet. The Starter plan is AWS-only.
+PINECONE_CLOUD = os.getenv("PINECONE_CLOUD", "aws")
+PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
+# llama-text-embed-v2 is 1024-dimensional. If you change the model, change this too - an
+# index is created with a fixed dimension and will reject vectors of any other size.
+PINECONE_EMBED_MODEL = os.getenv("PINECONE_EMBED_MODEL", "llama-text-embed-v2")
+PINECONE_EMBED_DIM = int(os.getenv("PINECONE_EMBED_DIM", "1024"))
+# bge-reranker-v2-m3 is the model the free tier includes 500 monthly requests of.
+PINECONE_RERANK_MODEL = os.getenv("PINECONE_RERANK_MODEL", "bge-reranker-v2-m3")
+# Pinecone caps an upsert at 1000 vectors / ~2MB and an embed call at 96 inputs.
+PINECONE_UPSERT_BATCH = int(os.getenv("PINECONE_UPSERT_BATCH", "100"))
+PINECONE_EMBED_BATCH = int(os.getenv("PINECONE_EMBED_BATCH", "96"))
+# Pin the API version explicitly: an unset version header defaults to the OLDEST supported
+# one, which eventually disappears and takes the app with it.
+PINECONE_API_VERSION = os.getenv("PINECONE_API_VERSION", "2025-10")
 # Chroma enforces a max batch size per add() call; stay well under it.
 CHROMA_ADD_BATCH = int(os.getenv("CHROMA_ADD_BATCH", "1000"))
 # Small JSON sidecar tracking what's been ingested, so /stats and the re-ingest check
@@ -119,10 +207,18 @@ RRF_K = int(os.getenv("RRF_K", "60"))  # RRF damping constant; 60 is the publish
 # Cross-encoder re-ranking. Set RERANK_ENABLED=false to A/B it against the eval harness.
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() in ("1", "true", "yes")
 RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+# "local" runs the cross-encoder here; "pinecone" and "cohere" call a hosted re-ranker.
+RERANKER_PROVIDER = _mode_default("RERANKER_PROVIDER", local="local", cloud="pinecone")
+COHERE_RERANK_MODEL = os.getenv("COHERE_RERANK_MODEL", "rerank-english-v3.0")
+
 # Cross-encoder logits are unbounded; ms-marco models put clearly-irrelevant pairs well
 # below zero. Chunks scoring under this are dropped, and if nothing survives we answer
 # "not in these documents" WITHOUT calling the LLM.
 MIN_RERANK_SCORE = float(os.getenv("MIN_RERANK_SCORE", "-6.0"))
+# Cohere Rerank returns a normalised 0..1 relevance, NOT a logit - the local floor of -6.0
+# would keep everything. Hence a second floor, chosen per provider by
+# reranker.score_floor(). 0.02 is roughly as permissive on that scale as -6.0 is on logits.
+MIN_RERANK_SCORE_API = float(os.getenv("MIN_RERANK_SCORE_API", "0.02"))
 # Fallback floor used when re-ranking is off (cosine similarity, 0..1).
 MIN_SIMILARITY = float(os.getenv("MIN_SIMILARITY", "0.15"))
 

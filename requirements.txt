@@ -9,6 +9,12 @@ chromadb==1.5.9
 # groq<0.13 passes a `proxies` kwarg to httpx.Client that httpx>=0.28 no longer accepts.
 groq==1.7.0
 python-dotenv==1.0.1
+# Production vector store (RAG_MODE=cloud). Unused in local mode, but small and pure
+# Python, so it stays in the one requirements file.
+pinecone==9.1.0
+# HTTP client for the Pinecone/Cohere/Jina embedding and re-rank calls (RAG_MODE=cloud). It is
+# already in the tree via groq; pinned here because this code imports it directly.
+httpx==0.28.1
 # Keyword half of hybrid retrieval (pure Python, no index server).
 rank-bm25==0.2.2
 # Multipart form parsing - required by FastAPI for the PDF upload endpoint.

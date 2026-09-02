@@ -61,8 +61,21 @@ class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     # Bounded: an unbounded top_k lets a client build an enormous prompt.
     top_k: int = Field(TOP_K, ge=1, le=MAX_TOP_K)
-    # Optional: restrict retrieval to one ingested document.
+    # Optional: restrict retrieval to one ingested document. Kept for compatibility with
+    # anything already calling the API; `sources` is what the UI sends now.
     source: Optional[str] = None
+    # Optional: restrict retrieval to a chosen subset of documents. An empty list and None
+    # both mean "search everything" - "search nothing" is not a state the UI can produce,
+    # and treating it as one would silently answer "not in these documents" forever.
+    # Bounded because each entry becomes a term in a store-side filter.
+    sources: Optional[List[str]] = Field(None, max_length=100)
+
+    def wanted_sources(self) -> Optional[List[str]]:
+        """The document filter to retrieve with, from either field. None = everything."""
+        chosen = [s for s in (self.sources or []) if s]
+        if not chosen and self.source:
+            chosen = [self.source]
+        return chosen or None
     # Recent conversation, oldest first. Only the last HISTORY_TURNS are used, and the
     # assembled history is clamped again by characters in llm._history_messages().
     history: List[Turn] = Field(default_factory=list, max_length=20)
