@@ -92,6 +92,9 @@ el.apiBase.textContent = window.location.origin;
 
 const TOKEN_KEY = "docqa.token";
 let session = null;          // { username } once signed in
+// Bumped on every sign-out. Background loops capture it and stop when it changes, so work
+// started under one session can never keep running (or keep 401ing) under the next.
+let sessionEpoch = 0;
 
 function readToken() {
   try {
@@ -125,7 +128,11 @@ async function authFetch(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (response.status === 401) {
     endSession("Your session expired. Sign in again.");
-    throw new Error("Signed out");
+    // Tagged, so a background loop can tell "you are signed out, stop" apart from "that
+    // request failed, try again". A loop that cannot tell them apart re-fires forever.
+    const err = new Error("Signed out");
+    err.signedOut = true;
+    throw err;
   }
   return response;
 }
@@ -599,9 +606,13 @@ async function pollUntilDone() {
     let job;
     try {
       job = await (await authFetch("/ingest/status")).json();
-    } catch {
-      setStatus("Lost contact with the backend.", "error");
-      setServerStatus("offline", "Offline", "The backend is not responding");
+    } catch (err) {
+      // Signed out is not "lost contact" - the sign-in screen is already up, and saying
+      // the backend died on top of it is a second, wrong explanation.
+      if (!(err && err.signedOut)) {
+        setStatus("Lost contact with the backend.", "error");
+        setServerStatus("offline", "Offline", "The backend is not responding");
+      }
       break;
     }
 
@@ -741,7 +752,10 @@ async function refreshSources() {
     setActivityRunning(Boolean(data.ingesting));
     // A job may already be running when the page loads (e.g. the server just started).
     if (data.ingesting && !polling) pollUntilDone();
-  } catch {
+  } catch (err) {
+    // A 401 has already put the sign-in screen up; calling the backend "offline" on top of
+    // that is both wrong and alarming.
+    if (err && err.signedOut) return;
     setServerStatus("offline", "Offline", "The backend is not responding");
   }
 }
@@ -1099,6 +1113,10 @@ el.authSwitch.addEventListener("click", () => {
 });
 
 function showAuthScreen(message) {
+  // Always back to "Sign in": the message says the session expired, so a form still
+  // labelled "Create an account" from earlier in the visit contradicts it - and submitting
+  // it answers "Incorrect username or password" for an account that exists.
+  setAuthMode("login");
   el.auth.hidden = false;
   el.app.hidden = true;
   el.authError.textContent = message || "";
@@ -1153,8 +1171,25 @@ function startSession(username) {
   el.questionInput.focus();
 }
 
+/**
+ * Ending a session, exactly once.
+ *
+ * Two guards, both learned the hard way. `sessionEpoch` is bumped so every background loop
+ * started under the old session stops on its next tick - without it, a loop kept polling
+ * with a dead token, which 401'd, which called this again, ~every second forever. And the
+ * early return means a second (or fiftieth) 401 does not re-render the sign-in screen:
+ * that re-render cleared the password field and pulled focus back to the username box, so
+ * the form fought anyone trying to type in it.
+ */
 function endSession(message) {
   writeToken(null);
+  sessionEpoch += 1;
+
+  if (session === null && !el.auth.hidden) {
+    // Already signed out and already showing the form; leave it alone.
+    return;
+  }
+  session = null;
   resetAppState();
   showAuthScreen(message);
 }
@@ -1411,13 +1446,16 @@ el.deleteAccountBtn.addEventListener("click", async () => {
    ==================================================================== */
 
 async function watchStartup() {
-  while (true) {
+  const epoch = sessionEpoch;
+
+  while (sessionEpoch === epoch) {
     let stats = null;
     try {
       stats = await (await authFetch("/stats")).json();
-    } catch {
-      // Server not listening yet, or a transient failure. Normal for the first seconds of
-      // a cold start; keep checking rather than declaring it offline.
+    } catch (err) {
+      // Signed out is terminal for this loop. Anything else - the server not listening
+      // yet, a dropped connection - is transient and worth another try.
+      if (err && err.signedOut) return;
       setServerStatus("checking", "Starting", "Waiting for the server to answer…");
       await sleep(1500);
       continue;
