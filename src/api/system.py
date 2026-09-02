@@ -4,11 +4,14 @@ from fastapi import APIRouter, Response
 from src.core.config import (
     COHERE_EMBED_MODEL,
     COHERE_RERANK_MODEL,
+    DOCUMENT_STORE,
     EMBEDDING_MODEL,
     GROQ_MODEL,
     JINA_EMBED_MODEL,
     RAG_MODE,
     RERANK_MODEL,
+    STATE_STORE,
+    VECTOR_STORE,
 )
 from src.ml import embeddings
 
@@ -88,6 +91,9 @@ def info():
         "mode": RAG_MODE,
         "embeddings_provider": embed_provider,
         "reranker_provider": rerank_provider,
+        "vector_store": VECTOR_STORE,
+        "document_store": DOCUMENT_STORE,
+        "state_store": STATE_STORE,
         "embedding_model": embed_model,
         "rerank_model": RERANK_MODEL if rerank_provider == "local" else COHERE_RERANK_MODEL,
         "llm_model": GROQ_MODEL,

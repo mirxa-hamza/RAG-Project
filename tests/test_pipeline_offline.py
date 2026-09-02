@@ -1612,4 +1612,297 @@ for name in ("s1.pdf", "s2.pdf", "s3.pdf"):
     vectorstore.delete_source(name)
 
 
+# ---- Cloud migration: STATE_STORE=mongo backends and the Cloudinary upload path --------
+#
+# These exercise the Mongo-backed implementations added for RAG_MODE=cloud DIRECTLY (the
+# private _mongo_*/_check_mongo functions), rather than by flipping STATE_STORE and
+# re-importing config - config.py reads its settings once, at import time (see its own
+# docstring), so a single test process can only ever run one STATE_STORE. Calling the
+# private functions with a fake collection injected via database.set_sync_collection()
+# proves the Mongo logic itself is correct without needing a second test process or a real
+# MongoDB. The dispatch in check()/get()/put()/... that picks memory vs mongo is a single
+# `if STATE_STORE == "mongo":` in each module - trivial enough not to need its own test.
+
+print("\n--- cloud state: a tiny fake pymongo collection ---")
+
+
+def _fake_matches(doc, query):
+    for key, expected in query.items():
+        if isinstance(expected, dict):
+            if "$gte" in expected and not (doc.get(key) is not None and doc[key] >= expected["$gte"]):
+                return False
+        elif doc.get(key) != expected:
+            return False
+    return True
+
+
+class FakeSyncCollection:
+    """Just enough of pymongo's Collection API for ratelimit/answer_cache/manifest/
+    cloud_documents: find_one, find, insert_one, update_one, delete_one/many,
+    count_documents, create_index. In-memory, keyed by '_id'."""
+
+    def __init__(self):
+        self.docs = {}
+        self._auto = 0
+
+    def create_index(self, *args, **kwargs):
+        return "ok"
+
+    def find_one(self, query):
+        for doc in self.docs.values():
+            if _fake_matches(doc, query):
+                return dict(doc)
+        return None
+
+    def find(self, query=None, sort=None):
+        results = [dict(d) for d in self.docs.values() if _fake_matches(d, query or {})]
+        if sort:
+            for field, direction in reversed(sort):
+                results.sort(key=lambda d: d.get(field), reverse=(direction < 0))
+        return results
+
+    def insert_one(self, doc):
+        doc = dict(doc)
+        if "_id" not in doc:
+            self._auto += 1
+            doc["_id"] = f"auto{self._auto}"
+        self.docs[doc["_id"]] = doc
+        return types.SimpleNamespace(inserted_id=doc["_id"])
+
+    def update_one(self, query, update, upsert=False):
+        target = None
+        for doc in self.docs.values():
+            if _fake_matches(doc, query):
+                target = doc
+                break
+        matched = target is not None
+        if target is None:
+            if not upsert:
+                return types.SimpleNamespace(matched_count=0)
+            target = {k: v for k, v in query.items() if not isinstance(v, dict)}
+            target.setdefault("_id", query.get("_id", f"auto{self._auto + 1}"))
+            self._auto += 1
+            self.docs[target["_id"]] = target
+        for key, value in update.get("$set", {}).items():
+            target[key] = value
+        if not matched:
+            for key, value in update.get("$setOnInsert", {}).items():
+                target.setdefault(key, value)
+        for key, amount in update.get("$inc", {}).items():
+            target[key] = target.get(key, 0) + amount
+        for key, spec in update.get("$push", {}).items():
+            lst = target.setdefault(key, [])
+            if isinstance(spec, dict) and "$each" in spec:
+                lst.extend(spec["$each"])
+                sl = spec.get("$slice")
+                if isinstance(sl, int) and sl < 0:
+                    target[key] = lst[sl:]
+            else:
+                lst.append(spec)
+        return types.SimpleNamespace(matched_count=int(matched))
+
+    def delete_one(self, query):
+        for _id, doc in list(self.docs.items()):
+            if _fake_matches(doc, query):
+                del self.docs[_id]
+                return types.SimpleNamespace(deleted_count=1)
+        return types.SimpleNamespace(deleted_count=0)
+
+    def delete_many(self, query):
+        victims = [i for i, d in self.docs.items() if _fake_matches(d, query)]
+        for i in victims:
+            del self.docs[i]
+        return types.SimpleNamespace(deleted_count=len(victims))
+
+    def count_documents(self, query):
+        return sum(1 for d in self.docs.values() if _fake_matches(d, query))
+
+
+print("\n--- cloud state: rate limiting over Mongo ---")
+from src.core import ratelimit as rl  # noqa: E402
+
+rl_events = FakeSyncCollection()
+database.set_sync_collection("rate_limit_events", rl_events)
+mongo_limit = rl.RateLimit("mongo-test", allowance=3, per_seconds=60)
+allowed = sum(1 for _ in range(5) if rl._check_mongo(mongo_limit, "someone") is None)
+check("the Mongo-backed limiter allows exactly the configured allowance", allowed == 3)
+check("the 4th event over the limit is refused",
+      rl._check_mongo(mongo_limit, "someone") is not None)
+check("a different key has its own bucket",
+      rl._check_mongo(mongo_limit, "someone-else") is None)
+check("each allowed event is one stored document",
+      rl_events.count_documents({"bucket": "mongo-test", "key": "someone"}) == 3)
+
+print("\n--- cloud state: the answer cache over Mongo ---")
+from src.services import answer_cache as ac  # noqa: E402
+
+database.set_sync_collection("answer_cache_entries", FakeSyncCollection())
+database.set_sync_collection("answer_cache_generations", FakeSyncCollection())
+ac._put_mongo("u1", "What is X?", None, 4, {"answer": "cached", "sources": []})
+check("a Mongo-backed cache hit round-trips the value",
+      (ac._get_mongo("u1", "  what   is x? ", None, 4) or {}).get("answer") == "cached")
+check("another user never sees it", ac._get_mongo("u2", "What is X?", None, 4) is None)
+ac._bump_mongo("u1")
+check("bumping a user's generation invalidates their Mongo-backed entries",
+      ac._get_mongo("u1", "What is X?", None, 4) is None)
+
+print("\n--- cloud state: the document manifest over Mongo ---")
+from src.services import manifest as manifest_mod  # noqa: E402
+
+manifest_fake = FakeSyncCollection()
+database.set_sync_collection("document_manifest", manifest_fake)
+manifest_mod._mongo_put("users/u1/book.pdf", {
+    "sha256": "abc123", "mtime": 0, "size": 10, "pages": 2, "chunks": 5, "user_id": "u1",
+    "ingested_at": "now",
+})
+check("a Mongo-backed manifest entry round-trips",
+      manifest_mod._mongo_get("users/u1/book.pdf")["sha256"] == "abc123")
+check("a document not yet ingested has no Mongo entry",
+      manifest_mod._mongo_get("users/u1/missing.pdf") is None)
+check("_mongo_all() lists it back by filename",
+      "users/u1/book.pdf" in manifest_mod._mongo_all())
+manifest_mod._mongo_remove("users/u1/book.pdf")
+check("removing it clears the Mongo entry", manifest_mod._mongo_get("users/u1/book.pdf") is None)
+
+print("\n--- cloud state: the Cloudinary document registry over Mongo ---")
+from src.services import cloud_documents  # noqa: E402
+
+database.set_sync_collection("cloud_documents", FakeSyncCollection())
+cloud_documents.register("users/u1/notes.pdf", user_id="u1", public_id="rag/users/u1/notes",
+                         url="https://res.cloudinary.com/demo/raw/upload/rag/users/u1/notes.pdf",
+                         size_bytes=1234, sha256="deadbeef")
+check("a registered document is fetchable by its path",
+      cloud_documents.get("users/u1/notes.pdf")["public_id"] == "rag/users/u1/notes")
+check("it appears in that user's listing",
+      [d["filename"] for d in cloud_documents.list_for_user("u1")] == ["users/u1/notes.pdf"])
+check("another user's listing is empty", cloud_documents.list_for_user("u2") == [])
+check("used_bytes reflects what was registered", cloud_documents.used_bytes("u1") == 1234)
+check("a name collision gets a ' (2)' suffix, like local mode's unique_path()",
+      cloud_documents.unique_filename("notes.pdf", "u1") == "notes (2).pdf")
+removed = cloud_documents.remove("users/u1/notes.pdf")
+check("remove() returns what was deleted", removed["public_id"] == "rag/users/u1/notes")
+check("and it is really gone", cloud_documents.get("users/u1/notes.pdf") is None)
+
+print("\n--- Cloudinary uploads: the public_id ownership check ---")
+from src.services import cloudinary_store  # noqa: E402
+
+folder = cloudinary_store.user_folder("u1")
+check("a public_id inside the caller's own folder is accepted",
+      cloudinary_store.public_id_belongs_to(f"{folder}/notes", "u1"))
+check("the folder path itself is accepted (an edge case, not a real upload)",
+      cloudinary_store.public_id_belongs_to(folder, "u1"))
+check("a public_id under a DIFFERENT user's folder is rejected - this is what stops "
+      "POST /upload/complete from being told to index someone else's file",
+      not cloudinary_store.public_id_belongs_to(f"{cloudinary_store.user_folder('u2')}/notes", "u1"))
+check("a public_id that merely starts with the folder NAME as a string, without the "
+      "separator, is still rejected (no accidental prefix match)",
+      not cloudinary_store.public_id_belongs_to(f"{folder}-evil/notes", "u1"))
+
+print("\n--- cloud state: the owner of record survives a read-only filesystem ---")
+# A serverless filesystem is read-only outside /tmp, and set_owner_of_record() runs on the
+# FIRST signup - after the user record has already been created. An OSError escaping it
+# means that account exists but its owner got a 500 and can never sign up (409 on retry).
+from src.services import ownership as ownership_mod  # noqa: E402
+
+_real_owner_path = ownership_mod._OWNER_OF_RECORD_PATH
+_real_owner_mongo = ownership_mod._MONGO
+try:
+    # Disk mode, pointed somewhere that cannot be created - stands in for a read-only FS.
+    ownership_mod._MONGO = False
+    ownership_mod._OWNER_OF_RECORD_PATH = Path("/proc/version/nope/owner_of_record.json")
+    raised = None
+    try:
+        ownership_mod.set_owner_of_record("user-abc")
+    except Exception as exc:                        # noqa: BLE001 - catching it IS the check
+        raised = exc
+    check("an unwritable owner-of-record file does not break the signup path", raised is None)
+    check("and it simply reads back as None afterwards",
+          ownership_mod.owner_of_record() is None)
+
+    # Cloud mode: the same call round-trips through Mongo instead of touching the disk.
+    state_fake = FakeSyncCollection()
+    database.set_sync_collection("app_state", state_fake)
+    ownership_mod._MONGO = True
+    ownership_mod.set_owner_of_record("user-xyz")
+    check("in cloud mode the owner of record lives in Mongo, not on disk",
+          ownership_mod.owner_of_record() == "user-xyz")
+    check("stored as a single keyed document", state_fake.count_documents({}) == 1)
+    ownership_mod.set_owner_of_record("user-second")
+    check("re-setting it overwrites in place rather than appending a second row",
+          state_fake.count_documents({}) == 1 and ownership_mod.owner_of_record() == "user-second")
+finally:
+    ownership_mod._OWNER_OF_RECORD_PATH = _real_owner_path
+    ownership_mod._MONGO = _real_owner_mongo
+
+print("\n--- a hosted Chroma truncates an unbounded get(): all_chunks() must page ---")
+# A local disk store returns every matching record from one get(), so an unpaginated read
+# looks correct here forever. A HOSTED Chroma caps records per request (300 on the free
+# tier) and TRUNCATES silently past it - which had BM25 indexing the first 300 chunks of a
+# 2,600-chunk corpus while vector search still saw everything, so nothing appeared broken.
+# Shrinking the page size below the corpus reproduces that shape against local Chroma.
+class _TruncatingCollection:
+    """
+    A local Chroma honours an unbounded get() and returns everything, so simply shrinking
+    the page size does NOT reproduce this bug - the unpaginated version passes too. This
+    stands in for the hosted server: it never returns more than `cap` records per request,
+    whether or not a limit was asked for, which is what silently drops rows in production.
+    """
+
+    def __init__(self, inner, cap):
+        self._inner, self._cap = inner, cap
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get(self, *args, **kwargs):
+        requested = kwargs.get("limit")
+        kwargs["limit"] = min(requested, self._cap) if requested else self._cap
+        return self._inner.get(*args, **kwargs)
+
+
+paged_owner = "6a" + "0" * 22
+vectorstore.add_chunks(
+    f"users/{paged_owner}/paging.pdf",
+    [{"text": f"paging probe passage number {i}", "page_start": i, "page_end": i}
+     for i in range(7)],
+    user_id=paged_owner,
+)
+
+_real_page = vector_chroma.CHROMA_ADD_BATCH
+_real_col = vector_chroma._col
+try:
+    _inner_col = vector_chroma._col()
+    vector_chroma.CHROMA_ADD_BATCH = 2          # smaller than what we just stored
+    vector_chroma._col = lambda: _TruncatingCollection(_inner_col, 2)
+    walked = vectorstore.all_chunks(paged_owner)
+    check("all_chunks() returns every chunk, not just the first page",
+          len(walked) == 7, )
+    check("and the pages are stitched together without duplicates",
+          len({row["text"] for row in walked}) == 7)
+    check("set_owner() also pages, so a large document is fully stamped",
+          vectorstore.set_owner(f"users/{paged_owner}/paging.pdf", paged_owner) == 7)
+finally:
+    vector_chroma.CHROMA_ADD_BATCH = _real_page
+    vector_chroma._col = _real_col
+    vectorstore.delete_source(f"users/{paged_owner}/paging.pdf")
+
+print("\n--- the Mongo connection string never reaches a log or a browser ---")
+# The URI is logged on every connection AND embedded in CANNOT_REACH, which main.py renders
+# into a 503 that the sign-in screen displays verbatim. A hosted URI carries the password
+# inline, so without redaction the database password is printed to the platform's log
+# stream on every cold start and shown to anyone loading the page during an outage.
+check("a password in an SRV URI is redacted",
+      database._redact("mongodb+srv://user:hunter2@cluster.mongodb.net/db")
+      == "mongodb+srv://user:***@cluster.mongodb.net/db")
+check("and in a plain mongodb:// URI",
+      database._redact("mongodb://admin:s3cret@localhost:27017")
+      == "mongodb://admin:***@localhost:27017")
+check("a URI with no credentials is left alone",
+      database._redact("mongodb://localhost:27017") == "mongodb://localhost:27017")
+check("a password containing ':' and '/' is still fully removed",
+      "p:/ss" not in database._redact("mongodb+srv://user:p:/ss@host.net"))
+check("the user-facing outage message carries no password",
+      "***" in database._redact(f"mongodb+srv://u:pw@h") and "pw" not in database._redact(
+          "mongodb+srv://u:pw@h"))
+
 print(f"\nAll {PASSED} checks passed.")

@@ -403,6 +403,11 @@ function setServerStatus(state, label, title) {
    ==================================================================== */
 
 let MAX_UPLOAD_MB = 100;   // replaced with the server's real limit by refreshSources()
+// "local" | "cloudinary" - which upload flow to use, learned from /stats (refreshSources()).
+// Cloud mode has no request body large enough to carry a PDF (Vercel's 4.5MB limit), so it
+// uploads straight to Cloudinary instead of POSTing the file to this server at all - see
+// uploadFilesCloud() below.
+let documentStore = "local";
 const uploadCards = new Map();
 
 function humanSize(bytes) {
@@ -486,9 +491,100 @@ function sendFiles(files, cards) {
   });
 }
 
+/* ── Cloud-mode upload: sign -> POST straight to Cloudinary -> tell the server ──
+   Vercel rejects any request body over 4.5MB, so the file never touches this server on
+   the way in. Each file gets its own signature (POST /upload/sign) and is posted directly
+   to Cloudinary with real byte-progress (XHR, same reason as sendFiles() above), then
+   /upload/complete tells this app what landed there so it can validate and register it. */
+
+async function signCloudUpload() {
+  const res = await authFetch("/upload/sign", { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || "Could not get an upload authorization.");
+  return data;
+}
+
+function sendToCloudinary(file, sign, card) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("api_key", sign.api_key);
+    form.append("timestamp", sign.timestamp);
+    form.append("signature", sign.signature);
+    form.append("folder", sign.folder);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", sign.upload_url);
+    xhr.upload.addEventListener("progress", (e) => {
+      if (!e.lengthComputable) return;
+      const percent = Math.round((e.loaded / e.total) * 100);
+      card.set(percent, `Uploading… ${percent}%`);
+    });
+    xhr.addEventListener("load", () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      reject(new Error(body.error?.message || `Cloudinary upload failed (${xhr.status})`));
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload failed — could not reach Cloudinary.")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
+    xhr.send(form);
+  });
+}
+
+async function uploadFilesCloud(files) {
+  clearFinishedUploads();
+
+  const tooBig = files.filter((f) => f.size > MAX_UPLOAD_MB * 1024 * 1024);
+  const notPdf = files.filter((f) => !/\.pdf$/i.test(f.name));
+  const good = files.filter((f) => !tooBig.includes(f) && !notPdf.includes(f));
+
+  for (const f of tooBig) addUploadCard(f.name, f.size).set(100, `Too large (limit ${MAX_UPLOAD_MB} MB)`, "error");
+  for (const f of notPdf) addUploadCard(f.name, f.size).set(100, "Not a PDF", "error");
+  if (!good.length) return;
+
+  setBusy(true);
+  // One at a time, not batched like the local flow: each file needs its own Cloudinary
+  // signature and its own /upload/complete call, so there is no single request whose
+  // progress event could represent the whole batch the way local mode's does.
+  for (const file of good) {
+    const card = addUploadCard(file.name, file.size);
+    card.set(2, "Requesting upload authorization…");
+    try {
+      const sign = await signCloudUpload();
+      const uploaded = await sendToCloudinary(file, sign, card);
+      card.set(100, "Uploaded — indexing…", "working");
+
+      const res = await authFetch("/upload/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          public_id: uploaded.public_id,
+          url: uploaded.secure_url || uploaded.url,
+          filename: file.name,
+          bytes: uploaded.bytes,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Could not register the upload.");
+      uploadCards.set(data.filename, card);
+    } catch (err) {
+      card.set(100, err.message, "error");
+      setStatus(err.message, "error");
+    }
+  }
+
+  await pollUntilDone();
+  for (const card of uploadCards.values()) {
+    if (card.li.dataset.tone !== "error") card.set(100, "Ready", "done");
+  }
+  setBusy(false);
+}
+
 async function uploadFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
+  if (documentStore === "cloudinary") return uploadFilesCloud(files);
 
   clearFinishedUploads();
 
@@ -591,14 +687,20 @@ async function runJob(path, startMessage) {
   }
 }
 
-// Ingestion runs as a background job on the backend, so poll it rather than hanging on one
-// long request — a big PDF takes minutes to embed.
+// Ingestion runs as a background job on the backend (local mode), so poll it rather than
+// hanging on one long request — a big PDF takes minutes to embed. Cloud mode has no
+// background thread to do that work between polls (see services/ingestion.py's module
+// docstring), so each iteration there calls POST /ingest/continue instead of GET
+// /ingest/status: that endpoint both does one file's worth of work AND returns the same
+// status shape, so the rendering code below is identical either way.
 async function pollUntilDone() {
   polling = true;
   while (polling) {
     let job;
     try {
-      job = await (await authFetch("/ingest/status")).json();
+      job = documentStore === "cloudinary"
+        ? await (await authFetch("/ingest/continue", { method: "POST" })).json()
+        : await (await authFetch("/ingest/status")).json();
     } catch {
       setStatus("Lost contact with the backend.", "error");
       setServerStatus("offline", "Offline", "The backend is not responding");
@@ -694,6 +796,7 @@ async function refreshSources() {
     const res = await authFetch("/stats");
     const data = await res.json();
     const docs = data.documents || [];
+    documentStore = data.document_store || "local";
 
     el.docCount.textContent = docs.length;
     if (el.railCount) el.railCount.textContent = docs.length;

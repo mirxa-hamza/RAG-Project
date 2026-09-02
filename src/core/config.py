@@ -159,6 +159,32 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
 # a time - and a full disk stops MongoDB and every other user, not just the culprit.
 MAX_USER_STORAGE_BYTES = int(os.getenv("MAX_USER_STORAGE_MB", "2048")) * 1024 * 1024
 
+# ---------------------------------------------------------------- Cloudinary (production PDF storage)
+# Where PDF bytes live: "local" (DATA_DIR, this process's own disk) or "cloudinary"
+# (uploaded straight from the browser, fetched back by URL for ingestion). Serverless hosts
+# have no persistent disk, so "local" would lose every file the moment the function that
+# wrote it exits.
+DOCUMENT_STORE = _mode_default("DOCUMENT_STORE", local="local", cloud="cloudinary")
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
+# Prefix inside the Cloudinary account; each user gets "<folder>/users/<user_id>/..." below
+# it, the same shape DATA_DIR uses locally, so ownership stays derivable from the path.
+CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "rag-documents")
+
+# ---------------------------------------------------------------- State store
+# Where the rate limiter, the answer cache, the ingestion job, and the document manifest
+# keep their state. "memory" is what this app has always done - a dict in this process,
+# correct only because the app is single-worker (see ratelimit.py). "mongo" moves all four
+# into MongoDB, which is what a serverless host needs: a cold start gets a fresh process
+# with empty memory every time, but the same Mongo documents.
+#
+# Deliberately a SYNCHRONOUS (pymongo) client rather than the async one used for accounts:
+# this state is read from both request handlers and the local background-ingestion thread,
+# which has no event loop to await into, and a blocking call against one indexed document
+# is a few milliseconds either way - this app has never claimed to serve concurrent load.
+STATE_STORE = _mode_default("STATE_STORE", local="memory", cloud="mongo")
+
 # ---------------------------------------------------------------- Auth (MongoDB + JWT)
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "rag_app")

@@ -1,26 +1,42 @@
 """
 The only way documents get into this system.
 
-Documents enter in one of two ways, and both end up in DATA_DIR (see config.py): dropped
-into the folder by whoever runs the backend, or uploaded through POST /upload from the web
-UI. Either way, ingestion itself only ever reads that folder - nothing is indexed straight
-out of a request body.
+Two document stores, chosen by DOCUMENT_STORE (see core/config.py):
+
+* **local** (DATA_DIR on this process's disk). Documents enter by being dropped into the
+  folder by whoever runs the backend, or uploaded through POST /upload from the web UI.
+  Ingestion reads that folder directly - nothing is indexed straight out of a request body.
+* **cloudinary** (RAG_MODE=cloud). PDFs are uploaded straight from the browser to
+  Cloudinary (see cloudinary_store.py) and registered in `cloud_documents.py`'s Mongo
+  registry, keyed by the SAME "users/<id>/name.pdf" path local mode uses - so ownership,
+  per-owner dedupe, and pruning all keep working unchanged; only how the PDF's bytes are
+  actually read differs (fetched by URL into a temp file here, vs. opened from disk).
 
 Ingestion is fingerprinted: a file is (re-)ingested when it's new, or when its bytes have
 changed since last time. Matching on filename alone meant an edited PDF was invisible
 forever.
 
-Long ingests run as a background job (see `start_job` / `job_status`) so the API never
-blocks on embedding a 900-page textbook.
+Two job models, also chosen by DOCUMENT_STORE/IS_CLOUD:
+
+* **local**: a background thread (`start_job` / `job_status` below) so the API never blocks
+  on embedding a 900-page textbook. Correct only because the app is a single long-lived
+  process - see the "single worker" note in core/ratelimit.py.
+* **cloud**: no background thread - a Vercel function is killed the instant it responds, so
+  there is no "meanwhile, in the background". Instead, `start_job()` computes the queue of
+  work and returns immediately, and `continue_job()` does ONE file's worth of work per call.
+  The frontend polls `/ingest/continue` in a loop until the job reports `done`. Progress is
+  a Mongo document (`ingestion_jobs`, one per user) rather than the in-process `_state`
+  dict, so it survives between the many small requests that make up one cloud ingest.
 """
 import hashlib
 import os
+import tempfile
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
 from src.services import answer_cache, manifest
-from src.core.config import CHUNK_OVERLAP_WORDS, CHUNK_SIZE_WORDS, DATA_DIR
+from src.core.config import CHUNK_OVERLAP_WORDS, CHUNK_SIZE_WORDS, DATA_DIR, DOCUMENT_STORE
 from src.core.logging import get_logger, timed
 from src.ml.embeddings import split_to_token_limit
 from src.services.pdf import chunk_document, extract_pages
@@ -29,25 +45,28 @@ from src.services.vectorstore import add_chunks, delete_source
 log = get_logger(__name__)
 
 _HASH_CHUNK = 1024 * 1024  # 1MB reads while fingerprinting
+IS_CLOUDINARY = DOCUMENT_STORE == "cloudinary"
 
-# Cap on the per-job result list. It is held in memory and returned on every status poll.
+# Cap on the per-job result/event lists. Held in memory (local mode) or in one Mongo
+# document (cloud mode), and returned on every status poll.
 MAX_JOB_RESULTS = 500
+MAX_JOB_EVENTS = 60
 
-# Uploads live in data/users/<user_id>/<filename>, so a document's owner is recoverable
-# from its path alone. That matters after a crash: the manifest may be stale, but the
-# filesystem still says whose file this is.
+# Uploads live in data/users/<user_id>/<filename> (local) or are registered under the same
+# path (cloud), so a document's owner is recoverable from its path alone in both modes.
 USERS_DIRNAME = "users"
 
 
 def user_dir(user_id: str):
-    """The folder a user's uploads live in."""
+    """The folder a user's uploads live in (local mode only)."""
     return DATA_DIR / USERS_DIRNAME / str(user_id)
 
 
 def owner_of(filename: str) -> Optional[str]:
     """
     Who a document belongs to: the user named by its path, or - for a file copied into
-    data/ by hand or indexed by the CLI - the owner of record (the first account created).
+    data/ by hand or indexed by the CLI (local mode only; cloud mode has no such path) - the
+    owner of record (the first account created).
 
     Ownerless documents are invisible to every filter, so a PDF dropped into data/ after
     the first signup would otherwise be indexed and then seen by nobody.
@@ -74,16 +93,19 @@ def owner_from_path(filename: str) -> Optional[str]:
 
 def _pdf_filenames(user_id: Optional[str] = None) -> List[str]:
     """
-    Every PDF under DATA_DIR, as paths relative to DATA_DIR with forward slashes (so a
-    document's identity is stable across Windows and POSIX).
+    Every known PDF, as paths in the "users/<id>/name.pdf" shape (local: relative to
+    DATA_DIR; cloud: the registry key), sorted.
 
-    Recursion matters: dropping a PDF into `data/textbooks/` used to make it silently
-    invisible, with no warning and no entry in /stats.
-
-    With a user_id, only that user's folder is walked. An upload triggers a scan, and
-    walking every other account's folders to find one new file is wasted work that grows
-    with the number of users.
+    With a user_id, only that user's documents are listed - an upload triggers a scan, and
+    walking/reading every other account's documents to find one new file is wasted work
+    that grows with the number of users.
     """
+    if IS_CLOUDINARY:
+        from src.services import cloud_documents
+
+        records = cloud_documents.list_for_user(user_id) if user_id else cloud_documents.list_all()
+        return sorted(d["filename"] for d in records)
+
     if not DATA_DIR.is_dir():
         log.warning("Data folder %s does not exist - nothing to ingest.", DATA_DIR)
         return []
@@ -118,13 +140,59 @@ def _pdf_filenames(user_id: Optional[str] = None) -> List[str]:
 
 
 def _fingerprint(path) -> Dict:
-    """sha256 + mtime + size. The hash is what actually decides whether to re-ingest."""
+    """sha256 + mtime + size of a LOCAL file. The hash is what actually decides re-ingest."""
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for block in iter(lambda: fh.read(_HASH_CHUNK), b""):
             digest.update(block)
     stat = os.stat(path)
     return {"sha256": digest.hexdigest(), "mtime": stat.st_mtime, "size": stat.st_size}
+
+
+def _fingerprint_cloud(filename: str) -> Dict:
+    """
+    The equivalent for a Cloudinary-registered document: the hash was already computed once,
+    when uploads.validate_uploaded_bytes() checked the file at /upload/complete time, and is
+    stored in the registry - there is no local file here to re-read and re-hash.
+    """
+    from src.services import cloud_documents
+
+    record = cloud_documents.get(filename)
+    if record is None:
+        raise FileNotFoundError(f"'{filename}' is not in the Cloudinary registry.")
+    return {"sha256": record["sha256"], "mtime": 0, "size": record.get("bytes", 0)}
+
+
+def _fingerprint_any(filename: str) -> Dict:
+    return _fingerprint_cloud(filename) if IS_CLOUDINARY else _fingerprint(DATA_DIR / filename)
+
+
+def _extract_pages_any(filename: str) -> List[Dict]:
+    """Extraction, from wherever the bytes live."""
+    if not IS_CLOUDINARY:
+        return extract_pages(str(DATA_DIR / filename))
+
+    from src.services import cloud_documents, cloudinary_store
+
+    record = cloud_documents.get(filename)
+    if record is None:
+        raise FileNotFoundError(f"'{filename}' is not in the Cloudinary registry.")
+    data = cloudinary_store.fetch_bytes(record["url"])
+
+    # PyMuPDF wants a path (or a stream, but extract_pages() is written against a path, and
+    # keeping that one shared code path is worth a throwaway temp file). Vercel's /tmp is
+    # writable and ephemeral, which is exactly what a file that only needs to live for the
+    # length of one request wants.
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="ingest-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        return extract_pages(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _needs_ingest(filename: str, fingerprint: Dict) -> Optional[str]:
@@ -142,13 +210,12 @@ def _needs_ingest(filename: str, fingerprint: Dict) -> Optional[str]:
 def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict] = None,
                on_stage=None) -> Dict:
     """
-    Extracts, chunks, embeds, and stores a single PDF already sitting in DATA_DIR.
+    Extracts, chunks, embeds, and stores a single PDF, wherever its bytes live.
 
     on_stage: optional callable(stage, done, total) where stage is "extracting" or
     "embedding". The UI turns this into a per-document progress bar.
     """
-    path = DATA_DIR / filename
-    fingerprint = fingerprint or _fingerprint(path)
+    fingerprint = fingerprint or _fingerprint_any(filename)
     owner = owner_of(filename)
 
     if on_stage:
@@ -156,7 +223,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     _event("Reading pages", filename, owner)
 
     with timed(log, f"extract '{filename}'"):
-        pages = extract_pages(str(path))
+        pages = _extract_pages_any(filename)
 
     if not pages:
         _event("No extractable text - skipped (is it a scan?)", filename, owner, kind="warn")
@@ -173,7 +240,7 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     chunks = split_to_token_limit(chunks)
     _event(f"Split {len(pages)} pages into {len(chunks)} passages", filename, owner)
     log.info(
-        "'%s': %d pages -> %d chunks. Embedding on CPU - a large document takes "
+        "'%s': %d pages -> %d chunks. Embedding - a large document takes "
         "several minutes, this is not a hang.",
         filename, len(pages), len(chunks),
     )
@@ -181,16 +248,12 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     # Replace, don't duplicate: drop any existing vectors for this document first.
     #
     # This runs for reason == "new" as well, which looks redundant but is not. A job killed
-    # part-way (Ctrl+C, or `uvicorn --reload` restarting on a file save) leaves whatever
-    # chunks it had already stored in Chroma, while the manifest entry - written only once
-    # the whole file finishes - never gets written. The next run therefore treats the file
-    # as "new" and re-embeds it from scratch under a fresh run_id, so without this delete
-    # the abandoned chunks would pile up as duplicates on every interrupted attempt.
-    # Unscoped by owner ON PURPOSE. A document's name is its path relative to data/, and
-    # uploads live under users/<id>/, so one document's name can never match another
-    # user's file. Scoping the delete by owner would leave behind chunks written before an
-    # owner existed - an interrupted pre-auth ingest, for instance - which no later delete
-    # would ever match.
+    # part-way (Ctrl+C, `uvicorn --reload` restarting, or - in cloud mode - a function that
+    # got killed between slices) leaves whatever chunks it had already stored, while the
+    # manifest entry - written only once the whole file finishes - never gets written. The
+    # next run therefore treats the file as "new" and re-embeds it from scratch, so without
+    # this delete the abandoned chunks would pile up as duplicates on every interrupted
+    # attempt. Unscoped by owner ON PURPOSE - see the note this had before the cloud split.
     delete_source(filename)
 
     if on_stage:
@@ -230,23 +293,23 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
 
 def prune_deleted(present: List[str], user_id: Optional[str] = None) -> List[Dict]:
     """
-    Drops documents that are in the store but no longer on disk.
+    Drops documents that are in the store but no longer known (gone from disk locally, or
+    removed from the Cloudinary registry in cloud mode).
 
-    Without this, deleting a PDF from data/ leaves its chunks searchable forever: the
-    answer still quotes it and still cites it by name, and there is no way to tell from
-    the app that the file is gone.
+    Without this, deleting a PDF leaves its chunks searchable forever: the answer still
+    quotes it and still cites it by name, with no way to tell from the app that it's gone.
     """
     removed = []
     for filename in manifest.sources(user_id):
         if filename in present:
             continue
         owner = owner_of(filename)
-        log.info("'%s' is gone from the data folder - removing it from the store.", filename)
+        log.info("'%s' is no longer present - removing it from the store.", filename)
         try:
             delete_source(filename)   # unscoped: see the note in ingest_one()
             manifest.remove(filename)
             answer_cache.bump(owner)
-            _event("Removed - the file is gone from the data folder", filename, owner)
+            _event("Removed - the file is no longer present", filename, owner)
             removed.append({"filename": filename, "user_id": owner, "status": "removed"})
         except Exception as exc:
             log.exception("Failed to remove '%s'", filename)
@@ -255,71 +318,97 @@ def prune_deleted(present: List[str], user_id: Optional[str] = None) -> List[Dic
     return removed
 
 
-def ingest_data_folder(force: bool = False, progress=None, stage=None,
-                       user_id: Optional[str] = None) -> List[Dict]:
+def _plan_ingest(filenames: List[str], force: bool) -> List[Dict]:
     """
-    Ingests every PDF in DATA_DIR that is new or has changed on disk, and removes stored
-    documents whose file has been deleted. Safe to call repeatedly - unchanged files are
-    reported, not re-embedded.
+    Shared by local's ingest_data_folder() and cloud's queue builder: for each filename, in
+    order, decide skip/duplicate/already-stored/needs-ingest. Returns ONE ordered list, not
+    two separate (decided, pending) lists - a pending entry carries {"pending": True,
+    "filename", "reason", "fingerprint"}, everything else is a terminal result dict.
 
-    force=True re-ingests everything (used after a reset).
-    progress: optional callable(filename, index, total) for job reporting.
-    stage: optional callable(stage_name, done, total) for within-document progress.
-    user_id: restrict the whole pass to one account's folder. Uploads use this; startup and
-    the CLI do not, because they are reconciling the entire folder.
-
-    A failure on one document never stops the others: a single malformed PDF used to abort
-    the whole job, leaving every file after it silently un-indexed.
+    This has to stay a single ordered list, not "everything already decided, then everything
+    freshly ingested": callers append results as they go, and a caller that appends all
+    decided items first and all pending items second reorders the results relative to the
+    original filename-scan order whenever a pending file happens to sort before a decided one
+    (e.g. "book (2).pdf" before "book.pdf" - space sorts below period in ASCII). Both the
+    offline test suite and anyone reading a job's "results" list depend on scan order.
     """
-    filenames = _pdf_filenames(user_id)
-    # Pruning compares the manifest against what is on disk, so a scoped pass must compare
-    # only that user's entries - otherwise every other account's documents look "deleted"
-    # and get dropped from the index.
-    results: List[Dict] = list(prune_deleted(filenames, user_id=user_id))
+    plan: List[Dict] = []
     seen_hashes: Dict[tuple, str] = {}
 
-    for index, filename in enumerate(filenames):
-        if progress:
-            progress(filename, index, len(filenames))
-
+    for filename in filenames:
         try:
-            fingerprint = _fingerprint(DATA_DIR / filename)
-        except OSError as exc:
+            fingerprint = _fingerprint_any(filename)
+        except (OSError, FileNotFoundError) as exc:
             log.warning("Could not read '%s': %s", filename, exc)
-            results.append({"filename": filename, "user_id": owner_of(filename),
-                            "status": "failed", "error": str(exc)})
+            plan.append({"filename": filename, "user_id": owner_of(filename),
+                        "status": "failed", "error": str(exc)})
             continue
 
-        # Same bytes under two names would be indexed twice and then compete with itself
-        # for every retrieval slot, crowding out other documents.
-        #
-        # Scoped PER OWNER: globally, two users uploading the same textbook would leave the
-        # second one with a "skipped" document they can never see or search, because the
-        # only stored copy belongs to somebody else.
+        # Same bytes under two names would be indexed twice and compete with itself for
+        # every retrieval slot. Scoped PER OWNER - see the note this had before the cloud
+        # split: globally, two users uploading the same textbook would leave the second one
+        # with a "skipped" document they can never see.
         owner = owner_of(filename)
         dedupe_key = (owner, fingerprint["sha256"])
         twin = seen_hashes.get(dedupe_key)
         if twin:
             log.warning("'%s' is byte-identical to '%s' - skipping the duplicate.", filename, twin)
             _event(f"Skipped - identical to '{twin}'", filename, owner, kind="warn")
-            results.append({"filename": filename, "user_id": owner, "status": "skipped",
-                            "reason": f"duplicate of '{twin}'"})
+            plan.append({"filename": filename, "user_id": owner, "status": "skipped",
+                        "reason": f"duplicate of '{twin}'"})
             continue
         seen_hashes[dedupe_key] = filename
 
         reason = "forced" if force else _needs_ingest(filename, fingerprint)
         if reason is None:
-            results.append({"filename": filename, "user_id": owner_of(filename),
-                            "status": "already_stored"})
+            plan.append({"filename": filename, "user_id": owner, "status": "already_stored"})
             continue
 
-        log.info("Ingesting '%s' (%s)...", filename, reason)
+        plan.append({
+            "pending": True,
+            "filename": filename,
+            "reason": "changed" if reason in ("changed", "forced") else "new",
+            "fingerprint": fingerprint,
+        })
+
+    return plan
+
+
+def ingest_data_folder(force: bool = False, progress=None, stage=None,
+                       user_id: Optional[str] = None) -> List[Dict]:
+    """
+    Ingests every known PDF that is new or has changed, and removes stored documents that
+    are no longer present. Safe to call repeatedly - unchanged files are reported, not
+    re-embedded. force=True re-ingests everything (used after a reset).
+
+    This is the LOCAL-MODE entry point (used by the background job, the CLI, and cloud's
+    own scripts/ingest.py run outside of a request). It runs the whole pass in one call,
+    which is fine off a request thread but is exactly what cloud mode's per-request job
+    (start_job/continue_job below) avoids doing on the request path.
+
+    A failure on one document never stops the others: a single malformed PDF used to abort
+    the whole job, leaving every file after it silently un-indexed.
+    """
+    filenames = _pdf_filenames(user_id)
+    results: List[Dict] = list(prune_deleted(filenames, user_id=user_id))
+    plan = _plan_ingest(filenames, force)
+
+    pending_total = sum(1 for item in plan if item.get("pending"))
+    pending_index = 0
+    for item in plan:
+        if not item.get("pending"):
+            results.append(item)
+            continue
+
+        filename = item["filename"]
+        if progress:
+            progress(filename, pending_index, pending_total)
+        pending_index += 1
+
+        log.info("Ingesting '%s' (%s)...", filename, item["reason"])
         try:
             result = ingest_one(
-                filename,
-                reason="changed" if reason in ("changed", "forced") else "new",
-                fingerprint=fingerprint,
-                on_stage=stage,
+                filename, reason=item["reason"], fingerprint=item["fingerprint"], on_stage=stage,
             )
         except Exception as exc:
             # Corrupt file, encrypted PDF, unreadable bytes, OOM on one monster document -
@@ -335,7 +424,7 @@ def ingest_data_folder(force: bool = False, progress=None, stage=None,
     return results
 
 
-# --------------------------------------------------------------------- background job
+# --------------------------------------------------------------------- local-mode background job
 
 _lock = threading.Lock()
 _state: Dict = {
@@ -362,13 +451,13 @@ _state: Dict = {
     "error": None,
 }
 
-# Kept small: it is returned on every status poll.
-MAX_JOB_EVENTS = 60
-
 
 def _event(message: str, filename: Optional[str] = None, user_id: Optional[str] = None,
            kind: str = "info") -> None:
     """Appends one line to the activity trail, tagged with whose document it concerns."""
+    if IS_CLOUDINARY:
+        _cloud_event(message, filename, user_id, kind)
+        return
     with _lock:
         _state["events"].append({
             "at": time.time(),
@@ -381,15 +470,7 @@ def _event(message: str, filename: Optional[str] = None, user_id: Optional[str] 
             del _state["events"][:-MAX_JOB_EVENTS]
 
 
-def job_status(user_id: Optional[str] = None) -> Dict:
-    """
-    The job's state. With a user_id, it is redacted to what that user may know.
-
-    The job is global - one thread indexes everybody's uploads - but its progress is not
-    public: `current_file` and `results` would otherwise tell you the filenames of every
-    other user's documents. Someone else's file in progress is reported as busy with no
-    name, so the UI can still say "indexing" without naming what.
-    """
+def _job_status_local(user_id: Optional[str] = None) -> Dict:
     with _lock:
         snapshot = dict(_state)
 
@@ -415,16 +496,10 @@ def job_status(user_id: Optional[str] = None) -> Dict:
         snapshot["stage"] = None
         snapshot["chunks_done"] = 0
         snapshot["chunks_total"] = 0
-        # Progress counts describe the whole queue, most of which may not be theirs.
         snapshot["files_done"] = 0
         snapshot["files_total"] = 0
         snapshot["other_user_busy"] = snapshot["state"] == "running"
     return snapshot
-
-
-def is_running() -> bool:
-    with _lock:
-        return _state["state"] == "running"
 
 
 def _run(force: bool, user_id: Optional[str] = None) -> None:
@@ -433,8 +508,6 @@ def _run(force: bool, user_id: Optional[str] = None) -> None:
             _state["current_file"] = filename
             _state["files_done"] = index
             _state["files_total"] = total
-            # A new file starts from scratch; leaving the previous file's counts in place
-            # made the bar jump backwards.
             _state["stage"] = None
             _state["chunks_done"] = 0
             _state["chunks_total"] = 0
@@ -449,8 +522,6 @@ def _run(force: bool, user_id: Optional[str] = None) -> None:
         results = ingest_data_folder(force=force, progress=progress, stage=stage,
                                      user_id=user_id)
 
-        # Anything uploaded while this run was in flight is picked up now, in the same
-        # thread, so the job the client is polling covers it too.
         while True:
             wanted, scopes = _consume_rescan_request()
             if not wanted:
@@ -460,8 +531,6 @@ def _run(force: bool, user_id: Optional[str] = None) -> None:
             for scope in scopes:
                 results.extend(ingest_data_folder(force=False, progress=progress,
                                                   stage=stage, user_id=scope))
-            # A long-lived server with many uploads would otherwise accumulate every result
-            # from every rescan in memory and ship the lot to each polling client.
             if len(results) > MAX_JOB_RESULTS:
                 dropped = len(results) - MAX_JOB_RESULTS
                 results = results[-MAX_JOB_RESULTS:]
@@ -469,14 +538,8 @@ def _run(force: bool, user_id: Optional[str] = None) -> None:
 
         with _lock:
             _state.update(
-                state="idle",
-                current_file=None,
-                stage=None,
-                chunks_done=0,
-                chunks_total=0,
-                files_done=_state["files_total"],
-                results=results,
-                error=None,
+                state="idle", current_file=None, stage=None, chunks_done=0, chunks_total=0,
+                files_done=_state["files_total"], results=results, error=None,
                 finished_at=time.time(),
             )
     except Exception as exc:  # a failed ingest must not kill the server
@@ -486,20 +549,10 @@ def _run(force: bool, user_id: Optional[str] = None) -> None:
 
 
 _rescan_requested = False
-# Whose folders still need scanning after the current run. `None` means "everything".
 _queued_scopes: List[Optional[str]] = []
 
 
-def start_job(force: bool = False, user_id: Optional[str] = None) -> Dict:
-    """
-    Kicks off ingestion in a background thread and returns immediately, so neither server
-    startup nor an HTTP request ever blocks on embedding a large corpus.
-
-    Called while a job is already running, it queues the request instead of starting a
-    second thread - two threads writing Chroma is not a supported configuration. The queued
-    entry remembers WHOSE scan was asked for, so an upload during someone else's long
-    indexing run is picked up as a scoped pass rather than a full re-walk of everything.
-    """
+def _start_job_local(force: bool = False, user_id: Optional[str] = None) -> Dict:
     global _rescan_requested
     with _lock:
         if _state["state"] == "running":
@@ -507,23 +560,13 @@ def start_job(force: bool = False, user_id: Optional[str] = None) -> Dict:
             _queued_scopes.append(user_id)
             return dict(_state)
         _state.update(
-            state="running",
-            scope=user_id,
-            started_at=time.time(),
-            finished_at=None,
-            current_file=None,
-            files_done=0,
-            files_total=0,
-            stage=None,
-            chunks_done=0,
-            chunks_total=0,
-            results=[],
-            events=[],
-            error=None,
+            state="running", scope=user_id, started_at=time.time(), finished_at=None,
+            current_file=None, files_done=0, files_total=0, stage=None, chunks_done=0,
+            chunks_total=0, results=[], events=[], error=None,
         )
 
     threading.Thread(target=_run, args=(force, user_id), daemon=True, name="ingest").start()
-    return job_status()
+    return _job_status_local()
 
 
 def _consume_rescan_request() -> Tuple[bool, List[Optional[str]]]:
@@ -532,7 +575,192 @@ def _consume_rescan_request() -> Tuple[bool, List[Optional[str]]]:
     with _lock:
         wanted, _rescan_requested = _rescan_requested, False
         scopes, _queued_scopes = _queued_scopes, []
-    # De-duplicated, and a single None ("everything") makes the scoped entries redundant.
     if None in scopes:
         return wanted, [None]
     return wanted, list(dict.fromkeys(scopes)) or [None]
+
+
+# --------------------------------------------------------------------- cloud-mode per-request job
+#
+# No background thread: a Vercel function is killed the instant it responds. `start_job()`
+# computes the work queue and writes it to Mongo; `continue_job()` (called by the frontend
+# in a loop, via POST /ingest/continue) does exactly one file per call. Always scoped to one
+# user - cloud mode has no local data/ folder to hand-copy files into, so there is no
+# "owner of record" full-corpus scan to support the way local mode's startup pass needs.
+
+def _jobs_collection():
+    from src.services import database
+
+    return database.sync_collection("ingestion_jobs")
+
+
+def _cloud_event(message: str, filename: Optional[str], user_id: Optional[str], kind: str) -> None:
+    if not user_id:
+        return
+    _jobs_collection().update_one(
+        {"_id": user_id},
+        {"$push": {"events": {
+            "$each": [{"at": time.time(), "kind": kind, "message": message,
+                       "file": filename, "user_id": user_id}],
+            "$slice": -MAX_JOB_EVENTS,
+        }}},
+        upsert=True,
+    )
+
+
+def _start_job_cloud(force: bool = False, user_id: Optional[str] = None) -> Dict:
+    if not user_id:
+        raise ValueError("Cloud-mode ingestion jobs must be scoped to a user.")
+
+    jobs = _jobs_collection()
+    existing = jobs.find_one({"_id": user_id})
+    if existing and existing.get("state") == "running":
+        # Mirrors local mode's "queue a rescan" behaviour: a second start while one is
+        # already in flight just asks for another pass once this one drains, rather than
+        # racing two queues against each other.
+        jobs.update_one({"_id": user_id}, {"$set": {"rescan_requested": True, "rescan_force": force}})
+        return _job_status_cloud(user_id)
+
+    filenames = _pdf_filenames(user_id)
+    prune_results = prune_deleted(filenames, user_id=user_id)
+    plan = _plan_ingest(filenames, force)
+    decided = [item for item in plan if not item.get("pending")]
+    pending = [item for item in plan if item.get("pending")]
+
+    jobs.update_one(
+        {"_id": user_id},
+        {"$set": {
+            "state": "running" if pending else "idle",
+            "started_at": time.time(),
+            "finished_at": None if pending else time.time(),
+            "current_file": None,
+            "files_done": 0,
+            "files_total": len(pending),
+            "stage": None,
+            "chunks_done": 0,
+            "chunks_total": 0,
+            "pending": pending,
+            "results": (prune_results + decided)[-MAX_JOB_RESULTS:],
+            "error": None,
+            "rescan_requested": False,
+            "rescan_force": False,
+        }, "$setOnInsert": {"events": []}},
+        upsert=True,
+    )
+    return _job_status_cloud(user_id)
+
+
+def continue_job(user_id: str) -> Dict:
+    """
+    Does ONE file's worth of ingestion for this user's queued job and returns the updated
+    status, including `done`. The frontend calls this in a loop (see script.js) until
+    `done` is true. A no-op, returning the current (already-done) status, if there is
+    nothing queued - so it is always safe to call.
+    """
+    jobs = _jobs_collection()
+    job = jobs.find_one({"_id": user_id})
+    if job is None or job.get("state") != "running" or not job.get("pending"):
+        if job and job.get("rescan_requested"):
+            # The previous pass finished exactly as a new one was requested; start it now
+            # rather than leaving the request stranded until someone happens to poll again.
+            jobs.update_one({"_id": user_id}, {"$set": {"rescan_requested": False}})
+            _start_job_cloud(force=bool(job.get("rescan_force")), user_id=user_id)
+            return continue_job(user_id)
+        return _job_status_cloud(user_id)
+
+    pending = list(job["pending"])
+    item = pending.pop(0)
+    filename = item["filename"]
+
+    jobs.update_one({"_id": user_id}, {"$set": {
+        "current_file": filename, "stage": None, "chunks_done": 0, "chunks_total": 0,
+    }})
+
+    def stage(name: str, done: int, total: int) -> None:
+        jobs.update_one({"_id": user_id},
+                        {"$set": {"stage": name, "chunks_done": done, "chunks_total": total}})
+
+    try:
+        result = ingest_one(filename, reason=item["reason"], fingerprint=item.get("fingerprint"),
+                            on_stage=stage)
+    except Exception as exc:
+        log.exception("Failed to ingest '%s'", filename)
+        _cloud_event(f"Failed: {type(exc).__name__}", filename, user_id, "error")
+        result = {"filename": filename, "user_id": user_id, "status": "failed",
+                  "error": f"{type(exc).__name__}: {exc}"}
+
+    files_done = job.get("files_done", 0) + 1
+    update = {
+        "pending": pending,
+        "files_done": files_done,
+        "current_file": None,
+        "stage": None,
+        "chunks_done": 0,
+        "chunks_total": 0,
+    }
+    if not pending:
+        update.update(state="idle", finished_at=time.time())
+    jobs.update_one({"_id": user_id}, {
+        "$set": update,
+        "$push": {"results": {"$each": [result], "$slice": -MAX_JOB_RESULTS}},
+    })
+
+    status = _job_status_cloud(user_id)
+    if status.get("state") != "running" and job.get("rescan_requested"):
+        jobs.update_one({"_id": user_id}, {"$set": {"rescan_requested": False}})
+        _start_job_cloud(force=bool(job.get("rescan_force")), user_id=user_id)
+        return _job_status_cloud(user_id)
+    return status
+
+
+def _job_status_cloud(user_id: Optional[str]) -> Dict:
+    if not user_id:
+        return dict(_state)  # shape compatibility for any unscoped caller
+    job = _jobs_collection().find_one({"_id": user_id})
+    if job is None:
+        return {
+            "state": "idle", "started_at": None, "finished_at": None, "scope": user_id,
+            "current_file": None, "files_done": 0, "files_total": 0, "stage": None,
+            "chunks_done": 0, "chunks_total": 0, "results": [], "events": [], "error": None,
+            "done": True,
+        }
+    job = dict(job)
+    job["scope"] = job.pop("_id")
+    job.pop("pending", None)
+    job.pop("rescan_requested", None)
+    job.pop("rescan_force", None)
+    job["done"] = job.get("state") != "running"
+    return job
+
+
+# --------------------------------------------------------------------- public API
+
+def job_status(user_id: Optional[str] = None) -> Dict:
+    """
+    The job's state, redacted to what `user_id` may know (local mode - see the note there;
+    cloud-mode jobs are already per-user, so nothing to redact).
+    """
+    if IS_CLOUDINARY:
+        return _job_status_cloud(user_id)
+    return _job_status_local(user_id)
+
+
+def is_running(user_id: Optional[str] = None) -> bool:
+    if IS_CLOUDINARY:
+        if not user_id:
+            return False
+        job = _jobs_collection().find_one({"_id": user_id}, {"state": 1})
+        return bool(job and job.get("state") == "running")
+    with _lock:
+        return _state["state"] == "running"
+
+
+def start_job(force: bool = False, user_id: Optional[str] = None) -> Dict:
+    """
+    Starts (or queues) ingestion for `user_id` (or, in local mode with no user_id, a full
+    scan of the whole data folder). Local mode: a background thread. Cloud mode: writes the
+    work queue and returns immediately - the caller must then drive it with continue_job().
+    """
+    if IS_CLOUDINARY:
+        return _start_job_cloud(force=force, user_id=user_id)
+    return _start_job_local(force=force, user_id=user_id)

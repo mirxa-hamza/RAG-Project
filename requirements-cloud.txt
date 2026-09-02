@@ -1,0 +1,35 @@
+# Dependencies for a Vercel (RAG_MODE=cloud) deployment. This is requirements.txt minus
+# torch and sentence-transformers, which do not fit a serverless bundle and are unused in
+# cloud mode anyway (embeddings and re-ranking are HTTP calls - see EMBEDDINGS_PROVIDER /
+# RERANKER_PROVIDER in src/core/config.py). Everything else is unchanged; the app code is
+# identical between local and cloud, only which packages back each piece differs.
+#
+# rank-bm25 stays: BM25 runs per-user, in memory, even in cloud mode (see services/bm25.py)
+# - it is a pure-Python, no-torch dependency, so there is nothing to trim there.
+#
+# Keep this in sync with requirements.txt by hand. There is deliberately no shared base
+# file with an exclusion list - Vercel's build reads this file directly, and a hidden
+# extra layer of indirection is exactly what this project's "no hidden abstractions" rule
+# argues against.
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pymupdf==1.28.2
+# chromadb 0.5.x hard-requires numpy<2.0; 1.x also dropped the posthog telemetry spam.
+chromadb==1.5.9
+# groq<0.13 passes a `proxies` kwarg to httpx.Client that httpx>=0.28 no longer accepts.
+groq==1.7.0
+python-dotenv==1.0.1
+# Vector store (VECTOR_STORE=pinecone) and/or embeddings/re-rank (EMBEDDINGS_PROVIDER=
+# pinecone, RERANKER_PROVIDER=pinecone).
+pinecone==9.1.0
+# HTTP client for the Pinecone/Cohere/Jina embedding+re-rank calls and for Cloudinary's
+# REST API (services/cloudinary_store.py).
+httpx==0.28.1
+# Keyword half of hybrid retrieval (pure Python, no index server) - stays in cloud mode.
+rank-bm25==0.2.2
+python-multipart==0.0.20
+# --- Authentication -------------------------------------------------------------------
+motor==3.7.1
+python-jose[cryptography]==3.5.0
+pwdlib[argon2]==0.3.1

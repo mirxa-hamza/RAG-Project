@@ -12,14 +12,16 @@ Note the consequence, which is deliberate and worth keeping in mind before expos
 server beyond localhost: anyone who can reach these routes can add documents to the corpus
 and delete them from disk. There is no authentication here.
 """
-from typing import List
+import hashlib
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from pydantic import BaseModel, Field
 
 from src.api.auth import _enforce
 from src.api.deps import get_current_user, user_id_of
 from src.core import ratelimit
-from src.core.config import MAX_UPLOAD_BYTES, MAX_USER_STORAGE_BYTES
+from src.core.config import DOCUMENT_STORE, MAX_UPLOAD_BYTES, MAX_USER_STORAGE_BYTES
 from src.core.logging import get_logger
 from src.ml import embeddings
 from src.services import answer_cache, database, ingestion, manifest, uploads, vectorstore
@@ -28,6 +30,8 @@ log = get_logger(__name__)
 
 router = APIRouter(tags=["documents"])
 
+IS_CLOUDINARY = DOCUMENT_STORE == "cloudinary"
+
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 def start_ingest(user: dict = Depends(get_current_user)):
@@ -35,12 +39,16 @@ def start_ingest(user: dict = Depends(get_current_user)):
     Starts a background scan of the data folder, ingesting anything new or changed and
     pruning anything deleted. Poll GET /ingest/status for progress.
 
-    The scan itself is global - it is the filesystem being reconciled, not one user's
-    documents - but each file is stored under the owner its path names, and the status this
-    returns is filtered to the caller.
+    Local mode: the scan itself is global - it is the whole data folder being reconciled,
+    not one user's documents - but each file is stored under the owner its path names, and
+    the status this returns is filtered to the caller. Cloud mode: there is no shared data
+    folder to reconcile, so this is scoped to the caller's own documents, and - having no
+    background thread - only computes the work queue; poll POST /ingest/continue to drive
+    it (see services/ingestion.py's module docstring).
     """
-    ingestion.start_job()
-    return ingestion.job_status(user_id_of(user))
+    uid = user_id_of(user)
+    ingestion.start_job(user_id=uid if IS_CLOUDINARY else None)
+    return ingestion.job_status(uid)
 
 
 @router.get("/ingest/status")
@@ -74,6 +82,9 @@ def stats(user: dict = Depends(get_current_user)):
         "storage_used_bytes": uploads.used_bytes(uid),
         "storage_quota_bytes": MAX_USER_STORAGE_BYTES,
         "username": user["username"],
+        # Tells the frontend which upload flow to use: the local multipart POST /upload, or
+        # the sign -> direct-to-Cloudinary -> /upload/complete dance cloud mode requires.
+        "document_store": DOCUMENT_STORE,
         **mine,
     }
 
@@ -89,6 +100,17 @@ async def upload(request: Request, files: List[UploadFile] = File(...),
     request open. Files are validated one by one: a bad file in a batch is reported in
     `rejected` while the good ones still go through.
     """
+    if IS_CLOUDINARY:
+        # Vercel rejects any request body over 4.5MB, so this endpoint - a raw multipart
+        # body - cannot be the cloud-mode upload path at all, not even for small files: the
+        # two modes must not silently differ by file size. Use POST /upload/sign then
+        # POST /upload/complete instead (see below).
+        raise HTTPException(
+            status_code=400,
+            detail="This deployment stores documents in Cloudinary. Use POST /upload/sign "
+                   "and POST /upload/complete instead of a direct multipart upload.",
+        )
+
     if not files:
         raise HTTPException(status_code=400, detail="No files were sent.")
 
@@ -136,6 +158,101 @@ async def upload(request: Request, files: List[UploadFile] = File(...),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024)}
 
 
+class UploadCompleteRequest(BaseModel):
+    """What the browser tells us after it has uploaded straight to Cloudinary."""
+    public_id: str = Field(..., min_length=1, max_length=500)
+    url: str = Field(..., min_length=1, max_length=2000)
+    filename: str = Field(..., min_length=1, max_length=255)
+    bytes: Optional[int] = Field(None, ge=0)
+
+
+@router.post("/upload/sign")
+async def upload_sign(user: dict = Depends(get_current_user)):
+    """
+    Cloud mode only: a short-lived signed payload the BROWSER posts straight to Cloudinary.
+    This process never sees the PDF bytes - see cloudinary_store.py's module docstring for
+    why that's forced on us by Vercel's 4.5MB request-body limit.
+    """
+    if not IS_CLOUDINARY:
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    from src.services import cloudinary_store
+
+    uid = user_id_of(user)
+    _enforce(ratelimit.UPLOAD_SIGN, uid)
+    try:
+        return cloudinary_store.sign_upload(uid)
+    except cloudinary_store.CloudinaryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.post("/upload/complete", status_code=status.HTTP_202_ACCEPTED)
+async def upload_complete(body: UploadCompleteRequest, user: dict = Depends(get_current_user)):
+    """
+    Cloud mode only: the browser calls this after its direct Cloudinary upload succeeds, so
+    this app can validate and register what actually landed there and start indexing it.
+
+    SECURITY: `public_id` is client-supplied, so before anything else it is checked against
+    the caller's own Cloudinary folder (see cloudinary_store.public_id_belongs_to). Without
+    that check, an authenticated caller could name any public_id - including one belonging
+    to another account - and have this app fetch and index it under their own library.
+    """
+    if not IS_CLOUDINARY:
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    from src.services import cloud_documents, cloudinary_store
+
+    uid = user_id_of(user)
+    _enforce(ratelimit.UPLOAD, uid)
+
+    if not cloudinary_store.public_id_belongs_to(body.public_id, uid):
+        raise HTTPException(status_code=403, detail="That upload does not belong to you.")
+
+    try:
+        data = cloudinary_store.fetch_bytes(body.url)
+    except cloudinary_store.CloudinaryError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    try:
+        # Same three checks local mode's save_pdf() makes while streaming - magic bytes,
+        # size cap, per-account quota - now applied to bytes fetched back from Cloudinary.
+        # This is deliberately not skipped: see validate_uploaded_bytes()'s docstring.
+        safe_name = uploads.validate_uploaded_bytes(body.filename, data, user_id=uid)
+    except uploads.UploadError as exc:
+        cloudinary_store.destroy(body.public_id)  # don't leave the rejected file billed
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    final_name = cloud_documents.unique_filename(safe_name, uid)
+    filename = f"{ingestion.USERS_DIRNAME}/{uid}/{final_name}"
+    sha256 = hashlib.sha256(data).hexdigest()
+
+    cloud_documents.register(
+        filename, user_id=uid, public_id=body.public_id, url=body.url,
+        size_bytes=len(data), sha256=sha256,
+    )
+    await database.record_audit(uid, user["username"], "upload", filename)
+
+    job = ingestion.start_job(user_id=uid)
+    return {"filename": filename, "bytes": len(data), "job": job}
+
+
+@router.post("/ingest/continue")
+async def ingest_continue(user: dict = Depends(get_current_user)):
+    """
+    Cloud mode only: does one file's worth of the caller's queued ingestion job and returns
+    the updated status, including `done`. The frontend calls this in a loop after
+    /upload/complete or /ingest until `done` is true - there is no background thread to do
+    it for them (see the module docstring in services/ingestion.py for why).
+
+    Harmless (and unnecessary) to call in local mode: it just reports the job status, since
+    local mode's background thread has already done the work.
+    """
+    uid = user_id_of(user)
+    if not IS_CLOUDINARY:
+        return ingestion.job_status(uid)
+    return ingestion.continue_job(uid)
+
+
 @router.delete("/documents/{filename:path}")
 async def delete_document(filename: str, user: dict = Depends(get_current_user)):
     """
@@ -145,13 +262,13 @@ async def delete_document(filename: str, user: dict = Depends(get_current_user))
     folder, and the next ingestion pass - including the one that runs at every startup -
     would faithfully index it again.
     """
-    if ingestion.is_running():
+    uid = user_id_of(user)
+    if ingestion.is_running(uid):
         raise HTTPException(
             status_code=409,
             detail="Indexing is running. Wait for it to finish before removing a document.",
         )
 
-    uid = user_id_of(user)
     record = manifest.get(filename)
 
     # Someone else's document is reported as missing, not as forbidden: a 403 would
@@ -189,10 +306,10 @@ async def reset(user: dict = Depends(get_current_user)):
     caller's documents is dropped from the store and re-embedded from the PDF that is
     still in their folder.
     """
-    if ingestion.is_running():
+    uid = user_id_of(user)
+    if ingestion.is_running(uid):
         raise HTTPException(status_code=409, detail="An ingestion job is already running.")
 
-    uid = user_id_of(user)
     mine = manifest.sources(uid)
     for name in mine:
         vectorstore.delete_source(name)

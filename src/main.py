@@ -28,7 +28,7 @@ from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api import api_router
-from src.core.config import CORS_ORIGINS, STATIC_DIR
+from src.core.config import CORS_ORIGINS, IS_CLOUD, STATIC_DIR
 from src.core.logging import get_logger, new_request_id, quiet_access_log, request_id
 from src.ml import embeddings
 from src.services import database, ingestion
@@ -93,13 +93,23 @@ async def lifespan(app: FastAPI):
         log.error("The app will start, but signing in will fail until MongoDB is running.")
     except Exception:
         log.exception("Could not prepare MongoDB indexes; sign-in may be unreliable.")
-    # Load the embedding model off the critical path. Doing it at import time kept the
-    # port closed for ~18s, so opening the link too early gave ERR_CONNECTION_REFUSED
-    # rather than the loading screen.
-    threading.Thread(target=embeddings.warm_up, name="warm-up", daemon=True).start()
-    # Kick ingestion off in the background - the API is up immediately, and new, changed
-    # or deleted PDFs are reconciled while it serves requests.
-    ingestion.start_job()
+    if IS_CLOUD:
+        # Nothing to warm up: embeddings/re-ranking are HTTP calls in cloud mode, not a
+        # local model. And nothing to background-scan: there is no shared data/ folder to
+        # reconcile, and no long-lived process for a thread to run in anyway - a Vercel
+        # function is killed the instant it responds to this very request. Cloud-mode
+        # ingestion is entirely request-driven (see services/ingestion.py's module
+        # docstring): POST /upload/complete or /ingest starts a job, POST /ingest/continue
+        # drives it one file at a time.
+        log.info("RAG_MODE=cloud: skipping local model warm-up and the startup ingest scan.")
+    else:
+        # Load the embedding model off the critical path. Doing it at import time kept the
+        # port closed for ~18s, so opening the link too early gave ERR_CONNECTION_REFUSED
+        # rather than the loading screen.
+        threading.Thread(target=embeddings.warm_up, name="warm-up", daemon=True).start()
+        # Kick ingestion off in the background - the API is up immediately, and new, changed
+        # or deleted PDFs are reconciled while it serves requests.
+        ingestion.start_job()
     yield
     database.close()
 

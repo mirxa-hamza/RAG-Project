@@ -300,6 +300,40 @@ def get_neighbors(source: str, chunk_index: int, radius: int = 1,
     return list(found.values())
 
 
+def _get_all_pages(where: Optional[Dict], include: List[str]) -> Dict[str, List]:
+    """
+    Every record matching `where`, read a page at a time.
+
+    A bare get() with no limit returns the whole result set from a LOCAL disk store, which
+    is why calling it that way looked correct for a long time. A HOSTED Chroma caps how many
+    records one request may return - 300 on the free tier at the time of writing, the same
+    cap that applies to add() - and over that cap the response is silently TRUNCATED. No
+    error, no warning, just fewer rows than were asked for.
+
+    That made all_chunks() build the BM25 index from the first 300 chunks of a 2,600-chunk
+    corpus. Vector search was unaffected (it filters server-side), so nothing looked broken:
+    answers still came back, and only the keyword half of hybrid retrieval quietly stopped
+    seeing 90% of the corpus. Exactly the kind of failure that never appears in local mode.
+
+    Paged with CHROMA_ADD_BATCH because it is already "how many records this account will
+    take in one request" - the cap applies in both directions.
+    """
+    out: Dict[str, List] = {"ids": [], "documents": [], "metadatas": []}
+    offset = 0
+    while True:
+        page = _col().get(where=where, include=include,
+                          limit=CHROMA_ADD_BATCH, offset=offset)
+        ids = page.get("ids") or []
+        for key in out:
+            values = page.get(key)
+            if values:
+                out[key].extend(values)
+        # A short page means this was the last one. Equality means there may be more.
+        if len(ids) < CHROMA_ADD_BATCH:
+            return out
+        offset += len(ids)
+
+
 def set_owner(source_name: str, user_id: str) -> int:
     """
     Stamps `user_id` onto every stored chunk of one document, in place.
@@ -308,7 +342,7 @@ def set_owner(source_name: str, user_id: str) -> int:
     accounts existed. Chroma has no "update where" - metadata is rewritten by id - so the
     ids and existing metadata are read first and updated in batches.
     """
-    got = _col().get(where={"source": source_name}, include=["metadatas"])
+    got = _get_all_pages({"source": source_name}, ["metadatas"])
     ids = got.get("ids") or []
     if not ids:
         return 0
@@ -332,10 +366,13 @@ def all_chunks(user_id: Optional[str] = None) -> List[Dict]:
     This is an O(corpus) read, done once per cached index (see bm25.py), not per query.
     Scoping it by user is what keeps one person's upload from making everyone else pay to
     rebuild.
+
+    Paged - see _get_all_pages(). Reading this in one unbounded request silently returned
+    only the first page against a hosted Chroma, so BM25 indexed a fraction of the corpus.
     """
     if _col().count() == 0:
         return []
-    got = _col().get(where=owner_filter(user_id), include=["documents", "metadatas"])
+    got = _get_all_pages(owner_filter(user_id), ["documents", "metadatas"])
     return [_row(text, meta) for text, meta in zip(got["documents"], got["metadatas"])]
 
 

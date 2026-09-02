@@ -10,6 +10,7 @@ embedding model is: uvicorn imports this module before it binds the port, and Mo
 constructor starts background topology threads. Lazily also means the offline test suite
 can substitute a fake collection without a server anywhere.
 """
+import re
 from typing import Any, Optional
 
 from src.core.config import AUDIT_COLLECTION, MONGO_DB, MONGO_URI, USERS_COLLECTION
@@ -17,9 +18,26 @@ from src.core.logging import get_logger
 
 log = get_logger(__name__)
 
+
+def _redact(uri: str) -> str:
+    """
+    "mongodb+srv://user:hunter2@cluster.mongodb.net" -> "mongodb+srv://user:***@cluster.mongodb.net"
+
+    A hosted connection string carries the password inline, and this URI is both LOGGED on
+    every connection and embedded in CANNOT_REACH below, which is shown to the user as-is
+    on the sign-in screen. Unredacted, that means the database password is printed into the
+    platform's log stream on every cold start, and rendered in a browser to anyone who
+    loads the page during an outage. Neither is recoverable after the fact - the only fix
+    once it has happened is rotating the credential.
+    """
+    return re.sub(r"(//[^:/?#@]+:)[^@]+@", r"\1***@", uri)
+
+
 _client = None
 _users = None
 _audit = None
+_sync_client = None
+_sync_collections: dict = {}
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -33,7 +51,7 @@ class DatabaseUnavailable(RuntimeError):
 
 
 CANNOT_REACH = (
-    f"Can't reach MongoDB at {MONGO_URI}. Start it and try again - on Windows: "
+    f"Can't reach MongoDB at {_redact(MONGO_URI)}. Start it and try again - on Windows: "
     "`net start MongoDB` in an admin terminal, or `mongod --dbpath C:\\data\\db`; "
     "with Docker: `docker run -d -p 27017:27017 --name mongo mongo`."
 )
@@ -63,7 +81,7 @@ def get_client():
         # be installed before Motor is ever needed.
         from motor.motor_asyncio import AsyncIOMotorClient
 
-        log.info("Connecting to MongoDB at %s (database '%s')", MONGO_URI, MONGO_DB)
+        log.info("Connecting to MongoDB at %s (database '%s')", _redact(MONGO_URI), MONGO_DB)
         _client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=3000)
     return _client
 
@@ -90,6 +108,41 @@ def set_users_collection(collection: Any, audit_collection: Any = None) -> None:
     _users = collection
     if audit_collection is not None:
         _audit = audit_collection
+
+
+def get_sync_client():
+    """
+    A synchronous (pymongo) client for the small pieces of STATE_STORE=mongo state - the
+    rate limiter, the answer cache, the ingestion job, and the document manifest - that are
+    called from plain synchronous code (the local background-ingestion thread has no event
+    loop) as well as from async request handlers. See the note in core/config.py.
+
+    Lazy for the same reason as get_client(): constructing it opens a background topology
+    thread, and this module must stay cheap to import.
+    """
+    global _sync_client
+    if _sync_client is None:
+        from pymongo import MongoClient
+
+        log.info("Connecting to MongoDB (sync client) at %s (database '%s')", _redact(MONGO_URI), MONGO_DB)
+        _sync_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+    return _sync_client
+
+
+def sync_collection(name: str) -> Any:
+    """
+    A collection reached through the synchronous client, by name. Tests replace one via
+    set_sync_collection() - a plain in-memory fake, no server required, mirroring how
+    set_users_collection() lets the async side run offline.
+    """
+    if name not in _sync_collections:
+        _sync_collections[name] = get_sync_client()[MONGO_DB][name]
+    return _sync_collections[name]
+
+
+def set_sync_collection(name: str, collection: Any) -> None:
+    """Injection point for tests: swap in a fake collection for one name, no server needed."""
+    _sync_collections[name] = collection
 
 
 async def ensure_indexes() -> None:
@@ -200,8 +253,12 @@ async def count_users() -> int:
 
 
 def close() -> None:
-    global _client, _users
+    global _client, _users, _sync_client, _sync_collections
     if _client is not None:
         _client.close()
     _client = None
     _users = None
+    if _sync_client is not None:
+        _sync_client.close()
+    _sync_client = None
+    _sync_collections = {}

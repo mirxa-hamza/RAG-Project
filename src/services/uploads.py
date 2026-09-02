@@ -29,13 +29,14 @@ import unicodedata
 from pathlib import Path
 from typing import BinaryIO, Optional, Tuple
 
-from src.core.config import DATA_DIR, MAX_UPLOAD_BYTES, MAX_USER_STORAGE_BYTES
+from src.core.config import DATA_DIR, DOCUMENT_STORE, MAX_UPLOAD_BYTES, MAX_USER_STORAGE_BYTES
 from src.core.logging import get_logger
 
 log = get_logger(__name__)
 
 PDF_MAGIC = b"%PDF-"
 _READ_CHUNK = 1024 * 1024  # 1MB
+IS_CLOUDINARY = DOCUMENT_STORE == "cloudinary"
 
 
 class UploadError(Exception):
@@ -123,11 +124,43 @@ def unique_path(filename: str, user_id: Optional[str] = None) -> Tuple[Path, str
 
 
 def used_bytes(user_id: Optional[str]) -> int:
-    """How much disk this account's documents currently occupy."""
+    """How much storage this account's documents currently occupy."""
+    if IS_CLOUDINARY:
+        from src.services import cloud_documents
+
+        return cloud_documents.used_bytes(user_id) if user_id else 0
     folder = upload_dir(user_id)
     if not folder.is_dir():
         return 0
     return sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+
+
+def validate_uploaded_bytes(raw_filename: str, data: bytes, user_id: Optional[str] = None) -> str:
+    """
+    The same three checks save_pdf() makes while streaming to disk, applied instead to
+    bytes already fetched from Cloudinary (POST /upload/complete). Kept as one shared
+    function rather than reimplemented at the call site, per this module's docstring: this
+    is the ONLY place that turns request-adjacent bytes into a trusted document, cloud path
+    included. Skipping this on the Cloudinary path would let an arbitrary file, disguised as
+    a PDF by nothing but its extension, reach the ingestion pipeline.
+
+    Returns the safe filename on success; raises UploadError otherwise.
+    """
+    filename = safe_filename(raw_filename)
+    if not data:
+        raise UploadError(f"'{filename}' is empty.")
+    if not data.startswith(PDF_MAGIC):
+        raise UploadError(f"'{filename}' is not a PDF (its contents don't start with a PDF header).")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise UploadError(f"'{filename}' is larger than the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.")
+    if user_id:
+        quota_used = used_bytes(user_id)
+        if quota_used + len(data) > MAX_USER_STORAGE_BYTES:
+            raise UploadError(
+                f"'{filename}' would take your library past its "
+                f"{MAX_USER_STORAGE_BYTES // (1024 * 1024)}MB limit."
+            )
+    return filename
 
 
 def save_pdf(stream: BinaryIO, raw_filename: str, user_id: Optional[str] = None) -> dict:
@@ -224,7 +257,17 @@ def resolve_document(filename: str, user_id: Optional[str] = None) -> Path:
 
 
 def delete_document(filename: str, user_id: Optional[str] = None) -> bool:
-    """Deletes the PDF from DATA_DIR. Returns False if it was already gone."""
+    """Deletes the PDF. Returns False if it was already gone."""
+    if IS_CLOUDINARY:
+        from src.services import cloud_documents, cloudinary_store
+
+        record = cloud_documents.remove(filename)
+        if record is None:
+            return False
+        cloudinary_store.destroy(record["public_id"])  # never raises; see its docstring
+        log.info("Deleted '%s' from Cloudinary.", filename)
+        return True
+
     path = resolve_document(filename, user_id)
     if not path.exists():
         return False
