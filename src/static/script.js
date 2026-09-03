@@ -1,5 +1,5 @@
 /* ============================================================================
-   Document Q&A — front end
+   Marginalia — front end
    The page is served by FastAPI itself (src/main.py mounts src/static at "/"), so every
    call is same-origin and no host needs hard-coding. Set an absolute URL here only if you
    deliberately serve this page from somewhere other than the API.
@@ -104,7 +104,9 @@ el.apiBase.textContent = window.location.origin;
    the only sane response is to drop it and show the sign-in screen again.
    ==================================================================== */
 
-const TOKEN_KEY = "docqa.token";
+// Renaming this key signs every existing browser out once, which is the correct
+// trade for not carrying the old product name around in local storage forever.
+const TOKEN_KEY = "marginalia.token";
 // The server's identity for this run. Stored alongside the token so a page reload keeps
 // the session, while restarting the project asks for a password again - which is the
 // difference between "I refreshed" and "this is a fresh start".
@@ -760,13 +762,22 @@ function setServerStatus(state, label, title) {
 }
 
 /* ─────────────────────────── Upload ─────────────────────────────────
-   The browser sends PDFs to POST /upload, which writes them into the server's data folder
-   and starts the same background ingestion job that the sync button uses. Two progress
-   phases, because they fail differently and take wildly different amounts of time:
-   the transfer (XHR, has real byte counts) and the indexing (polled from /ingest/status).
+   Two upload paths, chosen by `DOCUMENT_STORE` (from GET /stats):
+
+   - "local": the browser sends PDFs straight to POST /upload, which writes them into the
+     server's data folder and starts the same background ingestion job the sync button uses.
+   - "cloudinary": this server never sees the PDF bytes (Vercel rejects request bodies over
+     4.5MB). Each file is signed (POST /upload/sign), uploaded directly from the browser to
+     Cloudinary, then registered with POST /upload/complete, which is what actually starts
+     indexing it. See cloudinary_store.py's module docstring for why.
+
+   Either way there are two progress phases, because they fail differently and take wildly
+   different amounts of time: the transfer (XHR, has real byte counts) and the indexing
+   (polled through POST /ingest/continue).
    ==================================================================== */
 
 let MAX_UPLOAD_MB = 100;   // replaced with the server's real limit by refreshSources()
+let DOCUMENT_STORE = "local";   // replaced with the server's real mode by refreshSources()
 const uploadCards = new Map();
 
 function humanSize(bytes) {
@@ -850,6 +861,81 @@ function sendFiles(files, cards) {
   });
 }
 
+/**
+ * Cloud-mode upload of one file: sign, then an XHR straight to Cloudinary (this app never
+ * sees the bytes), then POST /upload/complete to register it and start indexing. Resolves
+ * to {filename, bytes} — the same shape local mode's /upload puts in `result.accepted`, so
+ * the rest of uploadFiles() does not need to know which path ran.
+ */
+async function uploadOneToCloudinary(file, card) {
+  card.set(2, "Preparing…");
+  const signRes = await authFetch("/upload/sign", { method: "POST" });
+  const sign = await signRes.json();
+  if (!signRes.ok) throw new Error(sign.detail || "Could not start the upload.");
+
+  const asset = await new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("api_key", sign.api_key);
+    form.append("timestamp", sign.timestamp);
+    form.append("folder", sign.folder);
+    form.append("signature", sign.signature);
+    form.append("resource_type", sign.resource_type);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", sign.upload_url);
+
+    xhr.upload.addEventListener("progress", (e) => {
+      if (!e.lengthComputable) return;
+      const percent = Math.round((e.loaded / e.total) * 100);
+      card.set(percent, `Uploading… ${percent}%`);
+    });
+
+    xhr.addEventListener("load", () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      reject(new Error(body.error?.message || `Upload to storage failed (${xhr.status})`));
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload failed — could not reach cloud storage.")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
+    xhr.send(form);
+  });
+
+  card.set(100, "Uploaded — indexing…", "working");
+
+  const completeRes = await authFetch("/upload/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      public_id: asset.public_id,
+      url: asset.secure_url || asset.url,
+      filename: file.name,
+      bytes: file.size,
+    }),
+  });
+  const completed = await completeRes.json();
+  if (!completeRes.ok) throw new Error(completed.detail || "Could not finish the upload.");
+  return { filename: completed.filename, bytes: completed.bytes };
+}
+
+/** Cloud-mode equivalent of sendFiles(): one signed round-trip per file, sequentially, since
+    each needs its own progress bar and its own /upload/complete call. Same {accepted,
+    rejected} shape as sendFiles() so uploadFiles() can treat both the same way. */
+async function sendFilesCloud(files, cards) {
+  const accepted = [];
+  const rejected = [];
+  for (let i = 0; i < files.length; i++) {
+    try {
+      accepted.push(await uploadOneToCloudinary(files[i], cards[i]));
+    } catch (err) {
+      cards[i].set(100, err.message, "error");
+      rejected.push({ filename: files[i].name, error: err.message });
+    }
+  }
+  return { accepted, rejected };
+}
+
 async function uploadFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
@@ -871,7 +957,9 @@ async function uploadFiles(fileList) {
   setBusy(true);
 
   try {
-    const result = await sendFiles(good, cards);
+    const result = DOCUMENT_STORE === "cloudinary"
+      ? await sendFilesCloud(good, cards)
+      : await sendFiles(good, cards);
 
     for (const bad of result.rejected || []) {
       const card = uploadCards.get(bad.filename);
@@ -995,7 +1083,11 @@ async function pollUntilDone() {
   while (polling) {
     let job;
     try {
-      job = await (await authFetch("/ingest/status")).json();
+      // POST /ingest/continue rather than GET /ingest/status: in cloud mode there is no
+      // background thread, so /ingest/continue is what actually drives the queue forward
+      // one file at a time (see services/ingestion.py). It is a harmless, plain status read
+      // in local mode, where the background thread is already doing the work.
+      job = await (await authFetch("/ingest/continue", { method: "POST" })).json();
     } catch (err) {
       // Signed out is not "lost contact" - the sign-in screen is already up, and saying
       // the backend died on top of it is a second, wrong explanation.
@@ -1133,6 +1225,7 @@ async function refreshSources() {
       MAX_UPLOAD_MB = data.max_upload_mb;
       if (el.maxUploadMb) el.maxUploadMb.textContent = data.max_upload_mb;
     }
+    if (data.document_store) DOCUMENT_STORE = data.document_store;
     renderQuota(data.storage_used_bytes || 0, data.storage_quota_bytes || 0);
     // The passage count is not shown in the sidebar any more; the element only exists if
     // someone puts it back.

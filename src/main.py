@@ -28,7 +28,7 @@ from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api import api_router
-from src.core.config import CORS_ORIGINS, STATIC_DIR
+from src.core.config import CORS_ORIGINS, IS_CLOUD, STATIC_DIR
 from src.core.logging import get_logger, new_request_id, quiet_access_log, request_id
 from src.ml import embeddings
 from src.services import database, ingestion, sessions
@@ -99,14 +99,19 @@ async def lifespan(app: FastAPI):
     # rather than the loading screen.
     threading.Thread(target=embeddings.warm_up, name="warm-up", daemon=True).start()
     # Kick ingestion off in the background - the API is up immediately, and new, changed
-    # or deleted PDFs are reconciled while it serves requests.
-    ingestion.start_job()
+    # or deleted PDFs are reconciled while it serves requests. Local-mode only: it scans
+    # the whole DATA_DIR unscoped to a user. Cloud-mode ingestion is per-user and driven by
+    # /upload or /ingest with an authenticated caller - start_job() with no user_id raises
+    # there, and an unhandled exception here fails the whole ASGI lifespan startup, which
+    # crashed every cold start on Vercel.
+    if not IS_CLOUD:
+        ingestion.start_job()
     yield
     database.close()
 
 
 app = FastAPI(
-    title="Document Q&A",
+    title="Marginalia",
     description="A from-scratch RAG API over the PDFs in the backend's data folder.",
     version="3.1",
     lifespan=lifespan,

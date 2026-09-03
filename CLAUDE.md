@@ -325,7 +325,7 @@ effectively N times larger.
 - **HTML is served `no-cache`; CSS and JS are cache-busted with `?v=N` in `index.html`.**
   Chrome served a cached `index.html` against a freshly updated `style.css` once and the new
   markup rendered completely unstyled. Bump the `?v=` number whenever you change either
-  static asset (currently `?v=22`).
+  static asset (currently `?v=27`).
 - **Auth code: `pwdlib` with Argon2id, never `passlib`.** passlib is unmaintained and
   breaks against recent bcrypt releases. `PasswordHash.recommended()` also gives hash
   migration for free.
@@ -502,6 +502,18 @@ warning when it sees them.
 
 ## Known gotchas (already fixed, keep them fixed)
 
+- **The frontend must branch on `document_store` from `GET /stats`, not assume local mode.**
+  `POST /upload` (a raw multipart body) is local-mode only — Vercel rejects any request body
+  over 4.5MB, so cloud mode (`DOCUMENT_STORE=cloudinary`) rejects it outright and tells the
+  caller to use `POST /upload/sign` + a direct browser-to-Cloudinary upload + `POST
+  /upload/complete` instead (see `cloudinary_store.py`'s module docstring). The frontend
+  went a full rebrand-and-feature cycle with only the local path implemented, so every cloud
+  upload failed with that exact "Use POST /upload/sign..." message shown as a raw error.
+  `script.js` now reads `DOCUMENT_STORE` from `/stats` and calls `sendFilesCloud()` instead
+  of `sendFiles()` when it is `"cloudinary"`. Relatedly: cloud mode has no background
+  ingestion thread, so polling `GET /ingest/status` alone never advances a queued job —
+  `pollUntilDone()` calls `POST /ingest/continue` instead, which does one file's worth of
+  work per call and is a harmless plain status read in local mode.
 - **Embedding truncation.** `all-MiniLM-L6-v2` reads only 256 tokens; the project's
   ~300-word chunks were being silently truncated, so the tail of every chunk never
   influenced retrieval. Now on `BAAI/bge-small-en-v1.5` (512 tokens), and
