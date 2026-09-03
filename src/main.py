@@ -111,7 +111,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Document Q&A",
+    title="Marginalia",
     description="A from-scratch RAG API over the PDFs in the backend's data folder.",
     version="3.1",
     lifespan=lifespan,
