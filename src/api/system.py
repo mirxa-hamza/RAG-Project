@@ -1,4 +1,6 @@
 """Liveness and diagnostics."""
+import uuid
+
 from fastapi import APIRouter, Response
 
 from src.core.config import (
@@ -17,6 +19,12 @@ from src.ml import embeddings
 
 router = APIRouter(tags=["system"])
 
+# A new identity for every server start. The browser stores the one it signed in under and
+# compares it on load: same id means "this is the same running server, stay signed in";
+# a different id means the project was restarted, which is when a fresh sign-in is wanted.
+# It is not a secret - it is a random label with nothing derived from it.
+BOOT_ID = uuid.uuid4().hex
+
 
 @router.get("/health")
 def health():
@@ -25,7 +33,8 @@ def health():
     the model is ready (it loads in a warm-up thread), so the UI needs to tell "up but
     still warming" apart from "up and able to answer".
     """
-    return {"status": "ok", "embedding_model_ready": embeddings.is_ready()}
+    return {"status": "ok", "embedding_model_ready": embeddings.is_ready(),
+            "boot_id": BOOT_ID}
 
 
 @router.get("/ready")

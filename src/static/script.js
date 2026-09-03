@@ -1,5 +1,5 @@
 /* ============================================================================
-   Marginalia — front end
+   Document Q&A — front end
    The page is served by FastAPI itself (src/main.py mounts src/static at "/"), so every
    call is same-origin and no host needs hard-coding. Set an absolute URL here only if you
    deliberately serve this page from somewhere other than the API.
@@ -14,6 +14,8 @@ const el = {
   authForm: $("authForm"),
   authTitle: $("authTitle"),
   authText: $("authText"),
+  authNameField: $("authNameField"),
+  authName: $("authName"),
   authUser: $("authUser"),
   authPass: $("authPass"),
   authError: $("authError"),
@@ -46,10 +48,16 @@ const el = {
   syncProgress: $("syncProgress"),
   syncProgressBar: $("syncProgressBar"),
   sourceList: $("sourceList"),
+  sidebarSourceList: $("sidebarSourceList"),
+  sidebarDocCount: $("sidebarDocCount"),
+  sidebarAddDocBtn: $("sidebarAddDocBtn"),
   docCount: $("docCount"),
   chunkCount: $("chunkCount"),
   railCount: $("railCount"),
   scopeBtn: $("scopeBtn"),
+  scopeBox: $("scopeBox"),
+  scopeList: $("scopeList"),
+  scopeAll: $("scopeAll"),
   scopeLabel: $("scopeLabel"),
   selectAllBtn: $("selectAllBtn"),
   appEl: $("app"),
@@ -58,6 +66,12 @@ const el = {
   docsScrim: $("docsScrim"),
   docsClose: $("docsClose"),
   newChatBtn: $("newChatBtn"),
+  historyList: $("historyList"),
+  historyEmpty: $("historyEmpty"),
+  historyFoot: $("historyFoot"),
+  historyLoading: $("historyLoading"),
+  historyEnd: $("historyEnd"),
+  sidebarInner: document.querySelector(".sidebar__inner"),
   attachBtn: $("attachBtn"),
   activityBtn: $("activityBtn"),
   activityDot: $("activityDot"),
@@ -90,9 +104,11 @@ el.apiBase.textContent = window.location.origin;
    the only sane response is to drop it and show the sign-in screen again.
    ==================================================================== */
 
-// Renaming this key signs every existing browser out once, which is the correct
-// trade for not carrying the old product name around in local storage forever.
-const TOKEN_KEY = "marginalia.token";
+const TOKEN_KEY = "docqa.token";
+// The server's identity for this run. Stored alongside the token so a page reload keeps
+// the session, while restarting the project asks for a password again - which is the
+// difference between "I refreshed" and "this is a fresh start".
+const BOOT_KEY = "docqa.boot";
 let session = null;          // { username } once signed in
 // Bumped on every sign-out. Background loops capture it and stop when it changes, so work
 // started under one session can never keep running (or keep 401ing) under the next.
@@ -104,6 +120,32 @@ function readToken() {
   } catch {
     // Private mode, or storage blocked. The app still works for this tab; the user just
     // signs in again next time.
+    return null;
+  }
+}
+
+function readBoot() {
+  try {
+    return localStorage.getItem(BOOT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeBoot(id) {
+  try {
+    if (id) localStorage.setItem(BOOT_KEY, id);
+    else localStorage.removeItem(BOOT_KEY);
+  } catch { /* not fatal - see readToken */ }
+}
+
+/** The running server's boot id, or null if it cannot be asked. */
+async function serverBootId() {
+  try {
+    const res = await fetch(`${API_BASE}/health`);
+    if (!res.ok) return null;
+    return (await res.json()).boot_id || null;
+  } catch {
     return null;
   }
 }
@@ -283,6 +325,276 @@ window.matchMedia("(max-width: 860px)").addEventListener("change", () => {
 });
 syncMenuButton();
 
+
+/* ─────────────────────────── Chat history ───────────────────────────
+   Conversations live in MongoDB, one document each, and the sidebar pages through them
+   ten at a time.
+
+   Cursor pagination, not page numbers: a conversation jumps to the top of the list the
+   moment you send a message in it, so "page 2" describes a different set of rows every
+   time it is asked for - rows get duplicated and skipped as you scroll. A cursor says
+   "everything strictly older than this exact row", which stays true however the list
+   reorders underneath.
+
+   The load trigger is an IntersectionObserver on a sentinel at the end of the list rather
+   than scroll-position arithmetic, which is what keeps it smooth and correct at any zoom.
+   ==================================================================== */
+
+const HISTORY_PAGE = 10;
+
+const chats = {
+  order: [],               // session ids, newest first
+  byId: new Map(),         // id -> { id, title, updated_at, message_count }
+  cursor: null,            // where the next page starts; null = start from the top
+  loading: false,          // one request at a time, or scrolling fires a dozen
+  done: false,             // the server said there is nothing older
+  activeId: null,          // the conversation on screen, or null for an unsaved new one
+};
+
+function resetHistory() {
+  chats.order = [];
+  chats.byId.clear();
+  chats.cursor = null;
+  chats.loading = false;
+  chats.done = false;
+  chats.activeId = null;
+  if (el.historyList) el.historyList.replaceChildren(el.historyEmpty);
+  if (el.historyEnd) el.historyEnd.hidden = true;
+}
+
+/** Puts one session at the top of the list, or moves it there if it is already known. */
+function rememberSession(session, { toTop = false } = {}) {
+  const known = chats.byId.has(session.id);
+  chats.byId.set(session.id, { ...(chats.byId.get(session.id) || {}), ...session });
+  if (!known) {
+    if (toTop) chats.order.unshift(session.id);
+    else chats.order.push(session.id);
+  } else if (toTop) {
+    chats.order = [session.id, ...chats.order.filter((id) => id !== session.id)];
+  }
+}
+
+function renderHistory() {
+  if (!el.historyList) return;
+
+  const rows = chats.order
+    .map((id) => chats.byId.get(id))
+    .filter(Boolean)
+    .map((session) => `
+      <li class="history__item${session.id === chats.activeId ? " is-active" : ""}"
+          data-session="${escapeHtml(session.id)}">
+        <button type="button" class="history__open" title="${escapeHtml(session.title)}">
+          <span class="history__title">${escapeHtml(session.title)}</span>
+        </button>
+        <button type="button" class="icon-btn history__rename" data-rename="${escapeHtml(session.id)}"
+                title="Rename this chat" aria-label="Rename ${escapeHtml(session.title)}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+        </button>
+        <button type="button" class="icon-btn history__delete" data-delete="${escapeHtml(session.id)}"
+                title="Delete this chat" aria-label="Delete ${escapeHtml(session.title)}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+        </button>
+      </li>`).join("");
+
+  el.historyList.innerHTML = rows ||
+    `<li class="history__empty" id="historyEmpty">No conversations yet</li>`;
+  el.historyEmpty = $("historyEmpty");
+  if (el.historyEnd) el.historyEnd.hidden = !(chats.done && chats.order.length > 0);
+}
+
+/**
+ * Fetches the next page of history.
+ *
+ * The `loading` and `done` guards are the whole point: without them an observer that fires
+ * three times while a request is in flight sends three identical requests, and the browser
+ * renders the same ten conversations three times over.
+ */
+async function loadMoreSessions() {
+  if (chats.loading || chats.done || !session) return;
+  chats.loading = true;
+  if (el.historyLoading) el.historyLoading.hidden = false;
+
+  const epoch = sessionEpoch;
+  try {
+    const query = new URLSearchParams({ limit: String(HISTORY_PAGE) });
+    if (chats.cursor) query.set("cursor", chats.cursor);
+    const page = await (await authFetch(`/api/sessions?${query}`)).json();
+
+    // A sign-out (or a different account signing in) while this was in flight means the
+    // rows that just arrived belong to nobody on screen.
+    if (sessionEpoch !== epoch) return;
+
+    for (const item of page.sessions || []) rememberSession(item);
+    chats.cursor = page.next_cursor || null;
+    chats.done = !chats.cursor;
+    renderHistory();
+  } catch (err) {
+    if (!(err && err.signedOut)) log_("Could not load chat history:", err.message);
+  } finally {
+    chats.loading = false;
+    if (el.historyLoading) el.historyLoading.hidden = true;
+    // The first page may not fill the sidebar, in which case the sentinel is still on
+    // screen and nothing would ever trigger the second page.
+    queueMicrotask(fillHistoryViewport);
+  }
+}
+
+function log_(...args) {
+  // eslint-disable-next-line no-console
+  console.warn(...args);
+}
+
+function fillHistoryViewport() {
+  if (chats.done || chats.loading || !el.historyFoot || !el.sidebarInner) return;
+  const foot = el.historyFoot.getBoundingClientRect();
+  const box = el.sidebarInner.getBoundingClientRect();
+  if (foot.top <= box.bottom + 40) loadMoreSessions();
+}
+
+if (el.historyFoot && "IntersectionObserver" in window) {
+  const watcher = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) loadMoreSessions();
+  }, { root: el.sidebarInner, rootMargin: "120px" });
+  watcher.observe(el.historyFoot);
+}
+
+/** Opens a saved conversation: metadata is already here, the messages are not. */
+async function openSession(id) {
+  if (!id || id === chats.activeId) return;
+  try {
+    const data = await (await authFetch(`/api/sessions/${encodeURIComponent(id)}`)).json();
+    chats.activeId = data.id;
+    rememberSession({ id: data.id, title: data.title, updated_at: data.updated_at,
+                      message_count: data.message_count });
+    renderHistory();
+
+    // Replay it into the chat area, and rebuild the follow-up context from the same
+    // messages so "and the second one?" still works in a reopened conversation.
+    el.messages.replaceChildren(el.welcome);
+    el.welcome.hidden = true;
+    history = [];
+    let pendingQuestion = null;
+
+    for (const message of data.messages || []) {
+      const rendered = addMessage(message.role === "user" ? "user" : "assistant",
+                                  message.content || "");
+      if (message.role === "assistant") {
+        if (message.sources && message.sources.length) {
+          renderSources(rendered.wrapper, { sources: message.sources });
+        }
+        if (pendingQuestion !== null) {
+          history.push({ question: pendingQuestion, answer: message.content || "" });
+          pendingQuestion = null;
+        }
+      } else {
+        pendingQuestion = message.content || "";
+      }
+    }
+    if (history.length > 8) history = history.slice(-8);
+
+    if (!(data.messages || []).length) {
+      el.messages.replaceChildren(el.welcome);
+      el.welcome.hidden = false;
+    }
+    scrollToBottom();
+    if (isNarrow()) setDrawer(false);
+  } catch (err) {
+    if (!(err && err.signedOut)) setStatus(err.message, "error");
+  }
+}
+
+/** The session a message belongs to, created on demand rather than on every "New chat". */
+async function ensureSession() {
+  if (chats.activeId) return chats.activeId;
+  const created = await (await authFetch("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  })).json();
+  chats.activeId = created.id;
+  // Deliberately created only when the first message is sent: pressing "New chat" three
+  // times would otherwise leave three empty conversations in the sidebar forever.
+  rememberSession(created, { toTop: true });
+  renderHistory();
+  return created.id;
+}
+
+async function saveMessage(role, content, sources) {
+  if (!chats.activeId || !content) return;
+  try {
+    const saved = await (await authFetch(
+      `/api/sessions/${encodeURIComponent(chats.activeId)}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role, content, sources: sources || null }),
+      })).json();
+    // The server names the conversation from its first question; take that title back so
+    // the sidebar does not sit on "New chat" until the next reload.
+    if (saved && saved.title) {
+      rememberSession({ id: chats.activeId, title: saved.title,
+                        updated_at: new Date().toISOString() }, { toTop: true });
+      renderHistory();
+    }
+  } catch (err) {
+    // A failed save must not break the answer already on screen; say so quietly.
+    if (!(err && err.signedOut)) setStatus("That message was not saved to your history.", "error");
+  }
+}
+
+el.historyList.addEventListener("click", async (e) => {
+  const rename = e.target.closest(".history__rename");
+  if (rename) {
+    const id = rename.dataset.rename;
+    const current = (chats.byId.get(id) || {}).title || "";
+    const wanted = prompt("Rename this chat", current);
+    // Cancel returns null; an unchanged or blank name is not worth a request.
+    if (wanted === null || !wanted.trim() || wanted.trim() === current) return;
+    rename.disabled = true;
+    try {
+      const saved = await (await authFetch(`/api/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: wanted.trim() }),
+      })).json();
+      // The server cleans and truncates the title, so take back what it actually stored
+      // rather than showing a name the database does not have.
+      rememberSession({ id, title: saved.title });
+      renderHistory();
+    } catch (err) {
+      if (!(err && err.signedOut)) setStatus(err.message, "error");
+    } finally {
+      rename.disabled = false;
+    }
+    return;
+  }
+
+  const remove = e.target.closest(".history__delete");
+  if (remove) {
+    const id = remove.dataset.delete;
+    const title = (chats.byId.get(id) || {}).title || "this chat";
+    if (!confirm(`Delete "${title}"? This cannot be undone.`)) return;
+    remove.disabled = true;
+    try {
+      await authFetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+      chats.byId.delete(id);
+      chats.order = chats.order.filter((known) => known !== id);
+      if (chats.activeId === id) {
+        chats.activeId = null;
+        newChat();
+      }
+      renderHistory();
+      fillHistoryViewport();
+    } catch (err) {
+      remove.disabled = false;
+      if (!(err && err.signedOut)) setStatus(err.message, "error");
+    }
+    return;
+  }
+
+  const row = e.target.closest(".history__item");
+  if (row) openSession(row.dataset.session);
+});
+
 /* ─────────────────────────── Search scope ───────────────────────────
    Which documents a question is answered from. A Set of filenames rather than one value,
    because a person can tick several - and an EMPTY set deliberately means "all of them",
@@ -296,33 +608,76 @@ function scopeList() {
   return [...scope];
 }
 
+// Every document the account has, as {filename, label}. Kept here so the scope dropdown
+// can be rebuilt without another request - refreshSources() hands it over.
+let scopeDocuments = [];
+
 function renderScope(available) {
   // Documents deleted since the last render must not stay in the selection - the filter
   // would keep narrowing the search to a document the server no longer has.
   if (available) {
+    scopeDocuments = available.map((name) => ({ name, label: shortDocName(name) }));
     for (const name of [...scope]) if (!available.includes(name)) scope.delete(name);
   }
 
-  const total = available ? available.length : null;
-  el.scopeLabel.textContent =
-    scope.size === 0 ? "All documents"
-      : scope.size === 1 ? shortDocName(scopeList()[0])
-        : `${scope.size} document${scope.size === 1 ? "" : "s"}`;
-  el.scopeBtn.title = scope.size === 0
-    ? "Searching every document. Tick documents in the panel to narrow it."
-    : `Searching ${scope.size} of ${total ?? "?"} documents.`;
-  el.scopeBtn.classList.toggle("is-active", scope.size > 0);
+  const total = scopeDocuments.length;
+  if (el.scopeLabel) {
+    el.scopeLabel.textContent =
+      scope.size === 0 ? "All documents"
+        : scope.size === 1 ? shortDocName(scopeList()[0])
+          : `${scope.size} of ${total} documents`;
+  }
+  if (el.scopeBtn) {
+    el.scopeBtn.title = scope.size === 0
+      ? "Answering from every document. Pick documents here to narrow it."
+      : `Answering from ${scope.size} of ${total} documents.`;
+    el.scopeBtn.classList.toggle("is-active", scope.size > 0);
+  }
+  // "All documents" is not a third state - it is simply what an empty selection means, so
+  // the checkbox mirrors the selection rather than holding a value of its own.
+  if (el.scopeAll) el.scopeAll.checked = scope.size === 0;
+
+  if (el.scopeList) {
+    el.scopeList.innerHTML = scopeDocuments.length
+      ? scopeDocuments.map((doc) => `
+          <li>
+            <label class="scope__row" title="${escapeHtml(doc.name)}">
+              <input type="checkbox" class="doc-pick" data-doc="${escapeHtml(doc.name)}"
+                     ${scope.has(doc.name) ? "checked" : ""}>
+              <span>${escapeHtml(doc.label)}</span>
+            </label>
+          </li>`).join("")
+      : `<li class="scope__empty">No documents yet</li>`;
+  }
 
   if (el.selectAllBtn) {
     el.selectAllBtn.textContent = scope.size === 0 ? "Select all" : "Clear selection";
   }
-  document.querySelectorAll(".doc-pick").forEach((box) => {
+  // The Documents panel shows the same ticks, so both stay in step.
+  document.querySelectorAll("#sourceList .doc-pick").forEach((box) => {
     box.checked = scope.has(box.dataset.doc);
   });
 }
 
-// The scope chip is a shortcut into the panel, where the ticking happens.
-if (el.scopeBtn) el.scopeBtn.addEventListener("click", () => openDocs());
+if (el.scopeList) {
+  el.scopeList.addEventListener("change", (e) => {
+    const box = e.target.closest(".doc-pick");
+    if (!box) return;
+    if (box.checked) scope.add(box.dataset.doc);
+    else scope.delete(box.dataset.doc);
+    renderScope();
+  });
+}
+
+// Ticking "All documents" clears the selection, because an empty selection IS "all".
+// Unticking it would mean "search nothing", which answers "not in these documents" to
+// every question and looks exactly like a broken index - so it is not a reachable state.
+if (el.scopeAll) {
+  el.scopeAll.addEventListener("change", () => {
+    scope.clear();
+    renderScope();
+  });
+}
 
 if (el.selectAllBtn) el.selectAllBtn.addEventListener("click", () => {
   // "Select all" and "no selection" mean the same search, so the button clears rather than
@@ -412,11 +767,6 @@ function setServerStatus(state, label, title) {
    ==================================================================== */
 
 let MAX_UPLOAD_MB = 100;   // replaced with the server's real limit by refreshSources()
-// "local" | "cloudinary" - which upload flow to use, learned from /stats (refreshSources()).
-// Cloud mode has no request body large enough to carry a PDF (Vercel's 4.5MB limit), so it
-// uploads straight to Cloudinary instead of POSTing the file to this server at all - see
-// uploadFilesCloud() below.
-let documentStore = "local";
 const uploadCards = new Map();
 
 function humanSize(bytes) {
@@ -500,100 +850,9 @@ function sendFiles(files, cards) {
   });
 }
 
-/* ── Cloud-mode upload: sign -> POST straight to Cloudinary -> tell the server ──
-   Vercel rejects any request body over 4.5MB, so the file never touches this server on
-   the way in. Each file gets its own signature (POST /upload/sign) and is posted directly
-   to Cloudinary with real byte-progress (XHR, same reason as sendFiles() above), then
-   /upload/complete tells this app what landed there so it can validate and register it. */
-
-async function signCloudUpload() {
-  const res = await authFetch("/upload/sign", { method: "POST" });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || "Could not get an upload authorization.");
-  return data;
-}
-
-function sendToCloudinary(file, sign, card) {
-  return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("api_key", sign.api_key);
-    form.append("timestamp", sign.timestamp);
-    form.append("signature", sign.signature);
-    form.append("folder", sign.folder);
-
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", sign.upload_url);
-    xhr.upload.addEventListener("progress", (e) => {
-      if (!e.lengthComputable) return;
-      const percent = Math.round((e.loaded / e.total) * 100);
-      card.set(percent, `Uploading… ${percent}%`);
-    });
-    xhr.addEventListener("load", () => {
-      let body = {};
-      try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
-      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
-      reject(new Error(body.error?.message || `Cloudinary upload failed (${xhr.status})`));
-    });
-    xhr.addEventListener("error", () => reject(new Error("Upload failed — could not reach Cloudinary.")));
-    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
-    xhr.send(form);
-  });
-}
-
-async function uploadFilesCloud(files) {
-  clearFinishedUploads();
-
-  const tooBig = files.filter((f) => f.size > MAX_UPLOAD_MB * 1024 * 1024);
-  const notPdf = files.filter((f) => !/\.pdf$/i.test(f.name));
-  const good = files.filter((f) => !tooBig.includes(f) && !notPdf.includes(f));
-
-  for (const f of tooBig) addUploadCard(f.name, f.size).set(100, `Too large (limit ${MAX_UPLOAD_MB} MB)`, "error");
-  for (const f of notPdf) addUploadCard(f.name, f.size).set(100, "Not a PDF", "error");
-  if (!good.length) return;
-
-  setBusy(true);
-  // One at a time, not batched like the local flow: each file needs its own Cloudinary
-  // signature and its own /upload/complete call, so there is no single request whose
-  // progress event could represent the whole batch the way local mode's does.
-  for (const file of good) {
-    const card = addUploadCard(file.name, file.size);
-    card.set(2, "Requesting upload authorization…");
-    try {
-      const sign = await signCloudUpload();
-      const uploaded = await sendToCloudinary(file, sign, card);
-      card.set(100, "Uploaded — indexing…", "working");
-
-      const res = await authFetch("/upload/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          public_id: uploaded.public_id,
-          url: uploaded.secure_url || uploaded.url,
-          filename: file.name,
-          bytes: uploaded.bytes,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || "Could not register the upload.");
-      uploadCards.set(data.filename, card);
-    } catch (err) {
-      card.set(100, err.message, "error");
-      setStatus(err.message, "error");
-    }
-  }
-
-  await pollUntilDone();
-  for (const card of uploadCards.values()) {
-    if (card.li.dataset.tone !== "error") card.set(100, "Ready", "done");
-  }
-  setBusy(false);
-}
-
 async function uploadFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
-  if (documentStore === "cloudinary") return uploadFilesCloud(files);
 
   clearFinishedUploads();
 
@@ -627,16 +886,42 @@ async function uploadFiles(fileList) {
       uploadCards.set(ok.filename, card);
     });
 
-    await pollUntilDone();
-
-    for (const ok of result.accepted || []) {
-      const card = uploadCards.get(ok.filename);
-      if (card && card.li.dataset.tone !== "error") card.set(100, "Ready", "done");
-    }
+    const job = await pollUntilDone();
+    applyIngestResults(result.accepted || [], job);
   } catch (err) {
     cards.forEach((c) => c.set(100, err.message, "error"));
     setStatus(err.message, "error");
     setBusy(false);
+  }
+}
+
+/**
+ * Sets each upload card to what the job actually reported for that file, instead of
+ * assuming every accepted upload became "Ready".
+ *
+ * Before this, a file the backend marked "skipped" (e.g. a scanned PDF with no
+ * extractable text - see ingest_one()'s "no extractable text" branch) or "failed" still
+ * showed "Ready" here, because the card was set unconditionally once polling finished. A
+ * document that never actually got indexed then looked done, and the first question that
+ * needed it answered "not in these documents" with no visible explanation - indistinguishable
+ * from a stuck or broken index. The real per-file outcome lives in `job.results`, keyed by
+ * filename, and is what drives the card now.
+ */
+function applyIngestResults(accepted, job) {
+  const results = (job && job.results) || [];
+  for (const ok of accepted) {
+    const card = uploadCards.get(ok.filename);
+    if (!card || card.li.dataset.tone === "error") continue;
+    const outcome = results.find((r) => r.filename === ok.filename);
+    if (!outcome || outcome.status === "ingested" || outcome.status === "already_stored") {
+      card.set(100, "Ready", "done");
+    } else if (outcome.status === "skipped") {
+      card.set(100, outcome.reason ? `Skipped — ${outcome.reason}` : "Skipped", "error");
+    } else if (outcome.status === "failed") {
+      card.set(100, outcome.error ? `Failed — ${outcome.error}` : "Failed", "error");
+    } else {
+      card.set(100, "Ready", "done");
+    }
   }
 }
 
@@ -696,23 +981,21 @@ async function runJob(path, startMessage) {
   }
 }
 
-// Ingestion runs as a background job on the backend (local mode), so poll it rather than
-// hanging on one long request — a big PDF takes minutes to embed. Cloud mode has no
-// background thread to do that work between polls (see services/ingestion.py's module
-// docstring), so each iteration there calls POST /ingest/continue instead of GET
-// /ingest/status: that endpoint both does one file's worth of work AND returns the same
-// status shape, so the rendering code below is identical either way.
+// Ingestion runs as a background job on the backend, so poll it rather than hanging on one
+// long request — a big PDF takes minutes to embed.
 async function pollUntilDone() {
   polling = true;
+  let finalJob = null;
+  // Set when the loop breaks without ever learning the job's real terminal state - either
+  // the connection was lost or the session ended mid-poll. Neither of those is "the job
+  // finished and the backend is fine", so the status dot must not be forced back to
+  // "Online" for them at the end - it used to be, which overwrote a just-shown "Lost
+  // contact with the backend" message with the opposite claim a moment later.
+  let interrupted = false;
   while (polling) {
     let job;
     try {
-      // In cloud mode each poll IS one file's worth of work, not just a status read:
-      // a serverless function is killed when it responds, so there is no background
-      // thread and this loop is what drives ingestion (see services/ingestion.py).
-      job = documentStore === "cloudinary"
-        ? await (await authFetch("/ingest/continue", { method: "POST" })).json()
-        : await (await authFetch("/ingest/status")).json();
+      job = await (await authFetch("/ingest/status")).json();
     } catch (err) {
       // Signed out is not "lost contact" - the sign-in screen is already up, and saying
       // the backend died on top of it is a second, wrong explanation.
@@ -720,8 +1003,10 @@ async function pollUntilDone() {
         setStatus("Lost contact with the backend.", "error");
         setServerStatus("offline", "Offline", "The backend is not responding");
       }
+      interrupted = true;
       break;
     }
+    finalJob = job;
 
     renderActivity(job);
 
@@ -793,8 +1078,12 @@ async function pollUntilDone() {
   el.syncProgress.hidden = true;
   el.syncProgressBar.style.width = "";
   // refreshSources() above ran while `polling` was still true, so it deliberately left the
-  // status dot alone; the job is over now, so put it back to "Online".
-  setServerStatus("online", "Online", `Connected to ${window.location.origin}`);
+  // status dot alone; the job is over now, so put it back to "Online" - but only if it
+  // actually finished rather than the connection dropping mid-poll.
+  if (!interrupted) {
+    setServerStatus("online", "Online", `Connected to ${window.location.origin}`);
+  }
+  return finalJob;
 }
 
 function setBusy(busy) {
@@ -807,15 +1096,39 @@ function setStatus(text, tone) {
   el.syncStatus.className = "status" + (tone ? ` status--${tone}` : "");
 }
 
+/**
+ * The document list markup, shared by the Documents panel and the sidebar's copy of it.
+ * Both render identically, so the same `.doc-pick`/`.doc-remove` handlers work on either.
+ */
+function renderDocListHtml(docs) {
+  if (docs.length === 0) return `<li class="doc-empty">Nothing ingested yet</li>`;
+  return docs.map((d) => `
+    <li title="${escapeHtml(d.filename)}">
+      <label class="doc-pick-wrap" title="Search this document">
+        <input type="checkbox" class="doc-pick" data-doc="${escapeHtml(d.filename)}">
+        <span class="sr-only">Search ${escapeHtml(shortDocName(d.filename))}</span>
+      </label>
+      <div class="doc-text">
+        <span class="doc-name">${escapeHtml(shortDocName(d.filename))}</span>
+        <span class="doc-meta">${d.size ? `${humanSize(d.size)} · ` : ""}${d.pages ?? "?"} pages · ${(d.chunks ?? 0).toLocaleString()} chunks</span>
+        <span class="doc-state">ready</span>
+      </div>
+      <button type="button" class="icon-btn doc-remove" data-doc="${escapeHtml(d.filename)}"
+              title="Remove this document" aria-label="Remove ${escapeHtml(shortDocName(d.filename))}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+      </button>
+    </li>`).join("");
+}
+
 async function refreshSources() {
   try {
     const res = await authFetch("/stats");
     const data = await res.json();
     const docs = data.documents || [];
-    documentStore = data.document_store || "local";
 
     el.docCount.textContent = docs.length;
     if (el.railCount) el.railCount.textContent = docs.length;
+    if (el.sidebarDocCount) el.sidebarDocCount.textContent = docs.length;
     if (data.max_upload_mb) {
       MAX_UPLOAD_MB = data.max_upload_mb;
       if (el.maxUploadMb) el.maxUploadMb.textContent = data.max_upload_mb;
@@ -835,24 +1148,9 @@ async function refreshSources() {
 
     // Only fully-indexed documents appear here: the list comes from the manifest, and a
     // manifest entry is written after the last chunk of that file is stored.
-    el.sourceList.innerHTML = docs.length === 0
-      ? `<li class="doc-empty">Nothing ingested yet</li>`
-      : docs.map((d) => `
-        <li title="${escapeHtml(d.filename)}">
-          <label class="doc-pick-wrap" title="Search this document">
-            <input type="checkbox" class="doc-pick" data-doc="${escapeHtml(d.filename)}">
-            <span class="sr-only">Search ${escapeHtml(shortDocName(d.filename))}</span>
-          </label>
-          <div class="doc-text">
-            <span class="doc-name">${escapeHtml(shortDocName(d.filename))}</span>
-            <span class="doc-meta">${d.size ? `${humanSize(d.size)} · ` : ""}${d.pages ?? "?"} pages · ${(d.chunks ?? 0).toLocaleString()} chunks</span>
-            <span class="doc-state">ready</span>
-          </div>
-          <button type="button" class="icon-btn doc-remove" data-doc="${escapeHtml(d.filename)}"
-                  title="Remove this document" aria-label="Remove ${escapeHtml(shortDocName(d.filename))}">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
-          </button>
-        </li>`).join("");
+    const docListHtml = renderDocListHtml(docs);
+    el.sourceList.innerHTML = docListHtml;
+    if (el.sidebarSourceList) el.sidebarSourceList.innerHTML = docListHtml;
 
     // Re-tick whatever is still selected, and drop anything that has been deleted.
     renderScope(docs.map((d) => d.filename));
@@ -868,17 +1166,20 @@ async function refreshSources() {
   }
 }
 
-/* ─────────────────────────── Remove a document ───────────────────────── */
+/* ─────────────────────────── Remove a document ─────────────────────────
+   The same two handlers are wired to both copies of the document list (the Documents
+   panel's #sourceList and the sidebar's #sidebarSourceList), since they render identical
+   markup and must stay in sync either way a document is picked or removed. */
 
-el.sourceList.addEventListener("change", (e) => {
+function onDocListChange(e) {
   const box = e.target.closest(".doc-pick");
   if (!box) return;
   if (box.checked) scope.add(box.dataset.doc);
   else scope.delete(box.dataset.doc);
   renderScope();
-});
+}
 
-el.sourceList.addEventListener("click", async (e) => {
+async function onDocListClick(e) {
   const btn = e.target.closest(".doc-remove");
   if (!btn) return;
 
@@ -889,7 +1190,10 @@ el.sourceList.addEventListener("click", async (e) => {
     "data folder. This cannot be undone."
   )) return;
 
-  btn.disabled = true;
+  // Both copies of the button (panel + sidebar) for this document should show the
+  // in-progress state, not just the one that was clicked.
+  const buttons = document.querySelectorAll(`.doc-remove[data-doc="${CSS.escape(filename)}"]`);
+  buttons.forEach((b) => { b.disabled = true; });
   try {
     const res = await authFetch(`/documents/${encodeURIComponent(filename)}`, {
       method: "DELETE",
@@ -899,16 +1203,28 @@ el.sourceList.addEventListener("click", async (e) => {
     setStatus(`Removed ${shortDocName(filename)}.`, "ok");
     await refreshSources();
   } catch (err) {
-    btn.disabled = false;
+    buttons.forEach((b) => { b.disabled = false; });
     setStatus(err.message, "error");
   }
-});
+}
+
+el.sourceList.addEventListener("change", onDocListChange);
+el.sourceList.addEventListener("click", onDocListClick);
+if (el.sidebarSourceList) {
+  el.sidebarSourceList.addEventListener("change", onDocListChange);
+  el.sidebarSourceList.addEventListener("click", onDocListClick);
+}
+if (el.sidebarAddDocBtn) el.sidebarAddDocBtn.addEventListener("click", () => openDocs());
 
 /* ─────────────────────────── Chat ───────────────────────────── */
 
 /** Start over: drop the conversation and its history, keep the documents. */
 function newChat() {
   history = [];
+  // No session is created here. One is created when the first message is sent, so
+  // pressing this button five times leaves no empty conversations behind.
+  chats.activeId = null;
+  renderHistory();
   el.messages.replaceChildren(el.welcome);
   el.welcome.hidden = false;
   el.questionInput.focus();
@@ -967,6 +1283,12 @@ el.chatForm.addEventListener("submit", async (e) => {
   el.welcome.hidden = true;
   addMessage("user", question);
 
+  // Save the question before the answer exists: if the model call fails, the conversation
+  // still shows what was asked rather than losing it.
+  let saving = ensureSession()
+    .then(() => saveMessage("user", question))
+    .catch(() => { /* reported inside saveMessage */ });
+
   el.questionInput.value = "";
   autoGrow();
   el.sendBtn.disabled = true;
@@ -989,6 +1311,7 @@ el.chatForm.addEventListener("submit", async (e) => {
   const clearThinking = () => thinking.remove();
 
   let answer = "";
+  let answerSources = null;
   let frame = null;
   const paint = () => {
     frame = null;
@@ -1019,6 +1342,7 @@ el.chatForm.addEventListener("submit", async (e) => {
       if (event === "sources") {
         // Retrieval is done; the model is now writing.
         setThinking("Writing the answer…");
+        answerSources = data.sources || null;
         renderSources(answerMsg.wrapper, data);
       } else if (event === "token") {
         if (!answer) {
@@ -1039,6 +1363,11 @@ el.chatForm.addEventListener("submit", async (e) => {
 
     history.push({ question, answer });
     if (history.length > 8) history = history.slice(-8);
+
+    // After the question, so the two land in order even though the first save was started
+    // while the answer was still streaming.
+    await saving;
+    await saveMessage("assistant", answer, answerSources);
   } catch (err) {
     clearThinking();
     answerMsg.row.className = "msg msg--error";
@@ -1102,8 +1431,12 @@ function addMessage(role, text) {
   bubble.className = "msg__bubble";
 
   const body = document.createElement("div");
-  body.className = role === "user" ? "md" : "md";
+  body.className = "md";
+  // A live answer arrives token by token and is painted by the streaming loop, so it is
+  // created empty. A REPLAYED answer already has its whole text, and leaving it out is why
+  // reopening a conversation showed empty answer bubbles with sources underneath.
   if (role === "user") body.textContent = text;
+  else if (text) body.innerHTML = renderMarkdown(text);
 
   bubble.appendChild(body);
   wrapper.append(roleLabel, bubble);
@@ -1212,6 +1545,10 @@ function setAuthMode(mode) {
   el.authSwitch.textContent = signingUp ? "Sign in" : "Create an account";
   // Tells a password manager whether to offer a saved password or a generated one.
   el.authPass.setAttribute("autocomplete", signingUp ? "new-password" : "current-password");
+  // The name field only exists for signup - login identifies an existing account by
+  // username alone, and a stored account may predate this field anyway.
+  if (el.authNameField) el.authNameField.hidden = !signingUp;
+  if (el.authName) el.authName.required = signingUp;
   el.authError.textContent = "";
 }
 
@@ -1229,6 +1566,7 @@ function showAuthScreen(message) {
   el.app.hidden = true;
   el.authError.textContent = message || "";
   el.authPass.value = "";
+  if (el.authName) el.authName.value = "";
   setTimeout(() => el.authUser.focus(), 50);
 }
 
@@ -1246,10 +1584,13 @@ function resetAppState() {
   el.messages.replaceChildren(el.welcome);
   el.welcome.hidden = false;
   el.sourceList.innerHTML = `<li class="doc-empty">Nothing ingested yet</li>`;
+  if (el.sidebarSourceList) el.sidebarSourceList.innerHTML = `<li class="doc-empty">Nothing ingested yet</li>`;
   el.docCount.textContent = "0";
   if (el.railCount) el.railCount.textContent = "0";
+  if (el.sidebarDocCount) el.sidebarDocCount.textContent = "0";
   scope.clear();
   renderScope([]);
+  resetHistory();
   el.uploadList.replaceChildren();
   uploadCards.clear();
   if (el.accountModal.open) el.accountModal.close();
@@ -1265,15 +1606,19 @@ function resetAppState() {
   closeDocs();
 }
 
-function startSession(username) {
-  session = { username };
-  el.whoName.textContent = username;
-  el.whoAvatar.textContent = (username[0] || "?").toUpperCase();
+function startSession(username, name) {
+  // `name` falls back to the username for accounts created before the field existed, or
+  // when a caller (a stale token flow, say) has no name to give.
+  session = { username, name: name || username };
+  el.whoName.textContent = session.name;
+  el.whoAvatar.textContent = (session.name[0] || "?").toUpperCase();
   el.auth.hidden = true;
   el.app.hidden = false;
   // The composer could not be measured while the app was hidden; now it can.
   autoGrow();
   refreshSources();
+  resetHistory();
+  loadMoreSessions();          // the first ten conversations; the rest arrive on scroll
   // Not awaited: the chat is usable immediately and this only updates the status dot.
   watchStartup();
   el.questionInput.focus();
@@ -1291,6 +1636,7 @@ function startSession(username) {
  */
 function endSession(message) {
   writeToken(null);
+  writeBoot(null);
   sessionEpoch += 1;
 
   if (session === null && !el.auth.hidden) {
@@ -1302,23 +1648,34 @@ function endSession(message) {
   showAuthScreen(message);
 }
 
-el.logoutBtn.addEventListener("click", () => endSession("You're signed out."));
+el.logoutBtn.addEventListener("click", () => {
+  // Ask first. Signing out is one click next to the account button, it ends the session on
+  // this browser, and the sign-in screen is the only way back - worth a confirmation, even
+  // though nothing is destroyed by it.
+  const who = session && session.username ? ` as ${session.username}` : "";
+  if (!confirm(`Sign out${who}?\n\nYour documents and chats stay saved - you'll just need to sign in again.`)) return;
+  endSession("You're signed out.");
+});
 
 el.authForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const username = el.authUser.value.trim();
   const password = el.authPass.value;
+  const signingUp = authMode === "signup";
 
   el.authSubmit.disabled = true;
   el.authError.textContent = "";
   const original = el.authSubmitText.textContent;
-  el.authSubmitText.textContent = authMode === "signup" ? "Creating…" : "Signing in…";
+  el.authSubmitText.textContent = signingUp ? "Creating…" : "Signing in…";
 
   try {
-    const res = await fetch(`${API_BASE}/api/${authMode === "signup" ? "signup" : "login"}`, {
+    const payload = { username, password };
+    if (signingUp) payload.name = el.authName.value.trim();
+
+    const res = await fetch(`${API_BASE}/api/${signingUp ? "signup" : "login"}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify(payload),
     });
     const body = await res.json().catch(() => ({}));
 
@@ -1335,8 +1692,9 @@ el.authForm.addEventListener("submit", async (e) => {
     }
 
     writeToken(body.access_token);
+    writeBoot(await serverBootId());
     resetAppState();
-    startSession(body.username || username);
+    startSession(body.username || username, body.name);
   } catch (err) {
     el.authError.textContent = err.message === "Failed to fetch"
       ? "Can't reach the server. Is it running?"
@@ -1464,7 +1822,7 @@ el.activityModal.addEventListener("click", (e) => {
    ==================================================================== */
 
 el.who.addEventListener("click", () => {
-  el.accountName.textContent = session?.username || "";
+  el.accountName.textContent = session?.name || session?.username || "";
   el.accountError.textContent = "";
   el.passwordForm.reset();
   refreshSources();                    // repaints the quota bar with current numbers
@@ -1609,25 +1967,36 @@ async function watchStartup() {
 async function startup() {
   setAuthMode("login");
 
-  if (!readToken()) {
+  const token = readToken();
+  const boot = await serverBootId();
+  const signedInUnder = readBoot();
+
+  // Resume only when this is the SAME running server the session was started on. A reload
+  // keeps you signed in; restarting the project (or signing out) asks for the password
+  // again. A missing boot id on either side is treated as "cannot prove it is the same
+  // server", so it asks - the safe direction.
+  if (!token || !boot || !signedInUnder || signedInUnder !== boot) {
+    writeToken(null);
+    writeBoot(null);
     showAuthScreen();
     return;
   }
 
   try {
     const res = await fetch(`${API_BASE}/api/me`, {
-      headers: { Authorization: `Bearer ${readToken()}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) {
       writeToken(null);
+      writeBoot(null);
       showAuthScreen(res.status === 401 ? "" : "Please sign in again.");
       return;
     }
     const me = await res.json();
-    startSession(me.username);
+    startSession(me.username, me.name);
   } catch {
-    // The server is unreachable. Sign-in will fail too, so say that rather than showing
-    // an app that cannot load anything.
+    // The server is unreachable. Signing in would fail too, so say that rather than
+    // showing an app that cannot load anything.
     showAuthScreen("Can't reach the server. Is it running?");
   }
 }

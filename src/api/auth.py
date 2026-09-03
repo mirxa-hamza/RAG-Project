@@ -17,10 +17,11 @@ from src.models.schemas import (
     ConfirmPassword,
     Credentials,
     PasswordChange,
+    SignupCredentials,
     TokenResponse,
     UserPublic,
 )
-from src.services import database, ownership, security
+from src.services import database, ownership, security, sessions
 
 from fastapi import Depends
 
@@ -49,7 +50,7 @@ def _enforce(limit, key: str) -> None:
 
 
 @router.post("/signup", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def signup(credentials: Credentials, request: Request):
+async def signup(credentials: SignupCredentials, request: Request):
     """
     Creates an account and signs it in immediately.
 
@@ -62,6 +63,7 @@ async def signup(credentials: Credentials, request: Request):
 
     _enforce(ratelimit.SIGNUP, ratelimit.client_key(request))
     username = credentials.username.strip()
+    name = credentials.name.strip()
 
     # Belt (this check) and braces (the unique index). The index is the only thing that
     # survives two simultaneous requests, but it only exists if Mongo accepted
@@ -74,7 +76,8 @@ async def signup(credentials: Credentials, request: Request):
     first_account = await database.count_users() == 0
 
     try:
-        user = await database.create_user(username, security.hash_password(credentials.password))
+        user = await database.create_user(username, security.hash_password(credentials.password),
+                                          name=name)
     except DuplicateKeyError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="That username is already taken.")
@@ -89,7 +92,7 @@ async def signup(credentials: Credentials, request: Request):
             log.info("Adopted %d pre-existing document(s) into '%s'", adopted, username)
 
     return security.create_access_token(user_id_of(user), user["username"],
-                                       user.get("token_version", 1))
+                                       user.get("token_version", 1), name=user.get("name"))
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -117,13 +120,13 @@ async def login(credentials: Credentials, request: Request):
     log.info("'%s' signed in", user["username"])
     await database.record_audit(user_id_of(user), username, "login")
     return security.create_access_token(user_id_of(user), user["username"],
-                                        user.get("token_version", 1))
+                                        user.get("token_version", 1), name=user.get("name"))
 
 
 @router.get("/me", response_model=UserPublic)
 async def me(user: dict = Depends(get_current_user)):
     """Lets the frontend confirm a stored token is still valid before showing the app."""
-    return {"id": user_id_of(user), "username": user["username"]}
+    return {"id": user_id_of(user), "username": user["username"], "name": user.get("name")}
 
 
 @router.post("/me/password", response_model=TokenResponse)
@@ -154,7 +157,7 @@ async def change_password(body: PasswordChange, request: Request,
     # rather than signing them out of the session they are actively using.
     refreshed = await database.find_user_by_id(uid)
     return security.create_access_token(uid, user["username"],
-                                        refreshed.get("token_version", 1))
+                                        refreshed.get("token_version", 1), name=user.get("name"))
 
 
 @router.post("/me/signout-everywhere", status_code=status.HTTP_204_NO_CONTENT)
@@ -184,8 +187,13 @@ async def delete_account(body: ConfirmPassword, user: dict = Depends(get_current
 
     uid = user_id_of(user)
     removed = ownership.delete_all_documents(uid)
+    # The conversations go with the account. Leaving them behind would keep a person's
+    # questions - and the passages quoted back to them - in the database after they asked
+    # for everything to be deleted.
+    conversations = await sessions.delete_all(uid)
     await database.delete_user(uid)
     await database.record_audit(uid, user["username"], "account_deleted",
-                                f"{removed} document(s)")
-    log.info("Deleted account '%s' and %d document(s)", user["username"], removed)
+                                f"{removed} document(s), {conversations} conversation(s)")
+    log.info("Deleted account '%s', %d document(s) and %d conversation(s)",
+             user["username"], removed, conversations)
     return {"deleted": True, "documents_removed": removed}

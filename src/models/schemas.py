@@ -22,6 +22,19 @@ class Credentials(BaseModel):
     password: str = Field(..., min_length=8, max_length=200)
 
 
+class SignupCredentials(Credentials):
+    """Signup only: a display name, shown back in the chat/profile area."""
+    name: str = Field(..., min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def _not_blank_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Name can't be empty.")
+        return stripped
+
+
 class PasswordChange(BaseModel):
     current_password: str = Field(..., min_length=1, max_length=200)
     new_password: str = Field(..., min_length=8, max_length=200)
@@ -37,11 +50,14 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     username: str
+    # Falls back to the username for accounts created before this field existed.
+    name: Optional[str] = None
 
 
 class UserPublic(BaseModel):
     id: str
     username: str
+    name: Optional[str] = None
 
 
 class Turn(BaseModel):

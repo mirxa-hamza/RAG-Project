@@ -1,7 +1,7 @@
 """
 MongoDB access: the one place that talks to Motor.
 
-Only user accounts live in Mongo. Documents and their vectors stay in ChromaDB and on
+User accounts and chat history live in Mongo. Documents and their vectors stay in ChromaDB and on
 disk, keyed by the Mongo user id - splitting a document's identity across two databases
 would mean a delete could half-succeed.
 
@@ -10,34 +10,23 @@ embedding model is: uvicorn imports this module before it binds the port, and Mo
 constructor starts background topology threads. Lazily also means the offline test suite
 can substitute a fake collection without a server anywhere.
 """
-import re
 from typing import Any, Optional
 
-from src.core.config import AUDIT_COLLECTION, MONGO_DB, MONGO_URI, USERS_COLLECTION
+from src.core.config import (
+    AUDIT_COLLECTION,
+    MONGO_DB,
+    MONGO_URI,
+    SESSIONS_COLLECTION,
+    USERS_COLLECTION,
+)
 from src.core.logging import get_logger
 
 log = get_logger(__name__)
 
-
-def _redact(uri: str) -> str:
-    """
-    "mongodb+srv://user:hunter2@cluster.mongodb.net" -> "mongodb+srv://user:***@cluster.mongodb.net"
-
-    A hosted connection string carries the password inline, and this URI is both LOGGED on
-    every connection and embedded in CANNOT_REACH below, which is shown to the user as-is
-    on the sign-in screen. Unredacted, that means the database password is printed into the
-    platform's log stream on every cold start, and rendered in a browser to anyone who
-    loads the page during an outage. Neither is recoverable after the fact - the only fix
-    once it has happened is rotating the credential.
-    """
-    return re.sub(r"(//[^:/?#@]+:)[^@]+@", r"\1***@", uri)
-
-
 _client = None
 _users = None
 _audit = None
-_sync_client = None
-_sync_collections: dict = {}
+_sessions = None
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -51,7 +40,7 @@ class DatabaseUnavailable(RuntimeError):
 
 
 CANNOT_REACH = (
-    f"Can't reach MongoDB at {_redact(MONGO_URI)}. Start it and try again - on Windows: "
+    f"Can't reach MongoDB at {MONGO_URI}. Start it and try again - on Windows: "
     "`net start MongoDB` in an admin terminal, or `mongod --dbpath C:\\data\\db`; "
     "with Docker: `docker run -d -p 27017:27017 --name mongo mongo`."
 )
@@ -81,7 +70,7 @@ def get_client():
         # be installed before Motor is ever needed.
         from motor.motor_asyncio import AsyncIOMotorClient
 
-        log.info("Connecting to MongoDB at %s (database '%s')", _redact(MONGO_URI), MONGO_DB)
+        log.info("Connecting to MongoDB at %s (database '%s')", MONGO_URI, MONGO_DB)
         _client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=3000)
     return _client
 
@@ -102,47 +91,23 @@ def audit() -> Any:
     return _audit
 
 
-def set_users_collection(collection: Any, audit_collection: Any = None) -> None:
+def sessions() -> Any:
+    """The chat-history collection: one document per conversation."""
+    global _sessions
+    if _sessions is None:
+        _sessions = get_client()[MONGO_DB][SESSIONS_COLLECTION]
+    return _sessions
+
+
+def set_users_collection(collection: Any, audit_collection: Any = None,
+                         sessions_collection: Any = None) -> None:
     """Injection point for tests: swap in fake collections, no server needed."""
-    global _users, _audit
+    global _users, _audit, _sessions
     _users = collection
     if audit_collection is not None:
         _audit = audit_collection
-
-
-def get_sync_client():
-    """
-    A synchronous (pymongo) client for the small pieces of STATE_STORE=mongo state - the
-    rate limiter, the answer cache, the ingestion job, and the document manifest - that are
-    called from plain synchronous code (the local background-ingestion thread has no event
-    loop) as well as from async request handlers. See the note in core/config.py.
-
-    Lazy for the same reason as get_client(): constructing it opens a background topology
-    thread, and this module must stay cheap to import.
-    """
-    global _sync_client
-    if _sync_client is None:
-        from pymongo import MongoClient
-
-        log.info("Connecting to MongoDB (sync client) at %s (database '%s')", _redact(MONGO_URI), MONGO_DB)
-        _sync_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
-    return _sync_client
-
-
-def sync_collection(name: str) -> Any:
-    """
-    A collection reached through the synchronous client, by name. Tests replace one via
-    set_sync_collection() - a plain in-memory fake, no server required, mirroring how
-    set_users_collection() lets the async side run offline.
-    """
-    if name not in _sync_collections:
-        _sync_collections[name] = get_sync_client()[MONGO_DB][name]
-    return _sync_collections[name]
-
-
-def set_sync_collection(name: str, collection: Any) -> None:
-    """Injection point for tests: swap in a fake collection for one name, no server needed."""
-    _sync_collections[name] = collection
+    if sessions_collection is not None:
+        _sessions = sessions_collection
 
 
 async def ensure_indexes() -> None:
@@ -180,7 +145,7 @@ async def find_user_by_id(user_id: str) -> Optional[dict]:
     return await _guard(users().find_one({"_id": oid}))
 
 
-async def create_user(username: str, password_hash: str) -> dict:
+async def create_user(username: str, password_hash: str, name: Optional[str] = None) -> dict:
     """
     Inserts a user. Raises DuplicateKeyError (from pymongo) if the username is taken -
     the caller turns that into a 409.
@@ -190,6 +155,7 @@ async def create_user(username: str, password_hash: str) -> dict:
     document = {
         "username": username,
         "password_hash": password_hash,
+        "name": name,
         # Bumped on password change and on "sign out everywhere". Every token carries the
         # version it was minted with, and a mismatch is rejected - which is the only way to
         # invalidate a JWT before it expires.
@@ -253,12 +219,42 @@ async def count_users() -> int:
 
 
 def close() -> None:
-    global _client, _users, _sync_client, _sync_collections
+    global _client, _users, _sessions
     if _client is not None:
         _client.close()
     _client = None
     _users = None
-    if _sync_client is not None:
-        _sync_client.close()
-    _sync_client = None
-    _sync_collections = {}
+    _sessions = None
+
+
+# --- Synchronous access -----------------------------------------------------------------
+# Motor is async, but the manifest, the ownership record, the rate limiter and the answer
+# cache are all called from synchronous code (including the ingestion thread), where there
+# is no event loop to await on. pymongo's blocking client is the honest answer there;
+# sharing one keeps it to a single connection pool.
+_sync_client = None
+_sync_collections: dict = {}
+
+
+def sync_collection(name: str) -> Any:
+    """
+    A blocking pymongo collection by name, for callers that are not async.
+
+    Tests replace individual collections through set_sync_collection().
+    """
+    global _sync_client
+    if name in _sync_collections:
+        return _sync_collections[name]
+    if _sync_client is None:
+        from pymongo import MongoClient
+
+        log.info("Opening a synchronous MongoDB connection to %s (database '%s')",
+                 MONGO_URI, MONGO_DB)
+        _sync_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+    _sync_collections[name] = _sync_client[MONGO_DB][name]
+    return _sync_collections[name]
+
+
+def set_sync_collection(name: str, collection: Any) -> None:
+    """Injection point for tests: no server needed."""
+    _sync_collections[name] = collection

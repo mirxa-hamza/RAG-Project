@@ -82,14 +82,18 @@ def get_secret() -> str:
     return config.JWT_SECRET
 
 
-def create_access_token(user_id: str, username: str, token_version: int = 1) -> dict:
+def create_access_token(user_id: str, username: str, token_version: int = 1,
+                        name: Optional[str] = None) -> dict:
     """
-    Returns {access_token, token_type, expires_in, username} - the login response body.
+    Returns {access_token, token_type, expires_in, username, name} - the login response body.
 
     `token_version` is what makes revocation possible: it is stamped into the token and
     compared against the account's current value on every request, so bumping the account's
     version invalidates every token issued before it. A JWT is otherwise valid until it
     expires, no matter what happens to the account.
+
+    `name` is display-only - not stamped into the token - and falls back to the username so
+    an account created before this field existed still gets something to display.
     """
     from jose import jwt
 
@@ -108,6 +112,7 @@ def create_access_token(user_id: str, username: str, token_version: int = 1) -> 
         "token_type": "bearer",
         "expires_in": expires_in,
         "username": username,
+        "name": name or username,
     }
 
 
