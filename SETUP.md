@@ -151,6 +151,7 @@ optional; doing it up front just means the app is queryable the moment it boots.
 | Same, without leaving the browser | **Refresh** in the Documents panel |
 | Add a PDF from the browser | **Documents** (top right), then drop or browse |
 | See what the server is doing with it | **Processing status**, in the Documents panel |
+| Revisit an old conversation | the chat list in the sidebar — click one to reopen it |
 | Remove a document | the bin icon on its card — deletes its passages **and** the PDF |
 | Search only some documents | tick them in the Documents panel; the chip by the send button shows what is searched |
 

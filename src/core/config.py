@@ -159,45 +159,6 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "100")) * 1024 * 1024
 # a time - and a full disk stops MongoDB and every other user, not just the culprit.
 MAX_USER_STORAGE_BYTES = int(os.getenv("MAX_USER_STORAGE_MB", "2048")) * 1024 * 1024
 
-# ---------------------------------------------------------------- Cloudinary (production PDF storage)
-# Where PDF bytes live: "local" (DATA_DIR, this process's own disk) or "cloudinary"
-# (uploaded straight from the browser, fetched back by URL for ingestion). Serverless hosts
-# have no persistent disk, so "local" would lose every file the moment the function that
-# wrote it exits.
-DOCUMENT_STORE = _mode_default("DOCUMENT_STORE", local="local", cloud="cloudinary")
-CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "")
-CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "")
-CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
-# Prefix inside the Cloudinary account; each user gets "<folder>/users/<user_id>/..." below
-# it, the same shape DATA_DIR uses locally, so ownership stays derivable from the path.
-CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "rag-documents")
-
-# ---------------------------------------------------------------- State store
-# Where the rate limiter, the answer cache, the ingestion job, and the document manifest
-# keep their state. "memory" is what this app has always done - a dict in this process,
-# correct only because the app is single-worker (see ratelimit.py). "mongo" moves all four
-# into MongoDB, which is what a serverless host needs: a cold start gets a fresh process
-# with empty memory every time, but the same Mongo documents.
-#
-# Deliberately a SYNCHRONOUS (pymongo) client rather than the async one used for accounts:
-# this state is read from both request handlers and the local background-ingestion thread,
-# which has no event loop to await into, and a blocking call against one indexed document
-# is a few milliseconds either way - this app has never claimed to serve concurrent load.
-STATE_STORE = _mode_default("STATE_STORE", local="memory", cloud="mongo")
-
-# How many chunks ONE POST /ingest/continue may embed before returning (cloud mode only).
-#
-# A serverless function is killed at maxDuration - 60s in vercel.json - and a 636-page book
-# takes about two minutes to embed and store. "One whole file per request" therefore meant a
-# large upload was killed mid-file, lost its partial work (the manifest entry is written only
-# after the last chunk), and was retried from scratch on the next poll: an infinite loop that
-# burned a function invocation and real embedding tokens on every turn. Bounding the slice is
-# what makes a document of any size ingestable within a fixed request budget.
-#
-# Raise it if maxDuration is raised. Each request re-extracts the PDF (a few seconds) before
-# doing its slice, so very small values spend most of the budget on that fixed overhead.
-INGEST_CHUNKS_PER_REQUEST = int(os.getenv("INGEST_CHUNKS_PER_REQUEST", "400"))
-
 # ---------------------------------------------------------------- Auth (MongoDB + JWT)
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "rag_app")
@@ -205,6 +166,19 @@ USERS_COLLECTION = os.getenv("USERS_COLLECTION", "users")
 # Append-only record of logins, uploads and deletions. The first thing anyone asks for
 # after an incident, and impossible to reconstruct after the fact.
 AUDIT_COLLECTION = os.getenv("AUDIT_COLLECTION", "audit")
+
+# ---------------------------------------------------------------- Chat history
+SESSIONS_COLLECTION = os.getenv("SESSIONS_COLLECTION", "chat_sessions")
+# How many conversations the sidebar asks for at a time. Ten is enough to fill the panel
+# without making the first paint wait for a hundred rows.
+SESSION_PAGE_SIZE = int(os.getenv("SESSION_PAGE_SIZE", "10"))
+# Titles are truncated from the first question; long enough to be recognisable, short
+# enough to fit the sidebar without wrapping to three lines.
+MAX_SESSION_TITLE = int(os.getenv("MAX_SESSION_TITLE", "48"))
+# Messages live inside the session document, so the document has to stay well under
+# Mongo's 16MB limit. The oldest are dropped past this - a conversation nobody will scroll
+# back through beats a write that starts failing mid-conversation.
+MAX_SESSION_MESSAGES = int(os.getenv("MAX_SESSION_MESSAGES", "400"))
 
 # Signing key for JWTs. Generated on first run and written to .env if absent (see
 # src/services/security.py) - a key that changed on every restart would silently log
@@ -298,3 +272,43 @@ CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 # "text" for a human at a terminal, "json" for anything that ships logs somewhere.
 LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()
+
+
+# ---------------------------------------------------------------- Cloud state & files
+# Where the small pieces of server state live - the ingestion manifest, the ownership
+# record, rate-limit counters and the answer cache. "memory" keeps them in this process
+# (and on disk), which is right for a machine that stays up; "mongo" keeps them in the
+# database, which is the only thing that works on a serverless host where every request
+# may land in a fresh process.
+STATE_STORE = _mode_default("STATE_STORE", local="memory", cloud="mongo")
+
+# Where uploaded PDFs live: "disk" (DATA_DIR) or "cloudinary". A serverless host has no
+# persistent disk, so the bytes have to go somewhere that does.
+DOCUMENT_STORE = _mode_default("DOCUMENT_STORE", local="disk", cloud="cloudinary")
+
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
+CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "rag-documents")
+
+# How much of a document one ingestion request embeds before returning "there is more".
+# Serverless functions are killed at their maxDuration, so a big book finishes across
+# several requests instead of restarting from scratch forever. Raise it alongside
+# maxDuration in vercel.json.
+INGEST_CHUNKS_PER_REQUEST = int(os.getenv("INGEST_CHUNKS_PER_REQUEST", "400"))
+
+# ---------------------------------------------------------------- Keyword search
+# The lexical half of hybrid retrieval. BM25 runs in this process, which means it has to
+# read every chunk of the corpus once to build its index:
+#
+#   * against a LOCAL Chroma folder that is a fast disk read, done once per user;
+#   * against a HOSTED store (Chroma Cloud, Pinecone) it is a bulk download over the
+#     network, and on a free tier it takes minutes and sometimes has the connection closed
+#     underneath it - which used to fail the whole question with a 500.
+#
+# "auto" therefore runs BM25 only when the corpus is local. "on" forces it anyway (fine for
+# a small hosted corpus); "off" disables it everywhere. With it off, retrieval is dense
+# search plus the re-ranker, which is the majority of the quality.
+KEYWORD_SEARCH = os.getenv("KEYWORD_SEARCH", "auto").strip().lower()
+if KEYWORD_SEARCH not in ("auto", "on", "off"):
+    raise ValueError(f"KEYWORD_SEARCH must be auto, on or off - got {KEYWORD_SEARCH!r}")

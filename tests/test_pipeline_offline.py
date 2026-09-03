@@ -109,6 +109,22 @@ os.environ["CHUNK_OVERLAP_WORDS"] = "10"   # to get more than one chunk per page
 os.environ["EMBEDDING_QUERY_PREFIX"] = ""
 os.environ["LOG_LEVEL"] = "WARNING"        # keep the test output readable
 os.environ["JWT_SECRET"] = "offline-test-secret-not-used-anywhere-real"
+# This suite fakes sentence_transformers (step 1 above) and never mocks the Pinecone/Cohere/
+# Jina HTTP clients, so it MUST force every provider switch to its local/disk value - a
+# developer's real .env (e.g. EMBEDDINGS_PROVIDER=pinecone, set to test cloud mode against a
+# local disk of PDFs, a mix CLAUDE.md explicitly documents as supported) would otherwise leak
+# through config.py's load_dotenv() and silently replace the fake embedding model with a live
+# HTTP call. That call either fails quietly or returns vectors the rest of this suite never
+# asked for, and ingestion reports "finished without error" while storing zero chunks -
+# exactly the "stuck/empty index" symptom this suite exists to catch, except caused by the
+# test harness itself rather than the product.
+os.environ["RAG_MODE"] = "local"
+os.environ["EMBEDDINGS_PROVIDER"] = "local"
+os.environ["RERANKER_PROVIDER"] = "local"
+os.environ["VECTOR_STORE"] = "chroma"
+os.environ["CHROMA_BACKEND"] = "disk"
+os.environ["DOCUMENT_STORE"] = "disk"
+os.environ["STATE_STORE"] = "memory"
 
 from scripts.make_test_pdf import make_pdf  # noqa: E402
 
@@ -176,11 +192,127 @@ class FakeUsers:
             await self.insert_one(document)
 
 
+
+class FakeSessions:
+    """
+    Enough of a Mongo collection to exercise the chat-history service for real.
+
+    Deliberately supports only the operators the service actually uses ($or, $lt, $push
+    with $each/$slice, $set, $inc, projections, sort/limit): a fake that accepts more than
+    the code needs is a fake that stops proving anything.
+    """
+
+    def __init__(self):
+        self.docs = []
+        self.indexes = []
+
+    async def create_index(self, keys, **kwargs):
+        self.indexes.append(keys)
+        return keys
+
+    @staticmethod
+    def _matches(doc, query):
+        for field, condition in (query or {}).items():
+            if field == "$or":
+                if not any(FakeSessions._matches(doc, clause) for clause in condition):
+                    return False
+                continue
+            value = doc.get(field)
+            if isinstance(condition, dict):
+                for op, operand in condition.items():
+                    if op == "$lt" and not (value is not None and value < operand):
+                        return False
+                    if op == "$gt" and not (value is not None and value > operand):
+                        return False
+            elif value != condition:
+                return False
+        return True
+
+    @staticmethod
+    def _project(doc, projection):
+        if not projection:
+            return dict(doc)
+        out = {"_id": doc["_id"]}
+        for field in projection:
+            if field != "_id" and field in doc:
+                out[field] = doc[field]
+        return out
+
+    async def insert_one(self, document):
+        stored = dict(document, _id=ObjectId())
+        self.docs.append(stored)
+        return type("Result", (), {"inserted_id": stored["_id"]})()
+
+    async def find_one(self, query, projection=None):
+        for doc in self.docs:
+            if self._matches(doc, query):
+                return self._project(doc, projection)
+        return None
+
+    def find(self, query, projection=None):
+        rows = [self._project(d, projection) for d in self.docs if self._matches(d, query)]
+        return _FakeCursor(rows)
+
+    async def update_one(self, query, update):
+        for doc in self.docs:
+            if not self._matches(doc, query):
+                continue
+            for field, value in (update.get("$set") or {}).items():
+                doc[field] = value
+            for field, amount in (update.get("$inc") or {}).items():
+                doc[field] = doc.get(field, 0) + amount
+            for field, spec in (update.get("$push") or {}).items():
+                target = doc.setdefault(field, [])
+                if isinstance(spec, dict) and "$each" in spec:
+                    target.extend(spec["$each"])
+                    slice_to = spec.get("$slice")
+                    if slice_to is not None and slice_to < 0:
+                        doc[field] = target[slice_to:]
+                else:
+                    target.append(spec)
+            return type("Result", (), {"modified_count": 1, "matched_count": 1})()
+        return type("Result", (), {"modified_count": 0, "matched_count": 0})()
+
+    async def delete_one(self, query):
+        for index, doc in enumerate(self.docs):
+            if self._matches(doc, query):
+                self.docs.pop(index)
+                return type("Result", (), {"deleted_count": 1})()
+        return type("Result", (), {"deleted_count": 0})()
+
+    async def delete_many(self, query):
+        keep = [d for d in self.docs if not self._matches(d, query)]
+        removed = len(self.docs) - len(keep)
+        self.docs = keep
+        return type("Result", (), {"deleted_count": removed})()
+
+    async def count_documents(self, query):
+        return sum(1 for d in self.docs if self._matches(d, query))
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def sort(self, keys):
+        for field, direction in reversed(keys):
+            self.rows.sort(key=lambda d: d.get(field), reverse=direction < 0)
+        return self
+
+    def limit(self, count):
+        self.rows = self.rows[:count]
+        return self
+
+    async def to_list(self, length=None):
+        return self.rows[:length] if length else list(self.rows)
+
+
 from src.services import database  # noqa: E402
 
 fake_users = FakeUsers()
 fake_audit = FakeUsers()          # same shape; only insert_one is used
-database.set_users_collection(fake_users, fake_audit)
+fake_sessions = FakeSessions()
+database.set_users_collection(fake_users, fake_audit, fake_sessions)
 asyncio.new_event_loop().run_until_complete(fake_users.create_index("username", unique=True))
 
 from src.ml import reranker  # noqa: E402
@@ -266,20 +398,28 @@ with TestClient(app) as client:
     check("the wrong scheme is 401",
           client.get("/stats", headers={"Authorization": "Basic abc"}).status_code == 401)
 
-    r = client.post("/api/signup", json={"username": "alice", "password": "alicepassword"})
+    r = client.post("/api/signup",
+                    json={"username": "alice", "password": "alicepassword", "name": "Alice"})
     check("signup returns 201", r.status_code == 201)
+    check("signup returns the display name", r.json().get("name") == "Alice")
     alice_token = r.json()["access_token"]
     check("signup returns a bearer token", r.json()["token_type"] == "bearer" and alice_token)
 
     check("a duplicate username is refused with 409",
           client.post("/api/signup",
-                      json={"username": "alice", "password": "otherpassword"}).status_code == 409)
+                      json={"username": "alice", "password": "otherpassword", "name": "Alice2"}
+                      ).status_code == 409)
     check("a short password is rejected",
           client.post("/api/signup",
-                      json={"username": "carol", "password": "short"}).status_code == 422)
+                      json={"username": "carol", "password": "short", "name": "Carol"}
+                      ).status_code == 422)
     check("a username with a path separator is rejected",
           client.post("/api/signup",
-                      json={"username": "a/../b", "password": "password123"}).status_code == 422)
+                      json={"username": "a/../b", "password": "password123", "name": "X"}
+                      ).status_code == 422)
+    check("signup without a name is rejected",
+          client.post("/api/signup",
+                      json={"username": "noname", "password": "password123"}).status_code == 422)
     check("the wrong password is 401",
           client.post("/api/login",
                       json={"username": "alice", "password": "wrongpassword"}).status_code == 401)
@@ -745,7 +885,8 @@ with TestClient(app) as client:
     print("\n--- multi-tenant isolation: two users, two documents ---")
     from src.services import retrieval as retrieval_mod
 
-    r = client.post("/api/signup", json={"username": "bob", "password": "bobpassword1"})
+    r = client.post("/api/signup",
+                    json={"username": "bob", "password": "bobpassword1", "name": "Bob"})
     check("a second account can be created", r.status_code == 201)
     bob_token = r.json()["access_token"]
     BOB = {"Authorization": f"Bearer {bob_token}"}
@@ -925,7 +1066,8 @@ with TestClient(app) as client:
     ratelimit.reset()
 
     print("\n--- account deletion removes everything it owns ---")
-    r = client.post("/api/signup", json={"username": "carol", "password": "carolpassword"})
+    r = client.post("/api/signup",
+                    json={"username": "carol", "password": "carolpassword", "name": "Carol"})
     CAROL = {"Authorization": f"Bearer {r.json()['access_token']}"}
     carol_id = client.get("/api/me", headers=CAROL).json()["id"]
     r = client.post("/upload",
@@ -998,7 +1140,8 @@ with TestClient(app) as client:
 
     def racing_signup():
         code = client.post("/api/signup",
-                           json={"username": "racer", "password": "racerpassword"}).status_code
+                           json={"username": "racer", "password": "racerpassword", "name": "Racer"}
+                           ).status_code
         with results_lock:
             signup_codes.append(code)
 
@@ -1612,352 +1755,119 @@ for name in ("s1.pdf", "s2.pdf", "s3.pdf"):
     vectorstore.delete_source(name)
 
 
-# ---- Cloud migration: STATE_STORE=mongo backends and the Cloudinary upload path --------
-#
-# These exercise the Mongo-backed implementations added for RAG_MODE=cloud DIRECTLY (the
-# private _mongo_*/_check_mongo functions), rather than by flipping STATE_STORE and
-# re-importing config - config.py reads its settings once, at import time (see its own
-# docstring), so a single test process can only ever run one STATE_STORE. Calling the
-# private functions with a fake collection injected via database.set_sync_collection()
-# proves the Mongo logic itself is correct without needing a second test process or a real
-# MongoDB. The dispatch in check()/get()/put()/... that picks memory vs mongo is a single
-# `if STATE_STORE == "mongo":` in each module - trivial enough not to need its own test.
 
-print("\n--- cloud state: a tiny fake pymongo collection ---")
+# ---- 15. Chat history -----------------------------------------------------------------
+print("\n=== chat sessions ===")
+from src.core.config import MAX_SESSION_MESSAGES  # noqa: E402
+from src.services import sessions as chat_sessions  # noqa: E402
 
+# The FastAPI test client's shutdown calls database.close(), which drops the injected
+# collections along with the real client - so put them back before using them here.
+database.set_users_collection(fake_users, fake_audit, fake_sessions)
 
-def _fake_matches(doc, query):
-    for key, expected in query.items():
-        if isinstance(expected, dict):
-            if "$gte" in expected and not (doc.get(key) is not None and doc[key] >= expected["$gte"]):
-                return False
-        elif doc.get(key) != expected:
-            return False
-    return True
+loop = asyncio.new_event_loop()
+run = loop.run_until_complete
 
+alice_chat = "aa" * 12
+bob_chat = "bb" * 12
 
-class FakeSyncCollection:
-    """Just enough of pymongo's Collection API for ratelimit/answer_cache/manifest/
-    cloud_documents: find_one, find, insert_one, update_one, delete_one/many,
-    count_documents, create_index. In-memory, keyed by '_id'."""
+run(chat_sessions.ensure_indexes())
+check("history is indexed by owner and recency, in that order",
+      fake_sessions.indexes and list(fake_sessions.indexes[0]) == [("user_id", 1), ("updated_at", -1)])
 
-    def __init__(self):
-        self.docs = {}
-        self._auto = 0
+print("\n--- titles come from the first question ---")
+check("a short question is the title verbatim",
+      chat_sessions.title_from("What is A* search?") == "What is A* search?")
+long_title = chat_sessions.title_from(
+    "Explain in detail how the transformer architecture handles long range dependencies")
+check("a long one is truncated", len(long_title) <= config.MAX_SESSION_TITLE + 1)
+# Cutting mid-word ("What is the differ…") reads like a rendering bug, not a title.
+check("and cut at a word boundary", not long_title[:-1].endswith(" ") and " " in long_title)
+check("markdown is stripped out",
+      chat_sessions.title_from("**what** is `RAG`?") == "what is RAG?")
+check("an empty question still gets a name", chat_sessions.title_from("   ") == "New chat")
 
-    def create_index(self, *args, **kwargs):
-        return "ok"
+print("\n--- a conversation saves both sides ---")
+made = run(chat_sessions.create(alice_chat))
+check("a new session starts empty", made["message_count"] == 0 and made["messages"] == [])
+run(chat_sessions.append_message(alice_chat, made["id"], "user", "What is A* search?"))
+run(chat_sessions.append_message(alice_chat, made["id"], "assistant", "A best-first search.",
+                                 [{"source": "ai.pdf", "pages": "p. 93", "snippet": "..."}]))
+full = run(chat_sessions.get(alice_chat, made["id"]))
+check("both messages are stored", len(full["messages"]) == 2)
+check("with their roles", [m["role"] for m in full["messages"]] == ["user", "assistant"])
+check("the first question named the conversation", full["title"] == "What is A* search?")
+check("and the answer kept its sources",
+      full["messages"][1]["sources"][0]["source"] == "ai.pdf")
 
-    def find_one(self, query):
-        for doc in self.docs.values():
-            if _fake_matches(doc, query):
-                return dict(doc)
-        return None
+print("\n--- the sidebar never loads messages ---")
+page = run(chat_sessions.list_page(alice_chat, limit=10))
+check("a listing returns the session", len(page["sessions"]) == 1)
+# This is the performance contract: 200 saved conversations must cost 200 titles, not 200
+# transcripts.
+check("but not its messages", "messages" not in page["sessions"][0])
+check("it does carry a message count", page["sessions"][0]["message_count"] == 2)
+check("and never the owner id", "user_id" not in page["sessions"][0])
 
-    def find(self, query=None, sort=None):
-        results = [dict(d) for d in self.docs.values() if _fake_matches(d, query or {})]
-        if sort:
-            for field, direction in reversed(sort):
-                results.sort(key=lambda d: d.get(field), reverse=(direction < 0))
-        return results
+print("\n--- paging through history, ten at a time ---")
+for n in range(25):
+    fresh = run(chat_sessions.create(alice_chat, f"Chat {n:02d}"))
+    run(chat_sessions.append_message(alice_chat, fresh["id"], "user", f"question {n:02d}"))
 
-    def insert_one(self, doc):
-        doc = dict(doc)
-        if "_id" not in doc:
-            self._auto += 1
-            doc["_id"] = f"auto{self._auto}"
-        self.docs[doc["_id"]] = doc
-        return types.SimpleNamespace(inserted_id=doc["_id"])
+first = run(chat_sessions.list_page(alice_chat, limit=10))
+check("the first page holds ten", len(first["sessions"]) == 10)
+check("and says where the next one starts", bool(first["next_cursor"]))
+second = run(chat_sessions.list_page(alice_chat, limit=10, cursor=first["next_cursor"]))
+third = run(chat_sessions.list_page(alice_chat, limit=10, cursor=second["next_cursor"]))
+check("the second page holds ten more", len(second["sessions"]) == 10)
+seen = [s["id"] for s in first["sessions"] + second["sessions"] + third["sessions"]]
+# The bug this catches: page-number pagination over a list that reorders as you use it
+# returns the same conversation on two different pages.
+check("no conversation appears twice", len(seen) == len(set(seen)))
+check("every conversation is reached", len(seen) == 26)
+check("the last page says there is nothing older", third["next_cursor"] is None)
+newest_first = [s["updated_at"] for s in first["sessions"]]
+check("and they arrive newest first", newest_first == sorted(newest_first, reverse=True))
 
-    def update_one(self, query, update, upsert=False):
-        target = None
-        for doc in self.docs.values():
-            if _fake_matches(doc, query):
-                target = doc
-                break
-        matched = target is not None
-        if target is None:
-            if not upsert:
-                return types.SimpleNamespace(matched_count=0)
-            target = {k: v for k, v in query.items() if not isinstance(v, dict)}
-            target.setdefault("_id", query.get("_id", f"auto{self._auto + 1}"))
-            self._auto += 1
-            self.docs[target["_id"]] = target
-        for key, value in update.get("$set", {}).items():
-            target[key] = value
-        if not matched:
-            for key, value in update.get("$setOnInsert", {}).items():
-                target.setdefault(key, value)
-        for key, amount in update.get("$inc", {}).items():
-            target[key] = target.get(key, 0) + amount
-        for key, spec in update.get("$push", {}).items():
-            lst = target.setdefault(key, [])
-            if isinstance(spec, dict) and "$each" in spec:
-                lst.extend(spec["$each"])
-                sl = spec.get("$slice")
-                if isinstance(sl, int) and sl < 0:
-                    target[key] = lst[sl:]
-            else:
-                lst.append(spec)
-        return types.SimpleNamespace(matched_count=int(matched))
+print("\n--- one account cannot see another's ---")
+theirs = run(chat_sessions.create(bob_chat, "Bob's chat"))
+run(chat_sessions.append_message(bob_chat, theirs["id"], "user", "my private question"))
+mine = run(chat_sessions.list_page(alice_chat, limit=50))
+check("a listing is scoped to its owner",
+      all(s["title"] != "Bob's chat" for s in mine["sessions"]))
+# Knowing the id must not be enough - ids appear in URLs, logs and browser history.
+check("and knowing the id is not enough to read it",
+      run(chat_sessions.get(alice_chat, theirs["id"])) is None)
+check("nor to write to it",
+      run(chat_sessions.append_message(alice_chat, theirs["id"], "user", "hi")) is None)
+check("nor to delete it", run(chat_sessions.delete(alice_chat, theirs["id"])) is False)
+check("the owner still has it", run(chat_sessions.get(bob_chat, theirs["id"])) is not None)
 
-    def delete_one(self, query):
-        for _id, doc in list(self.docs.items()):
-            if _fake_matches(doc, query):
-                del self.docs[_id]
-                return types.SimpleNamespace(deleted_count=1)
-        return types.SimpleNamespace(deleted_count=0)
+print("\n--- housekeeping ---")
+check("a malformed id is not found, not a crash",
+      run(chat_sessions.get(alice_chat, "not-an-object-id")) is None)
+check("deleting a conversation removes it",
+      run(chat_sessions.delete(alice_chat, made["id"])) is True)
+check("and it is gone from the listing",
+      run(chat_sessions.get(alice_chat, made["id"])) is None)
 
-    def delete_many(self, query):
-        victims = [i for i, d in self.docs.items() if _fake_matches(d, query)]
-        for i in victims:
-            del self.docs[i]
-        return types.SimpleNamespace(deleted_count=len(victims))
+capped = run(chat_sessions.create(alice_chat, "Long one"))
+for n in range(chat_sessions.MAX_SESSION_MESSAGES + 5):
+    run(chat_sessions.append_message(alice_chat, capped["id"], "user", f"m{n}"))
+grown = run(chat_sessions.get(alice_chat, capped["id"]))
+# Messages live inside the session document, so an unbounded conversation walks towards
+# Mongo's 16MB ceiling and starts failing writes mid-chat.
+check("a conversation cannot grow without limit",
+      len(grown["messages"]) == chat_sessions.MAX_SESSION_MESSAGES)
+check("and it is the OLDEST that are dropped",
+      grown["messages"][-1]["content"] == f"m{chat_sessions.MAX_SESSION_MESSAGES + 4}")
 
-    def count_documents(self, query):
-        return sum(1 for d in self.docs.values() if _fake_matches(d, query))
+removed = run(chat_sessions.delete_all(alice_chat))
+check("deleting an account takes its conversations with it", removed >= 26)
+check("but leaves everyone else's alone",
+      len(run(chat_sessions.list_page(bob_chat, limit=10))["sessions"]) == 1)
+run(chat_sessions.delete_all(bob_chat))
+loop.close()
 
-
-print("\n--- cloud state: rate limiting over Mongo ---")
-from src.core import ratelimit as rl  # noqa: E402
-
-rl_events = FakeSyncCollection()
-database.set_sync_collection("rate_limit_events", rl_events)
-mongo_limit = rl.RateLimit("mongo-test", allowance=3, per_seconds=60)
-allowed = sum(1 for _ in range(5) if rl._check_mongo(mongo_limit, "someone") is None)
-check("the Mongo-backed limiter allows exactly the configured allowance", allowed == 3)
-check("the 4th event over the limit is refused",
-      rl._check_mongo(mongo_limit, "someone") is not None)
-check("a different key has its own bucket",
-      rl._check_mongo(mongo_limit, "someone-else") is None)
-check("each allowed event is one stored document",
-      rl_events.count_documents({"bucket": "mongo-test", "key": "someone"}) == 3)
-
-print("\n--- cloud state: the answer cache over Mongo ---")
-from src.services import answer_cache as ac  # noqa: E402
-
-database.set_sync_collection("answer_cache_entries", FakeSyncCollection())
-database.set_sync_collection("answer_cache_generations", FakeSyncCollection())
-ac._put_mongo("u1", "What is X?", None, 4, {"answer": "cached", "sources": []})
-check("a Mongo-backed cache hit round-trips the value",
-      (ac._get_mongo("u1", "  what   is x? ", None, 4) or {}).get("answer") == "cached")
-check("another user never sees it", ac._get_mongo("u2", "What is X?", None, 4) is None)
-ac._bump_mongo("u1")
-check("bumping a user's generation invalidates their Mongo-backed entries",
-      ac._get_mongo("u1", "What is X?", None, 4) is None)
-
-print("\n--- cloud state: the document manifest over Mongo ---")
-from src.services import manifest as manifest_mod  # noqa: E402
-
-manifest_fake = FakeSyncCollection()
-database.set_sync_collection("document_manifest", manifest_fake)
-manifest_mod._mongo_put("users/u1/book.pdf", {
-    "sha256": "abc123", "mtime": 0, "size": 10, "pages": 2, "chunks": 5, "user_id": "u1",
-    "ingested_at": "now",
-})
-check("a Mongo-backed manifest entry round-trips",
-      manifest_mod._mongo_get("users/u1/book.pdf")["sha256"] == "abc123")
-check("a document not yet ingested has no Mongo entry",
-      manifest_mod._mongo_get("users/u1/missing.pdf") is None)
-check("_mongo_all() lists it back by filename",
-      "users/u1/book.pdf" in manifest_mod._mongo_all())
-manifest_mod._mongo_remove("users/u1/book.pdf")
-check("removing it clears the Mongo entry", manifest_mod._mongo_get("users/u1/book.pdf") is None)
-
-print("\n--- cloud state: the Cloudinary document registry over Mongo ---")
-from src.services import cloud_documents  # noqa: E402
-
-database.set_sync_collection("cloud_documents", FakeSyncCollection())
-cloud_documents.register("users/u1/notes.pdf", user_id="u1", public_id="rag/users/u1/notes",
-                         url="https://res.cloudinary.com/demo/raw/upload/rag/users/u1/notes.pdf",
-                         size_bytes=1234, sha256="deadbeef")
-check("a registered document is fetchable by its path",
-      cloud_documents.get("users/u1/notes.pdf")["public_id"] == "rag/users/u1/notes")
-check("it appears in that user's listing",
-      [d["filename"] for d in cloud_documents.list_for_user("u1")] == ["users/u1/notes.pdf"])
-check("another user's listing is empty", cloud_documents.list_for_user("u2") == [])
-check("used_bytes reflects what was registered", cloud_documents.used_bytes("u1") == 1234)
-check("a name collision gets a ' (2)' suffix, like local mode's unique_path()",
-      cloud_documents.unique_filename("notes.pdf", "u1") == "notes (2).pdf")
-removed = cloud_documents.remove("users/u1/notes.pdf")
-check("remove() returns what was deleted", removed["public_id"] == "rag/users/u1/notes")
-check("and it is really gone", cloud_documents.get("users/u1/notes.pdf") is None)
-
-print("\n--- Cloudinary uploads: the public_id ownership check ---")
-from src.services import cloudinary_store  # noqa: E402
-
-folder = cloudinary_store.user_folder("u1")
-check("a public_id inside the caller's own folder is accepted",
-      cloudinary_store.public_id_belongs_to(f"{folder}/notes", "u1"))
-check("the folder path itself is accepted (an edge case, not a real upload)",
-      cloudinary_store.public_id_belongs_to(folder, "u1"))
-check("a public_id under a DIFFERENT user's folder is rejected - this is what stops "
-      "POST /upload/complete from being told to index someone else's file",
-      not cloudinary_store.public_id_belongs_to(f"{cloudinary_store.user_folder('u2')}/notes", "u1"))
-check("a public_id that merely starts with the folder NAME as a string, without the "
-      "separator, is still rejected (no accidental prefix match)",
-      not cloudinary_store.public_id_belongs_to(f"{folder}-evil/notes", "u1"))
-
-print("\n--- cloud state: the owner of record survives a read-only filesystem ---")
-# A serverless filesystem is read-only outside /tmp, and set_owner_of_record() runs on the
-# FIRST signup - after the user record has already been created. An OSError escaping it
-# means that account exists but its owner got a 500 and can never sign up (409 on retry).
-from src.services import ownership as ownership_mod  # noqa: E402
-
-_real_owner_path = ownership_mod._OWNER_OF_RECORD_PATH
-_real_owner_mongo = ownership_mod._MONGO
-try:
-    # Disk mode, pointed somewhere that cannot be created - stands in for a read-only FS.
-    ownership_mod._MONGO = False
-    ownership_mod._OWNER_OF_RECORD_PATH = Path("/proc/version/nope/owner_of_record.json")
-    raised = None
-    try:
-        ownership_mod.set_owner_of_record("user-abc")
-    except Exception as exc:                        # noqa: BLE001 - catching it IS the check
-        raised = exc
-    check("an unwritable owner-of-record file does not break the signup path", raised is None)
-    check("and it simply reads back as None afterwards",
-          ownership_mod.owner_of_record() is None)
-
-    # Cloud mode: the same call round-trips through Mongo instead of touching the disk.
-    state_fake = FakeSyncCollection()
-    database.set_sync_collection("app_state", state_fake)
-    ownership_mod._MONGO = True
-    ownership_mod.set_owner_of_record("user-xyz")
-    check("in cloud mode the owner of record lives in Mongo, not on disk",
-          ownership_mod.owner_of_record() == "user-xyz")
-    check("stored as a single keyed document", state_fake.count_documents({}) == 1)
-    ownership_mod.set_owner_of_record("user-second")
-    check("re-setting it overwrites in place rather than appending a second row",
-          state_fake.count_documents({}) == 1 and ownership_mod.owner_of_record() == "user-second")
-finally:
-    ownership_mod._OWNER_OF_RECORD_PATH = _real_owner_path
-    ownership_mod._MONGO = _real_owner_mongo
-
-print("\n--- a large PDF ingests across several requests instead of timing out ---")
-# A serverless function is killed at maxDuration. Doing a whole file per invocation meant a
-# big document timed out, lost its partial work (the manifest entry lands only at the end),
-# and was retried from scratch forever. ingest_one() now takes a chunk window and reports
-# "partial", so the same document finishes across however many calls it needs.
-from src.services import ingestion as ing_resume
-
-make_pdf(str(TEST_DATA_DIR / "sliced.pdf"))
-manifest.remove("sliced.pdf")
-vectorstore.delete_source("sliced.pdf")
-
-whole = ing_resume.ingest_one("sliced.pdf", reason="new")
-full_total = whole["chunks_stored"]
-check("the fixture has enough chunks to slice", full_total >= 3)
-
-manifest.remove("sliced.pdf")
-vectorstore.delete_source("sliced.pdf")
-
-# Now the same document one chunk at a time, the way cloud mode would drive it.
-calls, offset, guard = 0, 0, 0
-while True:
-    guard += 1
-    assert guard < 50, "resumption did not terminate"
-    r = ing_resume.ingest_one("sliced.pdf", reason="new", start_chunk=offset, max_chunks=1)
-    calls += 1
-    if r["status"] != "partial":
-        break
-    check_silent = r["next_chunk"] == offset + 1
-    assert check_silent, (r, offset)
-    assert manifest.get("sliced.pdf") is None, "a partial slice must not finish the document"
-    offset = r["next_chunk"]
-
-check("slicing took one call per chunk and then finished", calls == full_total)
-check("the final call reports the document ingested", r["status"] == "ingested")
-check("a partial slice never writes the manifest entry (it is not done yet)",
-      manifest.get("sliced.pdf") is not None)
-
-sliced_rows = [c for c in vectorstore.all_chunks() if c["source"] == "sliced.pdf"]
-check("every chunk landed exactly once across the slices", len(sliced_rows) == full_total)
-check("and the text is not duplicated between slices",
-      len({c["text"] for c in sliced_rows}) == full_total)
-
-# The bug this most protects against: add_chunks numbers chunks from 0 on every call, so
-# without index_offset each slice would overwrite the previous slice's chunk_index range
-# and neighbour expansion (which addresses chunks BY that index) would fetch the wrong text.
-indices = sorted(c["chunk_index"] for c in sliced_rows)
-check("chunk_index stays contiguous across slice boundaries",
-      indices == list(range(full_total)))
-
-check("a resumed slice does not wipe the slices before it",
-      len(sliced_rows) == full_total and full_total > 1)
-
-vectorstore.delete_source("sliced.pdf")
-manifest.remove("sliced.pdf")
-
-print("\n--- a hosted Chroma truncates an unbounded get(): all_chunks() must page ---")
-# A local disk store returns every matching record from one get(), so an unpaginated read
-# looks correct here forever. A HOSTED Chroma caps records per request (300 on the free
-# tier) and TRUNCATES silently past it - which had BM25 indexing the first 300 chunks of a
-# 2,600-chunk corpus while vector search still saw everything, so nothing appeared broken.
-# Shrinking the page size below the corpus reproduces that shape against local Chroma.
-class _TruncatingCollection:
-    """
-    A local Chroma honours an unbounded get() and returns everything, so simply shrinking
-    the page size does NOT reproduce this bug - the unpaginated version passes too. This
-    stands in for the hosted server: it never returns more than `cap` records per request,
-    whether or not a limit was asked for, which is what silently drops rows in production.
-    """
-
-    def __init__(self, inner, cap):
-        self._inner, self._cap = inner, cap
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-    def get(self, *args, **kwargs):
-        requested = kwargs.get("limit")
-        kwargs["limit"] = min(requested, self._cap) if requested else self._cap
-        return self._inner.get(*args, **kwargs)
-
-
-paged_owner = "6a" + "0" * 22
-vectorstore.add_chunks(
-    f"users/{paged_owner}/paging.pdf",
-    [{"text": f"paging probe passage number {i}", "page_start": i, "page_end": i}
-     for i in range(7)],
-    user_id=paged_owner,
-)
-
-_real_page = vector_chroma.CHROMA_ADD_BATCH
-_real_col = vector_chroma._col
-try:
-    _inner_col = vector_chroma._col()
-    vector_chroma.CHROMA_ADD_BATCH = 2          # smaller than what we just stored
-    vector_chroma._col = lambda: _TruncatingCollection(_inner_col, 2)
-    walked = vectorstore.all_chunks(paged_owner)
-    check("all_chunks() returns every chunk, not just the first page",
-          len(walked) == 7, )
-    check("and the pages are stitched together without duplicates",
-          len({row["text"] for row in walked}) == 7)
-    check("set_owner() also pages, so a large document is fully stamped",
-          vectorstore.set_owner(f"users/{paged_owner}/paging.pdf", paged_owner) == 7)
-finally:
-    vector_chroma.CHROMA_ADD_BATCH = _real_page
-    vector_chroma._col = _real_col
-    vectorstore.delete_source(f"users/{paged_owner}/paging.pdf")
-
-print("\n--- the Mongo connection string never reaches a log or a browser ---")
-# The URI is logged on every connection AND embedded in CANNOT_REACH, which main.py renders
-# into a 503 that the sign-in screen displays verbatim. A hosted URI carries the password
-# inline, so without redaction the database password is printed to the platform's log
-# stream on every cold start and shown to anyone loading the page during an outage.
-check("a password in an SRV URI is redacted",
-      database._redact("mongodb+srv://user:hunter2@cluster.mongodb.net/db")
-      == "mongodb+srv://user:***@cluster.mongodb.net/db")
-check("and in a plain mongodb:// URI",
-      database._redact("mongodb://admin:s3cret@localhost:27017")
-      == "mongodb://admin:***@localhost:27017")
-check("a URI with no credentials is left alone",
-      database._redact("mongodb://localhost:27017") == "mongodb://localhost:27017")
-check("a password containing ':' and '/' is still fully removed",
-      "p:/ss" not in database._redact("mongodb+srv://user:p:/ss@host.net"))
-check("the user-facing outage message carries no password",
-      "***" in database._redact(f"mongodb+srv://u:pw@h") and "pw" not in database._redact(
-          "mongodb+srv://u:pw@h"))
 
 print(f"\nAll {PASSED} checks passed.")

@@ -74,17 +74,57 @@ def invalidate(user_id: Optional[str] = None) -> None:
             log.debug("BM25 index for %s invalidated.", user_id)
 
 
+_warned_remote = False
+
+
+def enabled() -> bool:
+    """
+    Whether the keyword half of hybrid retrieval should run at all.
+
+    BM25 lives in this process, so building its index means reading the WHOLE corpus. That
+    is a disk read against a local Chroma folder and a bulk download against a hosted store
+    - where it takes minutes on a free tier and can have the connection dropped mid-way.
+    Losing the keyword stage costs some ranking quality; failing the question costs the
+    answer, so "auto" trades the first away rather than the second.
+    """
+    global _warned_remote
+    from src.core.config import CHROMA_BACKEND, KEYWORD_SEARCH, VECTOR_STORE
+
+    if KEYWORD_SEARCH == "off":
+        return False
+    if KEYWORD_SEARCH == "on":
+        return True
+
+    remote = VECTOR_STORE != "chroma" or CHROMA_BACKEND != "disk"
+    if remote and not _warned_remote:
+        _warned_remote = True
+        log.info(
+            "Keyword (BM25) search is off: the corpus lives in a hosted store, and "
+            "building the index would download all of it on every cold start. Answers "
+            "use vector search plus the re-ranker. Set KEYWORD_SEARCH=on to force it."
+        )
+    return not remote
+
+
 def _build(user_id: str) -> Tuple[Optional[BM25Okapi], List[Dict]]:
     """Builds one index. `user_id` of "" means the whole store (CLI and eval only)."""
     # Imported here rather than at module scope to avoid a circular import
     # (vectorstore -> retrieval -> bm25 -> vectorstore).
     from src.services.vectorstore import all_chunks
 
-    with timed(log, f"build BM25 index ({user_id or 'all documents'})"):
-        rows = all_chunks(user_id=user_id or None)
-        if not rows:
-            return None, []
-        index = BM25Okapi([tokenize(r["text"]) for r in rows])
+    try:
+        with timed(log, f"build BM25 index ({user_id or 'all documents'})"):
+            rows = all_chunks(user_id=user_id or None)
+            if not rows:
+                return None, []
+            index = BM25Okapi([tokenize(r["text"]) for r in rows])
+    except Exception as exc:
+        # A store that is slow, rate-limited or drops the connection must not take the
+        # question down with it. This exact failure - Chroma Cloud closing the connection
+        # part-way through the bulk read - surfaced to the user as "Request failed (500)".
+        log.warning("Could not build the keyword index (%s) - answering with vector "
+                    "search and the re-ranker only.", exc)
+        return None, []
     log.info("BM25 index built over %d chunks for %s.", len(rows), user_id or "all documents")
     return index, rows
 
@@ -120,6 +160,9 @@ def search(question: str, limit: int, source=None,
     second line of defence - it costs one comparison per row and it is what would catch a
     caching mistake here.
     """
+    if not enabled():
+        return []
+
     index, rows = _get(user_id or "")
 
     if index is None or not rows:
