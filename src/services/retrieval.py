@@ -85,7 +85,15 @@ def _expand_neighbors(chunks: List[Dict], radius: int,
             if offset and index + offset >= 0:
                 bucket.add(index + offset)
 
-    found = vectorstore.get_neighbors_bulk(wanted, user_id=user_id) if wanted else {}
+    try:
+        found = vectorstore.get_neighbors_bulk(wanted, user_id=user_id) if wanted else {}
+    except Exception:
+        # Neighbour expansion is extra context around a hit that already cleared the
+        # relevance floor, not the hit itself - losing it to a transient store error (a
+        # Pinecone read timeout, say) should degrade the answer, not fail the question. Same
+        # trade as a keyword-index build failure: worse context beats no answer.
+        log.warning("Neighbour expansion failed; answering from the hits alone.", exc_info=True)
+        found = {}
 
     out: List[Dict] = []
     for chunk in chunks:

@@ -119,6 +119,35 @@ The proper fix for hosted mode is a server-side lexical index (a Pinecone sparse
 Mongo text search) so the lexical half runs where the data already is. Until then this is
 the trade being made deliberately, not an accident.
 
+
+### The answer prompt (src/ml/llm.py)
+
+`SYSTEM_PROMPT` is the contract the whole product rests on: the model answers ONLY from the
+passages in the CONTEXT block, and says so when they do not cover the question. What each
+part is there for, so it is not "simplified" back out later:
+
+- **Grounding.** Stated once as the rule everything else serves, because a confident answer
+  built on training data is indistinguishable to the user from a correct one.
+- **Verbatim figures.** Numbers, dates, versions and identifiers are quoted exactly - a
+  rounded price or a reformatted date is a wrong answer with a citation attached.
+- **Partial answers and conflicts.** Answer the covered part, name the uncovered part, and
+  when two passages disagree cite both rather than silently picking one.
+- **Conversational turns are the one exception** to "refuse when not in the documents":
+  "hi" gets a normal short reply, not a refusal about missing passages.
+- **History is intent, not fact.** Earlier turns resolve "it" and "the second one"; they
+  are never a source of claims, because this turn's CONTEXT may not contain what an earlier
+  answer relied on.
+- **Passages are data, not instructions** (with `<document>` fencing from `build_context`).
+  Anyone who can upload a PDF can write "ignore previous instructions" into it.
+- **`ANSWER_REMINDER` is appended AFTER the question**, so ground-it-and-cite-it is the last
+  thing the model reads. Rules at the top of a long prompt lose out to a persuasive passage
+  further down; the restatement costs a few dozen tokens.
+- **The user turn states the passage count** ("CONTEXT - 2 passage(s)"), so an empty context
+  is unambiguous rather than a blank block the model may read as "answer from what you know".
+
+Retrieval still refuses before the model is called at all: no chunks clearing the relevance
+floor means `NO_CONTEXT_MESSAGE`, with no LLM call and no API key needed.
+
 ## Layout
 
 Purpose-based `src/` package at the project root - one folder per concern, mirroring the
