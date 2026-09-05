@@ -1,79 +1,377 @@
 {
   "_readme": [
-    "Golden question set for eval/run_eval.py.",
+    "Golden question set for eval/run_eval.py and scripts/ab_chunking.py.",
     "",
-    "The entries below target the fictional fixture PDF (scripts/make_test_pdf.py), so the",
-    "harness is runnable out of the box. REPLACE THEM with 20-30 questions about your own",
-    "documents in data/ - that is what actually measures this system.",
+    "26 questions about the two textbooks in data/, every one anchored to a page whose",
+    "text was read and checked before the question was written (see the validator in",
+    "scripts/check_golden.py - it re-verifies the evidence is still on the cited page).",
+    "",
+    "All cited pages fall inside the first 250 EXTRACTED pages of each book, so",
+    "  python scripts/ab_chunking.py --max-pages 250",
+    "is a complete run - no question can miss merely because its page was not loaded.",
+    "Note the two books differ: AIMA's extracted page 1 is physical page 1, while Pattern",
+    "Classification has no text layer before physical page 13, so its extracted page 1 is",
+    "physical page 13. expected_pages are PHYSICAL page numbers, which is what the chunker",
+    "records and what _covers() compares against.",
     "",
     "Fields per question:",
     "  question        - what to ask",
     "  expected_source - the filename in data/ the answer should come from",
-    "  expected_pages  - page number(s) that should be retrieved; hit-rate@k checks these",
-    "  reference_answer- optional, only used by the LLM-as-judge correctness score",
+    "  expected_pages  - physical page number(s); hit-rate@k checks these",
+    "  reference_answer- used only by the --judge correctness score",
+    "  evidence        - literal strings that must appear on the cited page; the validator",
+    "                    fails the entry if they do not. This is what stops a question from",
+    "                    quietly rotting into an unmeasurable one.",
     "",
-    "Retrieval hit-rate needs no API key and no judge: it just asks whether the right page",
-    "made it into the retrieved set. That single number is what tells you whether a change",
-    "to chunking, the embedding model, BM25 or the re-ranker actually helped."
+    "The unanswerable entries are about this project and about events after these books",
+    "were written. Neither book can answer them, so the system should decline."
   ],
   "questions": [
     {
-      "question": "How much funding did Project Nightingale receive?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [2],
-      "reference_answer": "A grant of 1.2 million dollars from the Global Wildlife Fund, covering 2021 to 2024."
+      "question": "What two capabilities does a computer need in order to pass the total Turing Test?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        29
+      ],
+      "reference_answer": "Computer vision, to perceive objects, and robotics, to move them about.",
+      "evidence": [
+        "total Turing Test",
+        "computer vision",
+        "robotics"
+      ],
+      "reviewed": true
     },
     {
-      "question": "Which two previously undocumented stopover sites were identified?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [3],
-      "reference_answer": "One in the Yellow River Delta and one near Poyang Lake."
+      "question": "For breadth-first search, is memory or execution time the bigger problem?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        97
+      ],
+      "reference_answer": "Memory. Most people will wait 18 minutes for a depth-6 search, but few have the 111 megabytes it needs.",
+      "evidence": [
+        "memory requirements are a bigger problem for breadth-first"
+      ],
+      "reviewed": true
     },
     {
-      "question": "How many satellite tags were deployed and where?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [1],
-      "reference_answer": "42 tags across three breeding grounds in northern Russia."
+      "question": "Which two search strategies does iterative deepening combine the benefits of?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        101
+      ],
+      "reference_answer": "Depth-first and breadth-first: it is optimal and complete like breadth-first, but has the modest memory requirements of depth-first.",
+      "evidence": [
+        "combines the benefits of depth-first and breadth-first"
+      ],
+      "reviewed": true
     },
     {
-      "question": "What percentage of the budget goes to field operations?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [2],
-      "reference_answer": "30 percent, with a recommendation to increase it by 10 percent in the final year."
+      "question": "In an iterative deepening search, how many times is the root node expanded?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        102
+      ],
+      "reference_answer": "d + 1 times - the bottom level once, the next level twice, and so on up to the root.",
+      "evidence": [
+        "root of the search tree, which is expanded d + 1 times"
+      ],
+      "reviewed": true
     },
     {
-      "question": "How long do tagged cranes rest at the Yellow River Delta site?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [3],
-      "reference_answer": "An average of 11 days before continuing their migration."
+      "question": "What is the pathmax equation and why is it needed?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        120
+      ],
+      "reference_answer": "f(n') = max(f(n), g(n') + h(n')). It ignores the misleading values a nonmonotonic heuristic produces, so f is nondecreasing along any path from the root.",
+      "evidence": [
+        "pathmax equation",
+        "nonmonotonic heuristic"
+      ],
+      "reviewed": true
     },
     {
-      "question": "What is the battery life of each satellite tag?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [1],
-      "reference_answer": "Approximately 18 months, transmitting location data every six hours."
+      "question": "What is the Manhattan distance heuristic for the 8-puzzle, and what value does it give for the start state?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        124
+      ],
+      "reference_answer": "The sum of the horizontal and vertical distances of the tiles from their goal positions, also called the city block distance. The start state gives h2 = 15.",
+      "evidence": [
+        "Manhattan distance",
+        "city block distance"
+      ],
+      "reviewed": true
     },
     {
-      "question": "Who leads the project and at which institute?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [1],
-      "reference_answer": "Dr. Amara Chen at the Boreal Ecology Institute."
+      "question": "How is the quality of a heuristic characterized by the effective branching factor?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        124,
+        125
+      ],
+      "reference_answer": "The effective branching factor b* is the branching factor a uniform tree of the same depth would need to contain the number of nodes the search generated.",
+      "evidence": [
+        "effective branching factor"
+      ],
+      "reviewed": true
     },
     {
-      "question": "What does the team hypothesize about cranes departing later in the season?",
-      "expected_source": "sample.pdf",
-      "expected_pages": [3],
-      "reference_answer": "They take a more westerly route, hypothesized to be linked to wind patterns rather than food availability."
+      "question": "What kind of problem was simulated annealing first used extensively to solve?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        136
+      ],
+      "reference_answer": "VLSI layout problems, in the early 1980s. It has since been applied to factory scheduling and other large-scale optimization tasks.",
+      "evidence": [
+        "VLSI layout problems in the early 1980s"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "Does alpha-beta pruning change the move that minimax would return?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        152
+      ],
+      "reference_answer": "No. Applied to a standard minimax tree it returns the same move, pruning only branches that cannot influence the final decision.",
+      "evidence": [
+        "returns the same move as minimax",
+        "alpha-beta pruning"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "How many custom VLSI chips will Deep Blue use, and what search depth will that allow?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        160
+      ],
+      "reference_answer": "A parallel array of 1024 custom VLSI chips, roughly one billion positions per second, reaching depth 14.",
+      "evidence": [
+        "1024 custom VLSI chips",
+        "depth 14"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What is the scoring in the wumpus world - the reward for the gold and the penalty for dying?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        176
+      ],
+      "reference_answer": "1000 points for climbing out of the cave carrying the gold, a 1-point penalty per action, and a 10,000-point penalty for getting killed.",
+      "evidence": [
+        "1000 points are awarded",
+        "10,000-point penalty"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What is the ontological commitment of propositional logic compared with first-order logic?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        187
+      ],
+      "reference_answer": "Propositional logic commits only to facts; first-order logic commits to facts, objects and relations.",
+      "evidence": [
+        "Ontological Commitment",
+        "facts, objects, relations"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What form does a Horn sentence take, and why does that class matter?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        195
+      ],
+      "reference_answer": "P1 AND P2 AND ... AND Pn => Q, where the Pi and Q are nonnegated atoms. It is the class for which a polynomial-time inference procedure exists.",
+      "evidence": [
+        "Horn sentence has the form",
+        "nonnegated atoms",
+        "polynomial-time inference"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What replaces MINIMAX-VALUE in games that include an element of chance?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        157
+      ],
+      "reference_answer": "EXPECTIMINIMAX-VALUE, which computes expectimax and expectimin values at the chance nodes.",
+      "evidence": [
+        "EXPECTIMINIMAX-VALUE"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What are effect axioms in the situation calculus?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        226
+      ],
+      "reference_answer": "Axioms describing an action by stating the properties of the situation that results from doing it - for example, that grabbing a present portable object leaves the agent holding it.",
+      "evidence": [
+        "effect axioms",
+        "situation calculus"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "Who pointed out the frame problem as a major problem for the use of logic in AI?",
+      "expected_source": "Artificial Intelligence - A Modern Approach - Russel, Peter And Norvig, Stuart (Ebook - English).pdf",
+      "expected_pages": [
+        234
+      ],
+      "reference_answer": "McCarthy and Hayes, in 1969.",
+      "evidence": [
+        "frame problem was pointed out",
+        "McCarthy and Hayes (1969)"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "In minimum-error-rate classification, why is the decision generally determined by the more likely state of nature?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        45
+      ],
+      "reference_answer": "Because the loss incurred for an error is greater than for being correct, so both loss differences are positive - though the posteriors must still be scaled by those differences.",
+      "evidence": [
+        "more likely state of nature",
+        "loss incurred for making an error is greater"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What does knowledge of the covariance matrix let you calculate about the data?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        54
+      ],
+      "reference_answer": "The dispersion of the data in any direction or in any subspace; for y = A'x the density is N(A'mu, A'SigmaA).",
+      "evidence": [
+        "dispersion of the data in any direction"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "In Case 3, where each category has an arbitrary covariance matrix, what shape are the discriminant functions and the decision surfaces?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        61
+      ],
+      "reference_answer": "The discriminant functions are inherently quadratic and the decision surfaces are hyperquadrics - hyperplanes, hyperspheres, hyperellipsoids, hyperparaboloids and so on.",
+      "evidence": [
+        "inherently quadratic",
+        "hyperquadric"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "In signal detection theory, what are the four probabilities relating the internal signal to the threshold called?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        70
+      ],
+      "reference_answer": "A hit, a false alarm, a miss, and a correct rejection.",
+      "evidence": [
+        "a hit",
+        "false alarm",
+        "a miss",
+        "correct rejection"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "How is the maximum likelihood estimate of a parameter defined?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        109
+      ],
+      "reference_answer": "The value of theta that maximizes p(D|theta) - the value that best agrees with the observed training samples.",
+      "evidence": [
+        "maximum likelihood estimate",
+        "maximizes p(D|"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "Give an example of a trivial sufficient statistic and say why it is of little interest.",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        127
+      ],
+      "reference_answer": "A vector whose components are the n samples themselves. Such statistics are of little interest because they provide no real summary of the data.",
+      "evidence": [
+        "trivial ways of constructing su",
+        "samples themselves"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What are the two methods of choosing the region for density estimation, and which one grows the volume until it encloses k neighbours?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        190
+      ],
+      "reference_answer": "Shrinking the region as a function of n, which is the Parzen-window method, and specifying kn as a function of n such as kn = sqrt(n), which is the kn-nearest-neighbor method - that is the one that grows the volume until it encloses kn neighbours.",
+      "evidence": [
+        "Parzen-window method",
+        "nearest- neighbor estimation method",
+        "grown until it encloses"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What partitioning of the input space does the nearest-neighbor algorithm produce?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        206
+      ],
+      "reference_answer": "A Voronoi tesselation: cells of all points closer to one training point than to any other, each labelled by that point's category.",
+      "evidence": [
+        "Voronoi tesselation"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "In a Bayesian belief network, what do the links between nodes represent?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        141
+      ],
+      "reference_answer": "Conditional probabilities - for example P(c|a), described by a matrix of entries P(ci|aj).",
+      "evidence": [
+        "links between nodes represent conditional probabilities"
+      ],
+      "reviewed": true
+    },
+    {
+      "question": "What model parameters does hidden Markov model learning determine?",
+      "expected_source": "Pattern Classification by Richard O. Duda, David G. Stork, Peter E.Hart .pdf",
+      "expected_pages": [
+        155
+      ],
+      "reference_answer": "The transition probabilities aij and bjk, estimated from an ensemble of training samples.",
+      "evidence": [
+        "transition prob",
+        "aij and bjk"
+      ],
+      "reviewed": true
     }
   ],
   "unanswerable": [
     {
-      "question": "What is the airspeed velocity of an unladen swallow?",
-      "note": "Not in any ingested document - the system should decline rather than invent an answer. Measured as the 'refusal' metric."
+      "question": "What does the Pinecone Starter plan cost per month?"
     },
     {
-      "question": "How do I configure a Kubernetes ingress controller?",
-      "note": "Also absent - checks the relevance floor is doing its job."
+      "question": "How do I set CHROMA_COLLECTION in this project's .env file?"
+    },
+    {
+      "question": "Which company released GPT-4 and in what year?"
     }
   ]
 }

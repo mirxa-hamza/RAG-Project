@@ -182,7 +182,8 @@ src/
     ingestion.py       single entry point for documents + background job state machine
     uploads.py         validates + writes browser uploads into DATA_DIR; deletes documents
     manifest.py        JSON sidecar: what's ingested, with content hashes
-    pdf.py             extraction (keeps paragraph breaks, optional OCR) + chunker
+    pdf.py             extraction (keeps paragraph breaks, optional OCR) + fixed chunker
+    chunking.py        chunk_pages() - strategy dispatch (fixed | semantic) + the semantic chunker
     vectorstore.py     ChromaDB add/query/neighbours/delete/reset, batched
     bm25.py            lazy in-memory BM25 index (keyword half of hybrid search)
     retrieval.py       the retrieval pipeline: fusion, re-rank, floor, neighbour expansion
@@ -193,13 +194,16 @@ scripts/
   backup.py            archives data/ + MongoDB; --verify reads a backup back
   verify_index.py      finds orphan/ownerless/missing chunks; --fix repairs them
   draft_golden.py      drafts eval questions from the real corpus for a human to edit
+  check_golden.py      verifies every golden question's answer is on the page it cites
+  ab_chunking.py       chunking A/B: hit-rate@k and MRR per strategy, offline, writes nothing
 Dockerfile / docker-compose.yml   app + MongoDB + volumes, models baked into the image
   make_test_pdf.py     fixture generator -> tests/fixtures/, never data/
 eval/
-  golden_questions.json  golden set (currently fixture questions - replace with real ones)
+  golden_questions.json  26 verified questions on the two textbooks + 3 unanswerable
   run_eval.py            hit-rate@k, MRR, refusal rate, optional LLM-as-judge
 tests/
   test_pipeline_offline.py   220 checks, offline; no Groq key and no MongoDB needed
+  test_chunking_offline.py   53 checks, offline; both chunkers, stub embedder, no model
 data/                  the live ingestion source, gitignored
   users/<user_id>/     one folder per account: everything uploaded through the web UI
   <anything else>      hand-copied PDFs; owned by the "owner of record" (first account)
@@ -491,7 +495,9 @@ Two different questions, two different tools — don't confuse them:
 
 ```bash
 python tests/test_pipeline_offline.py    # does the plumbing work?  (220 checks, offline)
+python tests/test_chunking_offline.py    # do both chunkers behave? (53 checks, offline)
 python eval/run_eval.py                  # are the answers any good? (needs an index)
+python scripts/ab_chunking.py            # which chunking strategy retrieves better?
 ```
 
 `tests/` stubs `sentence_transformers` (both `SentenceTransformer` and `CrossEncoder`) via
@@ -522,12 +528,148 @@ python eval/run_eval.py --no-hybrid           # what is BM25 worth?
 python eval/run_eval.py --top-k 8 --out runs/topk8.json
 ```
 
-`eval/golden_questions.json` still holds questions about the *fixture* PDF so the harness
-runs out of the box. Replacing them with 20-30 questions about the real documents remains
-the single highest-value thing left to do; `scripts/draft_golden.py` does the tedious half
-(finding candidate passages and recording their pages) and marks every entry
-`"reviewed": false` so nobody mistakes a draft for a measurement - `run_eval.py` prints a
-warning when it sees them.
+`eval/golden_questions.json` holds **26 questions about the two textbooks in `data/`**, plus
+3 unanswerable ones for the refusal rate. Every question carries an `evidence` list -
+literal strings that must appear in the extracted text of the page it cites - and
+
+```bash
+python scripts/check_golden.py
+```
+
+re-extracts the PDFs and verifies them, printing where a phrase actually lives when it is
+not where the entry claims. Run it after editing the set or replacing anything in `data/`;
+it exits 1 on a failure, so it can gate a commit.
+
+That field exists because a wrong page number is worse than no golden set at all: the
+question scores as a MISS in *every* configuration, so a real improvement and a real
+regression look identical. That is exactly what a fixture-question set does - the first
+`ab_chunking.py` run on this corpus returned `hit@4 = 0.000` for both strategies, because
+every question named `sample.pdf` and neither textbook is `sample.pdf`.
+
+Two things about the page numbers. They are **physical** pages, which is what the chunker
+records and what `_covers()` compares against - and the two books differ: AIMA's extracted
+page 1 is physical page 1, while Pattern Classification has no text layer before physical
+page 13. All cited pages fall inside the first 250 *extracted* pages of each book, so
+`--max-pages 250` is a complete run and no question can miss merely because its page was
+never loaded.
+
+`scripts/draft_golden.py` remains the way to draft *more* entries from the corpus; it marks
+each `"reviewed": false` so nobody mistakes a draft for a measurement, and `run_eval.py`
+warns when it sees them.
+
+## Chunking strategies
+
+`CHUNK_STRATEGY` picks the chunker. `src/services/chunking.py::chunk_pages()` is the only
+entry point the pipeline calls; `ingestion.py` no longer knows which strategy is running.
+
+| | `fixed` (default) | `semantic` |
+|---|---|---|
+| boundary at | the word count running out | a spike in sentence-to-sentence distance |
+| overlap | `CHUNK_OVERLAP_WORDS` (50) | none, by design - overlap smears the boundary |
+| ingest cost | one embedding per ~300-word chunk | one embedding per **sentence**, ~15x |
+| knobs | `CHUNK_SIZE_WORDS`, `CHUNK_OVERLAP_WORDS` | `SEMANTIC_BREAKPOINT_PERCENTILE`, `SEMANTIC_BUFFER_SIZE`, `SEMANTIC_MIN_CHUNK_WORDS`, `SEMANTIC_MAX_CHUNK_WORDS` |
+
+How the semantic chunker works: split to sentences (keeping page numbers), embed each
+sentence together with `SEMANTIC_BUFFER_SIZE` neighbours either side, take
+`1 - cosine` between consecutive windows, and cut wherever that distance exceeds the
+`SEMANTIC_BREAKPOINT_PERCENTILE`-th percentile **of that document's own distances**. A
+percentile, not a fixed threshold: the absolute numbers move with the document and the
+embedding model, so a constant that behaves on one book cuts every other sentence in the
+next. Then the size bounds are enforced - anything over the ceiling is cut at its weakest
+internal seam, anything under the floor is merged into whichever neighbour it is *more
+similar to* (a heading belongs with the section it introduces, not the one that ended).
+
+Three things about this that are easy to get wrong:
+
+- **The strategies are not interchangeable for one index.** Different chunk text means
+  different vectors. Switching `CHUNK_STRATEGY` requires a full re-ingest into a
+  collection of its own (`CHROMA_COLLECTION`), or the two strategies' vectors sit mixed in
+  one store and every number measured afterwards is confident nonsense. Nothing errors.
+- **Resumed ingest slices depend on chunking being deterministic** (`ingest_one()`
+  re-extracts and re-chunks on every slice and resumes by index). Both strategies are
+  deterministic; the semantic one also memoises per document in `chunking._cache`, because
+  re-deriving it means re-embedding every sentence of the file *per slice*. If you add a
+  strategy, it must be deterministic - a chunker with any randomness in it silently
+  corrupts resumed uploads.
+- **Run the experiment with `EMBEDDINGS_PROVIDER=local`.** Sentence-level embedding on a
+  metered API is the expensive part of the run, and in cloud mode each slice is a fresh
+  process, so the cache does not survive between them.
+
+### Measuring one against the other
+
+```bash
+python scripts/ab_chunking.py --max-pages 150                 # fixed vs semantic
+python scripts/ab_chunking.py --percentile 90 --top-k 8
+python scripts/ab_chunking.py --strategies semantic --out eval/runs/semantic.json
+```
+
+`ab_chunking.py` extracts the documents once, then for each strategy chunks, embeds, and
+answers the golden questions by **brute-force cosine search over its own vectors** - exact,
+in memory, writing nothing. Two reasons it does not use the real store: Chroma and Pinecone
+are approximate, and their run-to-run recall variance is about the size of the effect being
+measured; and a script that writes vectors is a script that can leave two strategies mixed
+in one collection. It deliberately skips BM25 (that index is built from the live store), so
+read the numbers as *retrieval quality attributable to chunking*, not as the hybrid
+pipeline's absolute hit-rate.
+
+Hold everything else constant when comparing - same embedding model, same `top_k`, same
+reranker, same questions. One variable per run. And the numbers are only worth reading once
+`eval/golden_questions.json` holds real questions about the real documents; until then both
+strategies are being scored against the fixture PDF and the script says so.
+
+Published comparisons mostly find semantic chunking inside the noise of a well-tuned fixed
+chunker on structured documents, and clearly ahead only where formatting carries no signal
+(transcripts, chat logs, OCR without paragraph breaks). This corpus is textbooks with
+intact paragraphs. What was actually measured on it is below.
+
+### Measured results (Sept 2026)
+
+Corpus: the two textbooks in `data/`, `--max-pages 250`. Questions: the 26 in
+`eval/golden_questions.json`. Embeddings `BAAI/bge-small-en-v1.5` local, exact search.
+`fixed` = 300w/50w, `semantic` = p95, buffer 1, 60-300w.
+
+**Run 1 - production settings** (`top_k=4`, re-rank on, `expand=1`):
+
+| | chunks | words (med) | chunk s | embed s | hit@4 | MRR |
+|---|---|---|---|---|---|---|
+| fixed | 1030 | 254.5 | 30.2 | 182.6 | **1.000** | 0.942 |
+| semantic | 1235 | 174 | 501.7 | 161.8 | 0.962 | 0.942 |
+
+Both retrieve essentially everything. The -0.038 is one question, the smallest difference
+26 questions can express, and inside noise. **At this difficulty the strategy does not
+matter** - which is a statement about the test, not just about chunking: `hit@4 = 1.000` is
+a ceiling, and nothing can beat a ceiling.
+
+**Run 2 - safety nets off** (`--top-k 1 --no-rerank --expand 0`):
+
+| | chunk s | hit@1 | MRR |
+|---|---|---|---|
+| fixed | 26.8 | 0.692 | 0.692 |
+| semantic | 610.8 | **0.846** | 0.846 |
+
++0.154, four questions, four times the resolution. Real signal at rank 1. (hit@1 and MRR
+are necessarily equal here - with `top_k=1` rank is 1 or nothing - so that is one number
+printed twice, not two agreeing.)
+
+**What this does and does not establish.**
+
+- Semantic chunking retrieves better on a *first guess*. It does not retrieve better in
+  this pipeline: at production settings the re-ranker and neighbour expansion already
+  recover the whole gap.
+- The two arms are **not size-matched** - 174 vs 254 median words. At `top_k=1` a smaller
+  chunk embeds more precisely and covers a narrower page range, and `_covers()` never
+  penalises a chunk for containing less. So Run 2's gap may be chunk SIZE rather than
+  boundary placement. Those have very different prices: one line of `.env` against 610s of
+  sentence embedding per run.
+- **The control that settles it has not been run yet**: `fixed` at `--chunk-size 175` under
+  Run 2's settings. Near 0.846 means the win was size and `CHUNK_SIZE_WORDS` is the cheap
+  fix; near 0.692 means boundary placement earned it. Confirm from the other side with
+  `--min-words 200`, which lifts semantic's median toward fixed's.
+
+**Current decision: `CHUNK_STRATEGY=fixed` stays the default.** Semantic costs 20x the
+chunking time (26.8s to 610.8s) for an advantage this pipeline already recovers, and whose
+cause is not yet separated from chunk size. Revisit if the control above shows boundary
+placement is doing the work, or on a corpus where paragraph structure is absent.
 
 ## Known gotchas (already fixed, keep them fixed)
 
@@ -716,6 +858,8 @@ warning when it sees them.
 ## Before you commit
 
 - Never commit `.env` (real API key) or documents in `data/` — both gitignored.
-- Run `tests/test_pipeline_offline.py`; all checks must pass.
+- Run `tests/test_pipeline_offline.py` and `tests/test_chunking_offline.py`; all checks
+  must pass.
+- If you touched chunking, run `scripts/ab_chunking.py` before and after as well.
 - If you touched anything in the retrieval path, run `eval/run_eval.py` before and after
   and put the numbers in the commit message or PLAN.md.

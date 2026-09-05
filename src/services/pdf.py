@@ -202,6 +202,32 @@ def chunk_document(
     return chunks
 
 
+def sentences_with_pages(pages: List[Dict], max_words: int = 300) -> List[Tuple[str, int]]:
+    """
+    Flattens pages into [(sentence, page), ...] - the input the semantic chunker works on.
+
+    Paragraph structure is still used, but only as a guard rail: each paragraph is first
+    passed through _split_long_paragraph() so that a single runaway "sentence" (a table
+    dump, a formula block, bad OCR with no full stops) can never exceed max_words and blow
+    past the embedding model's window. Everything after that is a real sentence.
+
+    Deliberately NOT deduplicated or filtered by length: a two-word heading is a legitimate
+    sentence and its embedding is exactly the signal that a new topic starts here.
+    """
+    out: List[Tuple[str, int]] = []
+    for page in pages:
+        for paragraph in page["text"].split("\n\n"):
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            for piece in _split_long_paragraph(paragraph, max_words):
+                for sentence in _SENTENCE_END.split(piece):
+                    sentence = sentence.strip()
+                    if sentence:
+                        out.append((sentence, page["page"]))
+    return out
+
+
 def format_pages(page_start: int, page_end: int) -> str:
     """'page 7' or 'pages 7-8' - chunks routinely straddle a page break."""
     return f"page {page_start}" if page_start == page_end else f"pages {page_start}-{page_end}"

@@ -196,6 +196,37 @@ JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "12"))
 CHUNK_SIZE_WORDS = int(os.getenv("CHUNK_SIZE_WORDS", "300"))
 CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "50"))
 
+# Which chunker runs. "fixed" is the paragraph-aware packer above and the default;
+# "semantic" cuts where the meaning changes instead of where the word count runs out
+# (src/services/chunking.py).
+#
+# THESE ARE NOT INTERCHANGEABLE FOR THE SAME INDEX. Chunk text differs, so the vectors
+# differ; switching means a full re-ingest (`python scripts/ingest.py --force`) into a
+# COLLECTION OF ITS OWN. Point CHROMA_COLLECTION somewhere new before flipping this, or the
+# two strategies' vectors end up mixed in one store and every measurement is meaningless.
+CHUNK_STRATEGY = os.getenv("CHUNK_STRATEGY", "fixed").strip().lower()
+if CHUNK_STRATEGY not in ("fixed", "semantic"):
+    raise ValueError(f"CHUNK_STRATEGY must be 'fixed' or 'semantic', got {CHUNK_STRATEGY!r}")
+
+# ---- semantic chunking knobs (ignored when CHUNK_STRATEGY=fixed) ----
+# A chunk boundary is placed where the distance between neighbouring sentences lands above
+# this percentile of that document's own distance distribution. A percentile, not an
+# absolute threshold, because the raw numbers differ per document and per embedding model:
+# a fixed 0.3 that splits sensibly in one book cuts every other sentence in the next.
+# Lower = more, smaller chunks. 95 is the usual starting point.
+SEMANTIC_BREAKPOINT_PERCENTILE = float(os.getenv("SEMANTIC_BREAKPOINT_PERCENTILE", "95"))
+# Sentences embedded with N neighbours on each side. A lone sentence embeds noisily -
+# "It does not." carries no topic at all - and the buffer is what stops that noise being
+# read as a topic change. 1 means each embedded window is 3 sentences wide.
+SEMANTIC_BUFFER_SIZE = int(os.getenv("SEMANTIC_BUFFER_SIZE", "1"))
+# Floor and ceiling in words. The floor merges away one-line chunks (headings, page
+# furniture) that would otherwise each occupy a top_k slot; the ceiling stops a passage
+# with no detectable topic change from becoming one enormous chunk that the embedding
+# model would truncate anyway. The ceiling defaults to the fixed chunker's size so both
+# strategies land in the same size regime and the A/B compares chunking, not chunk length.
+SEMANTIC_MIN_CHUNK_WORDS = int(os.getenv("SEMANTIC_MIN_CHUNK_WORDS", "60"))
+SEMANTIC_MAX_CHUNK_WORDS = int(os.getenv("SEMANTIC_MAX_CHUNK_WORDS", str(CHUNK_SIZE_WORDS)))
+
 # OCR fallback for scanned/image-only PDFs. Needs `pip install pytesseract pillow` AND the
 # Tesseract binary installed on the machine; when either is missing, ingestion still works
 # and such PDFs are simply reported as skipped.

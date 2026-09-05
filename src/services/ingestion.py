@@ -36,11 +36,12 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from src.services import answer_cache, manifest
-from src.core.config import (CHUNK_OVERLAP_WORDS, CHUNK_SIZE_WORDS, DATA_DIR, DOCUMENT_STORE,
+from src.core.config import (CHUNK_STRATEGY, DATA_DIR, DOCUMENT_STORE,
                              INGEST_CHUNKS_PER_REQUEST)
 from src.core.logging import get_logger, timed
 from src.ml.embeddings import split_to_token_limit
-from src.services.pdf import chunk_document, extract_pages
+from src.services.chunking import chunk_pages
+from src.services.pdf import extract_pages
 from src.services.vectorstore import add_chunks, delete_source
 
 log = get_logger(__name__)
@@ -248,7 +249,10 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
             "reason": "no extractable text - likely a scanned/image PDF (no OCR yet)",
         }
 
-    chunks = chunk_document(pages, CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS)
+    # Which chunker runs is CHUNK_STRATEGY's business, not this function's. Both are
+    # deterministic, which is what lets a resumed slice re-chunk and see the identical list
+    # (the semantic one memoises as well, because re-deriving it is not cheap).
+    chunks = chunk_pages(pages)
     # The chunker counts words; the model counts tokens. Anything still over the window is
     # split here rather than being silently truncated at embedding time.
     chunks = split_to_token_limit(chunks)
@@ -260,9 +264,9 @@ def ingest_one(filename: str, *, reason: str = "new", fingerprint: Optional[Dict
     if start_chunk == 0:
         _event(f"Split {len(pages)} pages into {total_chunks} passages", filename, owner)
     log.info(
-        "'%s': %d pages -> %d chunks. Embedding - a large document takes "
+        "'%s': %d pages -> %d chunks (%s chunking). Embedding - a large document takes "
         "several minutes, this is not a hang.",
-        filename, len(pages), len(chunks),
+        filename, len(pages), len(chunks), CHUNK_STRATEGY,
     )
 
     # Replace, don't duplicate: drop any existing vectors for this document first.
